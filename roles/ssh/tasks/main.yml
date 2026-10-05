@@ -1,0 +1,54 @@
+---
+- name: Validate requested password authentication setting
+  ansible.builtin.assert:
+    that:
+      - "password_auth | default(false) | string | lower in ['true', 'false', 'yes', 'no', '1', '0']"
+    fail_msg: password_auth must be a boolean (default false).
+
+- name: Capture the real SSH connection before sudo filters the environment
+  ansible.builtin.shell: 'printf "%s" "$SSH_CONNECTION"'
+  become: false
+  register: ssh_connection
+  changed_when: false
+  check_mode: false
+
+- name: Stop this host cleanly if the SSH connection is unreachable
+  ansible.builtin.assert:
+    that: not ssh_connection.unreachable | default(false)
+    fail_msg: "{{ ssh_connection.msg | default('SSH connection unreachable') }}"
+    quiet: true
+
+- name: Discover SSH configuration using the standalone controller script
+  ansible.builtin.script:
+    cmd: "{{ playbook_dir }}/../scripts/discover-ssh"
+  register: ssh_discovery
+  changed_when: false
+  check_mode: false
+
+- name: Require successful SSH discovery
+  ansible.builtin.assert:
+    that: ssh_discovery.rc | default(1) == 0
+    fail_msg: "{{ ssh_discovery.msg | default('SSH discovery failed') }}"
+    quiet: true
+
+- name: Apply and verify SSH policy with automatic rollback
+  ansible.builtin.script:
+    cmd: "{{ playbook_dir }}/../scripts/apply-ssh {{ 'yes' if password_auth | default(false) | bool else 'no' }}"
+  environment:
+    SSH_CONNECTION: "{{ ssh_connection.stdout }}"
+    CCDC_SSH_CONTEXT: "{{ ssh_context | default('') }}"
+  register: ssh_apply
+  changed_when: ssh_apply.rc | default(1) == 0 and (ssh_apply.stdout | trim | from_json).changed
+  when: not ansible_check_mode
+
+- name: Require a successful SSH policy result
+  ansible.builtin.assert:
+    that: ssh_apply.rc | default(1) == 0
+    fail_msg: "{{ ssh_apply.msg | default('SSH application failed') }}"
+    quiet: true
+  when: not ansible_check_mode
+
+- name: Report SSH policy result
+  ansible.builtin.debug:
+    msg: "{{ ssh_apply.stdout | trim }}"
+  when: not ansible_check_mode

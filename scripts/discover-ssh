@@ -1,0 +1,124 @@
+#!/usr/bin/env python3
+"""Read-only SSH discovery. --context accepts sshd -C syntax; --config is diagnostic.
+
+Ansible: ansible.builtin.script: scripts/discover-ssh (stdout is one JSON object).
+No context means global defaults, NOT the policy for all possible Match blocks.
+"""
+import argparse
+import glob
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+
+REQUIRED = "permitrootlogin passwordauthentication kbdinteractiveauthentication pubkeyauthentication authorizedkeysfile allowusers allowgroups denyusers denygroups port listenaddress".split()
+
+
+def run(args):
+    p = subprocess.run(args, universal_newlines=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+    if p.returncode:
+        raise RuntimeError(p.stderr.strip() or "command failed: " + " ".join(args))
+    return p.stdout
+
+
+def daemon():
+    for pidfile in ('/run/sshd.pid', '/run/ssh.pid', '/var/run/sshd.pid'):
+        try:
+            pid = Path(pidfile).read_text().strip()
+            if pid.isdigit() and os.stat(pidfile).st_uid == 0:
+                path = os.readlink('/proc/' + pid + '/exe')
+                if os.path.basename(path) in ('sshd', 'sshd.pam', 'sshd.krb5') and os.access(path, os.X_OK):
+                    return path
+        except OSError:
+            pass
+    for path in ("/usr/sbin/sshd", "/usr/bin/sshd", "/sbin/sshd", shutil.which("sshd")):
+        if path and os.path.isfile(path) and os.access(path, os.X_OK):
+            return os.path.abspath(path)
+    raise RuntimeError("Cannot find sshd; bootstrap does not install or reconfigure SSH")
+
+
+def effective(output):
+    result = {key: [] for key in REQUIRED}
+    for line in output.splitlines():
+        key, _, value = line.partition(" ")
+        result.setdefault(key.lower(), []).append(value.strip())
+    return result
+
+
+def sources(config):
+    hashes, caveats, stack = {}, [], []
+
+    def visit(path, conditional=False):
+        path = os.path.abspath(path)
+        if path in stack or len(stack) >= 32 or len(hashes) >= 512:
+            raise RuntimeError("Include cycle or excessive config graph at " + path)
+        raw = Path(path).read_bytes()
+        hashes[path] = hashlib.sha256(raw).hexdigest()
+        stack.append(path)
+        for line in raw.decode("utf-8", errors="replace").splitlines():
+            match = re.match(r"^\s*([^\s=#]+)[\s=]+(.*)$", line)
+            if not match:
+                continue
+            key, text = match.groups()
+            values = shlex.split(text, comments=True)
+            if key.lower() == "match":
+                conditional = True
+                caveats.append("Match in %s: %s" % (path, text))
+            if key.lower() == "include":
+                if conditional:
+                    caveats.append("Conditional Include in " + path + "; sources are potential, not necessarily active")
+                for pattern in values:
+                    if not os.path.isabs(pattern):
+                        pattern = os.path.join("/etc/ssh", pattern)
+                    for included in sorted(glob.glob(pattern)):
+                        conditional = visit(included, conditional)
+        stack.pop()
+        return conditional
+
+    visit(config)
+    return hashes, sorted(set(caveats))
+
+
+def socket_listeners():
+    result = {}
+    tool = shutil.which('systemctl')
+    if tool and os.path.isdir('/run/systemd/system'):
+        for name in ('ssh.socket', 'sshd.socket'):
+            output = run([tool, 'show', name, '--property=Id,ActiveState,Listen'])
+            fields = dict(line.split('=', 1) for line in output.splitlines() if '=' in line)
+            if fields.get('ActiveState') == 'active':
+                result[fields.get('Id', name)] = fields.get('Listen', '')
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="/etc/ssh/sshd_config")
+    parser.add_argument("--context", default=os.environ.get("CCDC_SSH_CONTEXT") or None,
+                        help="sshd -C user=oski,host=...,addr=...,laddr=...,lport=...")
+    args = parser.parse_args()
+    sshd = daemon()
+    hashes, caveats = sources(args.config)
+    command = [sshd, "-T", "-f", args.config]
+    if args.context:
+        command += ["-C", args.context]
+    caveats.append("Effective values describe only the specified context, or global defaults if context is null; Match may differ for other connections")
+    caveats.append("Service command-line overrides are not represented by sshd -T -f; socket_listeners separately reports active systemd SSH socket bindings")
+    dropins = {path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
+               for path in sorted(glob.glob('/etc/ssh/sshd_config.d/*')) if os.path.isfile(path)}
+    print(json.dumps({"effective": effective(run(command)), "sources": hashes, "dropins": dropins,
+                      "context": args.context, "socket_listeners": socket_listeners(), "caveats": sorted(set(caveats)),
+                      "sshd": sshd}, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        print("discover-ssh: " + str(exc), file=sys.stderr)
+        sys.exit(1)

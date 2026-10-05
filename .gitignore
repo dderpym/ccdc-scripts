@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.venv/
+*.retry
+/baselines/*
+!/baselines/.gitkeep
+/reports/*
+!/reports/.gitkeep
+/secrets/
+# Never commit private keys or plaintext credentials.
+*.pem
+*.key

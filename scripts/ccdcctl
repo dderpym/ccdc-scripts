@@ -1,0 +1,632 @@
+#!/usr/bin/env python3
+"""Inventory-wide controller. Ansible owns transport; host scripts own state."""
+import argparse
+import difflib
+import getpass
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+EXTRA = shlex.split(os.environ.get("ANSIBLE_ARGS", ""))
+
+
+def run(args, capture=True, result_dir=None):
+    env = dict(os.environ, ANSIBLE_CONFIG=str(ROOT / "ansible.cfg"),
+               ANSIBLE_NOCOLOR="1")
+    if result_dir:
+        env.update(CCDC_RESULT_DIR=result_dir, ANSIBLE_LOAD_CALLBACK_PLUGINS="1",
+                   ANSIBLE_CALLBACKS_ENABLED="ccdc_results")
+    else:
+        env.pop("CCDC_RESULT_DIR", None)
+    return subprocess.run(args, cwd=ROOT, env=env, text=True,
+                          stdout=subprocess.PIPE if capture else None,
+                          stderr=subprocess.PIPE if capture else None, check=False)
+
+
+def inventory():
+    result = run(["ansible-inventory", "--list"])
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or result.stdout.strip())
+    data = json.loads(result.stdout)
+    names = set()
+    for group, values in data.items():
+        if group != "_meta":
+            names.update(values.get("hosts", []))
+    if not names:
+        raise RuntimeError("Inventory has no hosts")
+    for name in names:
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", name) or name == "all":
+            raise RuntimeError(f"Unsafe/reserved inventory hostname: {name!r}")
+    variables = data.get("_meta", {}).get("hostvars", {})
+    return sorted(names), variables
+
+
+def select(target="all"):
+    hosts, variables = inventory()
+    if target != "all":
+        if target not in hosts:
+            raise RuntimeError(f"Not an inventory hostname: {target}")
+        hosts = [target]
+    return hosts, variables
+
+
+def collect(kind, hosts, args=()):
+    """One Ansible batch; retain successful hosts even if another is unreachable."""
+    module_args = shlex.join([str(ROOT / "scripts" / f"discover-{kind}"), *args])
+    with tempfile.TemporaryDirectory(prefix="ccdc-results-") as directory:
+        result = run(["ansible", "all", "--limit", ":".join(hosts), "--become",
+                      "-m", "ansible.builtin.script", "-a", module_args,
+                      *EXTRA], result_dir=directory)
+        states, errors = {}, {}
+        for host in hosts:
+            try:
+                response = json.loads((Path(directory) / host).read_text())
+                if response.get("unreachable") or response.get("failed") or response.get("rc", 0):
+                    raise ValueError(response.get("stderr") or response.get("msg") or "remote command failed")
+                states[host] = json.loads(response["stdout"])
+            except (OSError, ValueError, KeyError) as exc:
+                errors[host] = str(exc) if not isinstance(exc, FileNotFoundError) else (
+                    result.stderr.strip() or result.stdout.strip() or "No Ansible result")
+        return states, errors
+
+
+def run_with_vars(args, variables, capture=True, result_dir=None):
+    # Passwords must never appear in argv, shell history, or Ansible console logs.
+    with tempfile.NamedTemporaryFile(mode="w", prefix="ccdc-vars-", suffix=".json") as out:
+        json.dump(variables, out)
+        out.flush()
+        os.fsync(out.fileno())
+        return run([*args, "--extra-vars", "@" + out.name], capture=capture, result_dir=result_dir)
+
+
+def playbook(name, host="all", variables=None):
+    args = ["ansible-playbook", f"playbooks/{name}.yml", "--limit", host, *EXTRA]
+    result = run(args, capture=False) if variables is None else run_with_vars(args, variables, capture=False)
+    return result.returncode == 0
+
+
+def text_file(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, delete=False) as out:
+        temporary = Path(out.name)
+        out.write(text)
+    try:
+        os.chmod(temporary, 0o600)
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def save(path, state):
+    text_file(path, json.dumps(state, indent=2, sort_keys=True) + "\n")
+
+
+def read_secret(path):
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise RuntimeError(f"Credential must be an owned regular file with mode 0600: {path}")
+    password = path.read_text()
+    if password.startswith("$ANSIBLE_VAULT;"):
+        result = run(["ansible-vault", "view", str(path)])
+        if result.returncode:
+            raise RuntimeError(f"Cannot decrypt {path}; configure your Ansible Vault identity")
+        password = result.stdout
+    password = password.rstrip("\n")
+    if not password or any(char in password for char in "\n\r\0"):
+        raise RuntimeError(f"Credential file must contain one nonempty password: {path}")
+    return password
+
+
+def root_login_vars(password):
+    return {"ansible_user": "root", "ansible_become": False,
+            "ansible_password": password, "ansible_ssh_pass": password,
+            "ansible_ssh_args": "-o ControlMaster=no -o ControlPath=none "
+            "-o ForwardAgent=no -o PreferredAuthentications=password -o PubkeyAuthentication=no "
+            "-o KbdInteractiveAuthentication=no"}
+
+
+def probe_root(host, password):
+    # Authentication only: no Python, sudo, package installation, or account changes.
+    with tempfile.TemporaryDirectory(prefix="ccdc-auth-") as directory:
+        args = ["ansible", "all", "--limit", host, "-m", "ansible.builtin.raw", "-a", "true", *EXTRA]
+        result = run_with_vars(args, root_login_vars(password), result_dir=directory)
+        try:
+            response = json.loads((Path(directory) / host).read_text())
+        except (OSError, ValueError):
+            return False, False, "Ansible authentication probe returned no usable result"
+        if not response.get('unreachable') and not response.get('failed') and response.get('rc', 0) == 0 and result.returncode == 0:
+            return True, False, ""
+        message = str(response.get('msg') or response.get('stderr') or 'connection failed')
+        authentication = bool(response.get('unreachable')) and bool(re.search(
+            r'permission denied(?:,\s*please try again|\s*\([a-z0-9,@._ -]+\))|authentication failed|(?:incorrect|invalid)[^\n]*password',
+            message, re.I))
+        return False, authentication, message.replace(password, '[redacted]')
+
+
+def initialize(hosts, target, password_file=None, save_bootstrap=False, use_saved=True):
+    if not use_saved:
+        if password_file or save_bootstrap:
+            raise RuntimeError('--no-bootstrap-password cannot be combined with a password-file/save option')
+        return not playbook('init', target)
+    path = Path(password_file).expanduser().absolute() if password_file else ROOT / 'secrets/bootstrap.password'
+    if save_bootstrap:
+        if path.exists() and path.read_text().startswith('$ANSIBLE_VAULT;'):
+            raise RuntimeError('Refusing to replace an encrypted credential with plaintext; use ansible-vault edit')
+        if not sys.stdin.isatty():
+            raise RuntimeError('--save-bootstrap-password requires an interactive terminal')
+        password = getpass.getpass('Known bootstrap root password (saved controller-side): ')
+        if not password or any(char in password for char in '\n\r\0'):
+            raise RuntimeError('Bootstrap password must be nonempty and single-line')
+        text_file(path, password + '\n')
+        print(f'Saved bootstrap credential: {path}')
+    if not path.exists() and password_file is None:
+        # Existing key/admin/-k workflows remain available without automatic retries.
+        return not playbook('init', target)
+    if any(flag in EXTRA for flag in ('-k', '--ask-pass', '-K', '--ask-become-pass')):
+        raise RuntimeError('Saved-root bootstrap handles prompts itself; remove Ansible password-prompt flags')
+    key = run(['ssh-keygen', '-l', '-f', str(ROOT / 'files/oski.pub')])
+    if key.returncode:
+        raise RuntimeError('Replace files/oski.pub with a valid team public key before bootstrap')
+    default = read_secret(path)
+    results = []
+    for index, host in enumerate(hosts, 1):
+        heading(host, index, len(hosts))
+        recovery = ROOT / 'secrets/root' / (host + '.password')
+        try:
+            if recovery.exists() and verify_admin_access(host):
+                # Reinitialization after hardening must not depend on root SSH.
+                # Use the playbook's become: true, not a global extra-var:
+                # extra-vars would also force sudo on controller delegates.
+                variables = {"ansible_user": "oski", "ansible_become_method": "sudo",
+                             "ansible_become_user": "root", "ansible_password": "",
+                             "ansible_ssh_pass": "", "ansible_become_password": ""}
+            else:
+                # Only one automatic password attempt: saved per-host credential
+                # on reruns, otherwise the shared competition bootstrap password.
+                password = read_secret(recovery) if recovery.exists() else default
+                success, auth_failure, error = probe_root(host, password)
+                if not success and auth_failure and sys.stdin.isatty():
+                    print('Saved credential rejected; one manual retry is available.')
+                    password = getpass.getpass(f'Actual root password for {host} (empty = skip): ')
+                    if not password:
+                        results.append((host, 'SKIPPED - unchanged'))
+                        continue
+                    if any(char in password for char in '\n\r\0'):
+                        raise RuntimeError('Root password must be single-line')
+                    success, _, error = probe_root(host, password)
+                if not success:
+                    results.append((host, 'FAILED - ' + error))
+                    continue
+                variables = root_login_vars(password)
+            success = playbook('init', host, variables)
+            results.append((host, 'OK - root credential saved' if success else 'FAILED - inspect playbook output; saved credential may be pending'))
+        except (RuntimeError, OSError) as exc:
+            results.append((host, 'FAILED - ' + str(exc)))
+    print('\nINIT SUMMARY')
+    for host, outcome in results:
+        print(f'{host:20} {outcome}')
+    print('Recovery credentials: secrets/root/<host>.password (private; previous versions retained as backups)')
+    return any(outcome != 'OK - root credential saved' for _, outcome in results)
+
+
+def value(state, key):
+    found = state.get("effective", {}).get(key, "unset")
+    return ",".join(map(str, found)) if isinstance(found, list) else str(found)
+
+
+def problems(errors):
+    for host, error in errors.items():
+        print(f"{host}: FAILED - {error}", file=sys.stderr)
+
+
+def status(kind, hosts):
+    states, errors = collect(kind, hosts)
+    if len(hosts) == 1:
+        if states:
+            print(json.dumps(states[hosts[0]], indent=2, sort_keys=True))
+    elif kind == "ssh":
+        print(f"{'HOST':20} {'ROOT LOGIN':12} {'PASSWORD AUTH':15} {'PUBKEY AUTH':12} PORT")
+        for host, state in states.items():
+            print(f"{host:20} {value(state, 'permitrootlogin'):12} "
+                  f"{value(state, 'passwordauthentication'):15} "
+                  f"{value(state, 'pubkeyauthentication'):12} {value(state, 'port')}")
+    else:
+        print(f"{'HOST':20} {'BACKEND':16} {'INBOUND':14} TCP / UDP / SSH22")
+        for host, state in states.items():
+            print(f"{host:20} {state.get('backend', 'unknown'):16} "
+                  f"{str(state.get('default_inbound', 'unknown')):14} "
+                  f"{state.get('allowed_tcp', [])} / {state.get('allowed_udp', [])} / "
+                  f"{state.get('ssh22', 'unknown')}")
+            if state.get('allowed_tcp') is None:
+                candidates = sorted({hint['protocol'] + '/' + str(port)
+                                     for hint in state.get('explicit_inbound_accepts', [])
+                                     for port in hint['ports']})
+                print("  Explicit ACCEPT candidates (conditions/order may deny): " + ', '.join(candidates))
+                print("  Base INPUT policies: " + json.dumps(state.get('input_policies', []), sort_keys=True))
+    problems(errors)
+    return bool(errors)
+
+
+def ask(prompt, choices, default):
+    while True:
+        answer = input(prompt + " > ").strip().lower() or default
+        if answer in choices:
+            return answer
+        print("Choose " + "/".join(choices))
+
+
+def heading(host, index, count):
+    print(f"\n{'=' * 50}\nHost {index}/{count}: {host}\n{'=' * 50}")
+
+
+def verify_admin_access(host):
+    # A new, key-only connection: an existing multiplexed session proves nothing.
+    variables = {"ansible_user": "oski", "ansible_become": True,
+                 "ansible_become_method": "sudo", "ansible_become_user": "root",
+                 "ansible_password": "", "ansible_ssh_pass": "", "ansible_become_password": "",
+                 "ansible_ssh_args": "-o ControlMaster=no -o ControlPath=none "
+                 "-o ForwardAgent=no -o PreferredAuthentications=publickey -o PasswordAuthentication=no "
+                 "-o KbdInteractiveAuthentication=no"}
+    result = run(["ansible", "all", "--limit", host, "-m", "ansible.builtin.ping",
+                  *EXTRA, "--extra-vars", json.dumps(variables)])
+    if result.returncode:
+        print(f"{host}: FAILED - fresh oski key login/escalation preflight\n"
+              + result.stdout + result.stderr, file=sys.stderr)
+    return result.returncode == 0
+
+
+def configure_ssh(hosts):
+    summary = []
+    bulk = None
+    for index, host in enumerate(hosts, 1):
+        heading(host, index, len(hosts))
+        states, errors = collect("ssh", [host])
+        if errors:
+            problems(errors)
+            summary.append((host, "unknown", "unknown", "FAILED"))
+            continue
+        print("Current SSH state:\n" + json.dumps(states[host], indent=2, sort_keys=True))
+        if bulk is not None:
+            print(f"Bulk password-auth choice: {'enabled' if bulk else 'disabled'} (override available)")
+            choice = ask("[enter] reuse, [y] enable, [n] disable, [s] skip", ["reuse", "y", "n", "s"], "reuse")
+            enabled = bulk if choice == "reuse" else choice == "y"
+        else:
+            choice = ask("Password auth: [y] yes, [n] no (default), [a] no remaining, [b] yes remaining, [s] skip",
+                         ["y", "n", "a", "b", "s"], "n")
+            enabled = choice in ("y", "b")
+            if choice in ("a", "b"):
+                bulk = enabled
+        if choice == "s":
+            summary.append((host, "unchanged", "unchanged", "SKIPPED"))
+            continue
+        print(f"Desired: root login=no, password/kbd-interactive={'yes' if enabled else 'no'}, pubkey=yes")
+        if ask("Apply? [Y/n]", ["y", "n"], "y") == "n":
+            summary.append((host, "unchanged", "unchanged", "SKIPPED"))
+            continue
+        if not verify_admin_access(host):
+            summary.append((host, "unchanged", "unchanged", "FAILED"))
+            continue
+        success = playbook("ssh", host, {"password_auth": enabled})
+        states, errors = collect("ssh", [host])
+        if not errors:
+            print("Effective state after apply:\n" + json.dumps(states[host], indent=2, sort_keys=True))
+            desired = {"permitrootlogin": "no", "passwordauthentication": "yes" if enabled else "no",
+                       "kbdinteractiveauthentication": "yes" if enabled else "no", "pubkeyauthentication": "yes"}
+            success = success and all(value(states[host], k) == v for k, v in desired.items())
+            if success:
+                success = verify_admin_access(host)
+        else:
+            problems(errors)
+            success = False
+        summary.append((host, "enabled" if enabled else "disabled", "disabled" if success else "unknown",
+                        "OK" if success else "FAILED"))
+    print("\nSSH SUMMARY\nHOST                 PASSWORD AUTH   ROOT LOGIN   RESULT")
+    for host, auth, root, outcome in summary:
+        print(f"{host:20} {auth:15} {root:12} {outcome}")
+    return any(row[-1] == "FAILED" for row in summary)
+
+
+def listener_text(hosts, variables, states, errors):
+    lines = ["NETWORK SERVICE INVENTORY", "", "EXTERNAL = non-loopback binding, NOT proven network/firewall reachability."]
+    for host in hosts:
+        lines += ["", "=" * 50, f"{host} - {variables.get(host, {}).get('ansible_host', host)}", "=" * 50]
+        if host in errors:
+            lines.append("FAILED - " + errors[host])
+            continue
+        for external, title in ((True, "EXTERNAL"), (False, "LOOPBACK")):
+            lines.append("\n" + title)
+            for item in states[host]:
+                if item["external"] != external:
+                    continue
+                lines += [f"{item['protocol']}/{item['port']}  {item['address']} ({item['family']})",
+                          f"  process: {item.get('process') or 'unknown'}  PID: {item.get('pid') or 'unknown'}",
+                          f"  service: {item.get('service') or 'unknown'} ({item.get('service_confidence', 'unknown')})",
+                          f"  user: {item.get('user') or 'unknown'}  executable: {item.get('executable') or 'unknown'}"]
+    return "\n".join(lines) + "\n"
+
+
+def listeners(hosts, variables):
+    states, errors = collect("listeners", hosts)
+    structured = {"hosts": {host: {"address": variables.get(host, {}).get("ansible_host", host),
+                                  "listeners": states.get(host, []), "error": errors.get(host)} for host in hosts}}
+    save(ROOT / "reports/listeners.json", structured)
+    report = listener_text(hosts, variables, states, errors)
+    text_file(ROOT / "reports/listeners.txt", report)
+    print(report)
+    print("Saved reports/listeners.txt and reports/listeners.json")
+    return bool(errors)
+
+
+def groups(items):
+    grouped = {}
+    for item in items:
+        if not item["external"]:
+            continue
+        identity = (item.get("service") or "unknown", item.get("process") or "unknown",
+                    item.get("executable") or "unknown")
+        port = (item["protocol"], int(item["port"]))
+        # Unknown owners are reviewed per port, never guessed to be one service.
+        key = (identity, port if identity == ("unknown", "unknown", "unknown") else ())
+        grouped.setdefault(key, set()).add(port)
+    return sorted((key[0], sorted(ports)) for key, ports in grouped.items())
+
+
+def policy_text(policies):
+    lines = ["\n" + "=" * 50, "PROPOSED FIREWALL POLICY", "=" * 50,
+             "Only approved ports remain open; other unsolicited inbound traffic is blocked."]
+    for host, policy in policies.items():
+        lines.append("\n" + host)
+        for protocol in ("tcp", "udp"):
+            for port in policy[protocol]:
+                lines.append(f"  ALLOW {protocol}/{port}")
+        lines.extend("  " + line for line in policy["review"])
+    return "\n".join(lines)
+
+
+def configure_firewall(hosts):
+    remembered = {}
+    while True:
+        states, errors = collect("listeners", hosts)
+        firewalls, fw_errors = collect("firewall", hosts)
+        errors.update(fw_errors)
+        problems(errors)
+        policies = {}
+        for index, host in enumerate(hosts, 1):
+            heading(host, index, len(hosts))
+            if host in errors:
+                print("Skipping failed discovery; no policy applied.")
+                continue
+            print("Current firewall:\n" + json.dumps(firewalls[host], indent=2, sort_keys=True))
+            print("Default: ALLOW tcp/22, loopback, established/related and essential IPv6 ICMP; BLOCK other unsolicited inbound.")
+            print("nft replaces ALL existing tables/input policy atomically (unsafe NAT/forward/output is refused).")
+            print("iptables overrides prior INPUT policy with a first owned jump; existing source restrictions do not carry over.")
+            print("Approved ports are open to all sources, for IPv4 and IPv6. Non-loopback bindings below.")
+            policy = {"tcp": [22], "udp": [], "review": []}
+            skipped = False
+            for identity, ports in groups(states[host]):
+                service, process, executable = identity
+                print(f"\n{service} / {process} ({executable}): " + ", ".join(f"{p}/{n}" for p, n in ports))
+                undecided = [(p, n) for p, n in ports if (p, n) != ("tcp", 22)]
+                if not undecided:
+                    print("ALLOW tcp/22 by default")
+                    continue
+                key = (identity, tuple(undecided))
+                reusable = process != "unknown" and executable != "unknown"
+                if key in remembered:
+                    print("Reusing matching service/process/executable/ports: " + ("ALLOW" if remembered[key] else "BLOCK"))
+                    choice = ask("[enter] reuse, [y] allow, [n] block, [s] skip host", ["reuse", "y", "n", "s"], "reuse")
+                    allowed = remembered[key] if choice == "reuse" else choice == "y"
+                else:
+                    options = ["y", "n", "s"] + (["a", "b"] if reusable else [])
+                    prompt = "[y] allow, [n] block (default), [s] skip host"
+                    if reusable:
+                        prompt += ", [a] allow matching remaining, [b] block matching remaining"
+                    choice = ask(prompt, options, "n")
+                    allowed = choice in ("y", "a")
+                    if choice in ("a", "b"):
+                        remembered[key] = allowed
+                if choice == "s":
+                    skipped = True
+                    break
+                for protocol, port in undecided:
+                    if allowed:
+                        policy[protocol].append(port)
+                    policy["review"].append(f"{'ALLOW' if allowed else 'BLOCK'} {protocol}/{port} {service}/{process}")
+            if skipped:
+                print("Host skipped; unchanged.")
+                continue
+            for protocol in ("tcp", "udp"):
+                policy[protocol] = sorted(set(policy[protocol]))
+            print(policy_text({host: policy}))
+            if ask("Include this host in aggregate apply? [y/N]", ["y", "n"], "n") == "y":
+                policies[host] = policy
+        print(policy_text(policies))
+        for host in hosts:
+            if host not in policies:
+                print(f"\n{host}: {'FAILED discovery' if host in errors else 'SKIPPED'} - unchanged")
+        print("\nChanges are sequential. nft REPLACES the entire ruleset; iptables overrides INPUT.")
+        print("Prior source restrictions are NOT retained. Managers, mixed backends and unsafe hooks refuse enforcement.")
+        choice = ask("[y] apply all, [r] review again, [n] abort (default)", ["y", "r", "n"], "n")
+        if choice == "r":
+            continue
+        if choice == "n" or not policies:
+            return bool(errors)
+        break
+    results = [(host, "FAILED - discovery" if host in errors else "SKIPPED - unchanged")
+               for host in hosts if host not in policies]
+    for host, policy in policies.items():
+        fresh, failure = collect("listeners", [host])
+        if failure or groups(fresh[host]) != groups(states[host]):
+            problems(failure)
+            results.append((host, "FAILED - listeners changed; review again"))
+            continue
+        if not verify_admin_access(host):
+            results.append((host, "FAILED - fresh oski access preflight"))
+            continue
+        # Verify the current SSH listener port, not only a controller/NAT port.
+        ssh, failure = collect("ssh", [host])
+        if failure:
+            problems(failure)
+            results.append((host, "FAILED - SSH safety discovery"))
+            continue
+        ssh_ports = ssh[host].get("effective", {}).get("port", ["22"])
+        if not isinstance(ssh_ports, list):
+            ssh_ports = [ssh_ports]
+        if not all(int(port) in policy["tcp"] for port in ssh_ports):
+            results.append((host, "FAILED - approve all active SSH ports before applying"))
+            continue
+        snapshots, failure = collect("firewall", [host], ["--snapshot"])
+        if failure:
+            problems(failure)
+            results.append((host, "FAILED - no rollback snapshot"))
+            continue
+        path = ROOT / "reports/rollback" / host / "firewall.json"
+        save(path, snapshots[host])
+        success = playbook("firewall", host, {"firewall_action": "apply",
+                                            "firewall_tcp_ports": policy["tcp"], "firewall_udp_ports": policy["udp"]})
+        observed, failure = collect("firewall", [host])
+        if failure:
+            problems(failure)
+            success = False
+        elif observed:
+            print("Effective firewall after apply:\n" + json.dumps(observed[host], indent=2, sort_keys=True))
+        if success:
+            success = verify_admin_access(host)
+        results.append((host, "OK" if success else "FAILED - inspect/rollback before proceeding"))
+    print("\nFIREWALL SUMMARY")
+    for host, result in results:
+        print(f"{host:20} {result}")
+    return bool(errors) or any(result.startswith("FAILED") for _, result in results)
+
+
+def rollback(hosts):
+    results = []
+    for host in hosts:
+        path = ROOT / "reports/rollback" / host / "firewall.json"
+        if not path.is_file():
+            results.append((host, False))
+            print(f"{host}: FAILED - no controller rollback snapshot")
+            continue
+        print(f"{host}: restoring {path.relative_to(ROOT)}")
+        results.append((host, playbook("firewall", host, {"firewall_action": "restore",
+                                                       "firewall_restore_file": str(path)})))
+    print("\nROLLBACK SUMMARY")
+    for host, success in results:
+        print(f"{host:20} {'OK' if success else 'FAILED'}")
+    return any(not success for _, success in results)
+
+
+def baseline(kind, hosts):
+    states, errors = collect(kind, hosts)
+    for host, state in states.items():
+        save(ROOT / "baselines" / host / f"{kind}.json", state)
+        print(f"{host}: accepted {kind} baseline")
+    problems(errors)
+    return bool(errors)
+
+
+def drift(expected, observed):
+    before = json.dumps(expected, sort_keys=True, indent=2).splitlines()
+    after = json.dumps(observed, sort_keys=True, indent=2).splitlines()
+    return "\n".join(difflib.unified_diff(before, after, fromfile="expected", tofile="observed", lineterm=""))
+
+
+def monitor(kinds, target, interval, once=False):
+    previous = {}
+    hosts, _ = select(target)
+    print(f"Monitoring {len(hosts)} hosts...", flush=True)
+    while True:
+        hosts, _ = select(target)
+        current = {}
+        for kind in kinds:
+            states, errors = collect(kind, hosts)
+            for host in hosts:
+                key = (host, kind)
+                if host in errors:
+                    current[key] = "WARNING - unreachable/discovery failed: " + errors[host]
+                    continue
+                path = ROOT / "baselines" / host / f"{kind}.json"
+                try:
+                    expected = json.loads(path.read_text())
+                except (OSError, ValueError) as exc:
+                    current[key] = f"WARNING - missing/invalid baseline: {exc}"
+                    continue
+                if states[host] != expected:
+                    current[key] = "CRITICAL - drift\n" + drift(expected, states[host])
+                else:
+                    current[key] = ""
+        for (host, kind), message in current.items():
+            key = (host, kind)
+            if message and message != previous.get(key):
+                print(f"[{time.strftime('%H:%M:%S')}] {host} {kind}: {message}", flush=True)
+            elif not message and previous.get(key):
+                print(f"[{time.strftime('%H:%M:%S')}] INFO - {host} {kind} recovered / baseline matches", flush=True)
+        previous = current
+        if once:
+            return any(current.values())
+        time.sleep(interval)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    cmd = sub.add_parser('init')
+    cmd.add_argument('target', nargs='?', default='all')
+    cmd.add_argument('--bootstrap-password-file', help='private single-password file (plaintext or Ansible Vault); defaults to secrets/bootstrap.password if present')
+    cmd.add_argument('--save-bootstrap-password', action='store_true', help='prompt once, save the shared bootstrap password privately, then initialize')
+    cmd.add_argument('--no-bootstrap-password', action='store_true', help='ignore saved root credentials and use normal Ansible key/admin/-k options')
+    for command in ("ping", "listeners"):
+        cmd = sub.add_parser(command)
+        cmd.add_argument("target", nargs="?", default="all")
+    for command in ("ssh", "firewall"):
+        cmd = sub.add_parser(command)
+        cmd.add_argument("action", choices=["status", "configure", "baseline"] + (["rollback"] if command == "firewall" else []))
+        cmd.add_argument("target", nargs="?", default="all")
+    cmd = sub.add_parser("monitor")
+    cmd.add_argument("kind", nargs="?", choices=["ssh", "firewall"])
+    cmd.add_argument("--host", default="all")
+    cmd.add_argument("--interval", type=int, default=60)
+    cmd.add_argument("--once", action="store_true", help="one poll, nonzero if alerts (debugging)")
+    args = parser.parse_args()
+    if args.command == "monitor":
+        if args.interval < 5:
+            parser.error("--interval must be at least 5 seconds")
+        return monitor([args.kind] if args.kind else ["ssh", "firewall"], args.host, args.interval, args.once)
+    hosts, variables = select(args.target)
+    if args.command == "init":
+        return initialize(hosts, args.target, args.bootstrap_password_file, args.save_bootstrap_password, not args.no_bootstrap_password)
+    if args.command == "ping":
+        return run(["ansible", "all", "--limit", ":".join(hosts), "-m", "ansible.builtin.ping", *EXTRA], False).returncode != 0
+    if args.command == "listeners":
+        return listeners(hosts, variables)
+    if args.action == "status":
+        return status(args.command, hosts)
+    if args.action == "baseline":
+        return baseline(args.command, hosts)
+    if args.action == "rollback":
+        return rollback(hosts)
+    if not sys.stdin.isatty():
+        parser.error("configure requires an interactive terminal")
+    return configure_ssh(hosts) if args.command == "ssh" else configure_firewall(hosts)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(int(bool(main())))
+    except KeyboardInterrupt:
+        print("\nInterrupted; baselines unchanged.", file=sys.stderr)
+        sys.exit(130)
+    except EOFError:
+        print("\nInput closed; no further changes applied.", file=sys.stderr)
+        sys.exit(1)
+    except (RuntimeError, OSError, ValueError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        sys.exit(1)

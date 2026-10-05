@@ -1,0 +1,122 @@
+---
+- name: Require an explicit firewall operation
+  ansible.builtin.assert:
+    that:
+      - firewall_action | default('') in ['apply', 'restore']
+      - inventory_hostname is match('^[A-Za-z0-9_][A-Za-z0-9_.-]*$')
+    fail_msg: Set firewall_action to apply or restore; discovery uses scripts/discover-firewall directly.
+
+- name: Require both explicit port lists for apply
+  ansible.builtin.assert:
+    that:
+      - firewall_tcp_ports is defined
+      - firewall_udp_ports is defined
+    fail_msg: Supply firewall_tcp_ports (including 22) and firewall_udp_ports, even when UDP is empty.
+  when: firewall_action == 'apply'
+
+- name: Notice about destructive nft replacement and runtime-only enforcement
+  ansible.builtin.debug:
+    msg: >-
+      RUNTIME ONLY: the role saves a controller snapshot before applying.
+      For nftables, ALL existing rules/tables are replaced in
+      ONE atomic transaction with inet ccdc. Existing input rules, sets and
+      empty forward/output chains are removed. NAT, flow offload and nontrivial
+      forward/output/other hooks are refused, not silently destroyed. For
+      iptables, only an owned chain and a FIRST INPUT jump are changed; NAT,
+      forwarding and output remain intact. Additional non-filter ingress
+      INPUT/PREROUTING rules are refused because they can block or rewrite
+      approved ports; ordinary POSTROUTING NAT is supported. Active
+      firewalld/ufw and mixed or ambiguous backends are refused; managers are
+      NEVER stopped. IPv6 ICMP, loopback and established/related traffic remain allowed. No boot
+      persistence is installed. A failed apply attempts a full snapshot rollback.
+  when: firewall_action == 'apply'
+
+- name: Protect the actual current SSH transport port, including socket activation and NAT
+  when: firewall_action == 'apply' and ansible_connection | default('ssh') not in ['local']
+  block:
+    - name: Read the connection before sudo removes SSH_CONNECTION
+      ansible.builtin.shell: 'printf "%s" "$SSH_CONNECTION"'
+      become: false
+      register: firewall_connection
+      changed_when: false
+      check_mode: false
+
+    - name: Require the current server-side SSH port in the approved TCP policy
+      ansible.builtin.assert:
+        that:
+          - firewall_connection.stdout.split() | length == 4
+          - >-
+            firewall_connection.stdout.split()[3] | int in
+            (firewall_tcp_ports | from_json if firewall_tcp_ports is string else firewall_tcp_ports)
+        fail_msg: Approve the actual server-side SSH connection port before firewall application.
+
+- name: Save a controller rollback copy before any application
+  when: firewall_action == 'apply' and not ansible_check_mode
+  block:
+    - name: Capture the restorable effective firewall
+      ansible.builtin.script:
+        cmd: "{{ (playbook_dir ~ '/../scripts/discover-firewall') | quote }} --snapshot"
+        executable: python3
+      register: firewall_snapshot
+      changed_when: false
+
+    - name: Create a private controller rollback directory
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../reports/rollback/{{ inventory_hostname }}"
+        state: directory
+        mode: '0700'
+      delegate_to: localhost
+      become: false
+
+    - name: Save the raw snapshot on the controller
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/../reports/rollback/{{ inventory_hostname }}/firewall.json"
+        content: "{{ firewall_snapshot.stdout | from_json | to_nice_json }}\n"
+        mode: '0600'
+      delegate_to: localhost
+      become: false
+
+- name: Apply and verify the exact dual-stack inbound policy
+  ansible.builtin.script:
+    cmd: >-
+      {{ (playbook_dir ~ '/../scripts/discover-firewall') | quote }} --apply
+      {{ {'tcp': (firewall_tcp_ports | from_json if firewall_tcp_ports is string else firewall_tcp_ports),
+          'udp': (firewall_udp_ports | from_json if firewall_udp_ports is string else firewall_udp_ports)}
+         | to_json | quote }}
+    executable: python3
+  when: firewall_action == 'apply'
+
+- name: Require a controller snapshot path for restore
+  ansible.builtin.assert:
+    that:
+      - firewall_restore_file is defined
+    fail_msg: firewall_restore_file must name the controller's --snapshot JSON file.
+  when: firewall_action == 'restore'
+
+- name: Upload and restore the controller snapshot
+  when: firewall_action == 'restore'
+  block:
+    - name: Allocate a private remote snapshot file
+      ansible.builtin.tempfile:
+        state: file
+        suffix: .firewall.json
+      register: firewall_restore_temp
+
+    - name: Copy the raw snapshot from the controller
+      ansible.builtin.copy:
+        src: "{{ firewall_restore_file }}"
+        dest: "{{ firewall_restore_temp.path }}"
+        mode: '0600'
+
+    - name: Restore the raw snapshot
+      ansible.builtin.script:
+        cmd: >-
+          {{ (playbook_dir ~ '/../scripts/discover-firewall') | quote }} --restore
+          {{ firewall_restore_temp.path | quote }}
+        executable: python3
+  always:
+    - name: Remove the uploaded snapshot
+      ansible.builtin.file:
+        path: "{{ firewall_restore_temp.path }}"
+        state: absent
+      when: firewall_restore_temp.path is defined

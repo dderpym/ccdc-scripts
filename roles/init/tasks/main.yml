@@ -1,0 +1,249 @@
+---
+- name: Require a real controller-owned oski public key
+  ansible.builtin.assert:
+    that:
+      - inventory_hostname is match('^[A-Za-z0-9_][A-Za-z0-9_.-]*$')
+      - lookup('ansible.builtin.file', playbook_dir ~ '/../files/oski.pub') | trim | length > 40
+      - lookup('ansible.builtin.file', playbook_dir ~ '/../files/oski.pub') | trim is match('^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) [A-Za-z0-9+/]+={0,3}( .*)?$')
+    fail_msg: Supply a real single public key in files/oski.pub before running init.
+
+- name: Install Python 3 and sudo only when missing
+  ansible.builtin.raw: |
+    set -eu
+    missing=""
+    command -v python3 >/dev/null 2>&1 || missing="$missing python3"
+    command -v sudo >/dev/null 2>&1 || missing="$missing sudo"
+    [ -n "$missing" ] || exit 0
+    [ -r /etc/os-release ] || { echo 'Missing /etc/os-release' >&2; exit 1; }
+    . /etc/os-release
+    case " $ID ${ID_LIKE:-} " in
+      *' debian '*|*' ubuntu '*)
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update
+        apt-get install -y --no-install-recommends $missing
+        ;;
+      *' rhel '*|*' centos '*|*' rocky '*|*' fedora '*|*' almalinux '*|*' ol '*)
+        if command -v dnf >/dev/null 2>&1; then dnf install -y $missing
+        else yum install -y $missing; fi
+        ;;
+      *' alpine '*) apk add --no-cache $missing ;;
+      *' void '*) xbps-install -Sy $missing ;;
+      *) echo "Unsupported distribution: $ID" >&2; exit 1 ;;
+    esac
+    echo CCDC_BOOTSTRAP_CHANGED
+  register: init_bootstrap
+  changed_when: "'CCDC_BOOTSTRAP_CHANGED' in init_bootstrap.stdout"
+
+- name: Gather facts after Python is available
+  ansible.builtin.setup:
+
+- name: Choose administrative group
+  ansible.builtin.set_fact:
+    oski_admin_group: "{{ 'sudo' if ansible_facts['os_family'] == 'Debian' else 'wheel' }}"
+
+- name: Ensure administrative group exists
+  ansible.builtin.group:
+    name: "{{ oski_admin_group }}"
+    state: present
+
+- name: Ensure oski primary group exists
+  ansible.builtin.group:
+    name: oski
+    state: present
+
+- name: Check whether bash is installed
+  ansible.builtin.stat:
+    path: /bin/bash
+  register: init_bash
+
+- name: Create oski with a home and login shell
+  ansible.builtin.user:
+    name: oski
+    create_home: true
+    home: /home/oski
+    shell: "{{ '/bin/bash' if init_bash.stat.exists and init_bash.stat.executable else '/bin/sh' }}"
+    group: oski
+    groups: "{{ oski_admin_group }}"
+    append: true
+    # '*' disables password login without the Linux '!' account lock that
+    # prevents public-key login on non-PAM systems such as Alpine and Void.
+    password: '*'
+    update_password: on_create
+    state: present
+
+- name: Detect an existing account lock that would prevent non-PAM key login
+  ansible.builtin.shell: |
+    awk -F: '$1 == "oski" && $2 ~ /^!/ { locked=1 } END { exit !locked }' /etc/shadow
+  register: init_account_locked
+  changed_when: false
+  failed_when: init_account_locked.rc not in [0, 1]
+  check_mode: false
+  no_log: true
+
+- name: Replace a locked password with a non-login password marker
+  ansible.builtin.user:
+    name: oski
+    password: '*'
+    update_password: always
+  when: init_account_locked.rc == 0
+
+- name: Secure the administrative home directory
+  ansible.builtin.file:
+    path: /home/oski
+    state: directory
+    owner: oski
+    group: oski
+    mode: '0750'
+
+- name: Create sudoers include directory
+  ansible.builtin.file:
+    path: /etc/sudoers.d
+    state: directory
+    owner: root
+    group: root
+    mode: '0750'
+
+- name: Locate visudo without assuming sbin is in PATH
+  ansible.builtin.shell: |
+    command -v visudo || { [ -x /usr/sbin/visudo ] && echo /usr/sbin/visudo; } || { [ -x /sbin/visudo ] && echo /sbin/visudo; }
+  register: init_visudo
+  changed_when: false
+
+- name: Ensure sudo actually reads its drop-in directory
+  ansible.builtin.lineinfile:
+    path: /etc/sudoers
+    regexp: '^\s*[#@]includedir\s+"?/etc/sudoers\.d"?\s*$'
+    line: '#includedir /etc/sudoers.d'
+    validate: "{{ init_visudo.stdout | trim }} -cf %s"
+
+- name: Grant validated passwordless sudo to oski
+  ansible.builtin.copy:
+    dest: /etc/sudoers.d/oski
+    content: "Defaults:oski !requiretty\noski ALL=(ALL:ALL) NOPASSWD: ALL\n"
+    owner: root
+    group: root
+    mode: '0440'
+    validate: "{{ init_visudo.stdout | trim }} -cf %s"
+
+- name: Validate the complete sudoers configuration
+  ansible.builtin.command:
+    argv: ["{{ init_visudo.stdout | trim }}", '-c']
+  changed_when: false
+
+- name: Create oski SSH directory
+  ansible.builtin.file:
+    path: /home/oski/.ssh
+    state: directory
+    owner: oski
+    group: oski
+    mode: '0700'
+
+- name: Add the controller-owned oski public key without deleting existing keys
+  ansible.builtin.lineinfile:
+    path: /home/oski/.ssh/authorized_keys
+    create: true
+    line: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../files/oski.pub') | trim }}"
+    owner: oski
+    group: oski
+    mode: '0600'
+
+- name: Verify access and save a unique root recovery password before changing it
+  when: not ansible_check_mode
+  block:
+    - name: Prove a fresh oski key login and passwordless sudo from the controller
+      ansible.builtin.command:
+        argv:
+          - ansible
+          - all
+          - --inventory
+          - "{{ ansible_inventory_sources | first }}"
+          - --limit
+          - "{{ inventory_hostname }}"
+          - -m
+          - ansible.builtin.ping
+          - --extra-vars
+          - >-
+            {{ {'ansible_user': 'oski', 'ansible_become': true,
+                'ansible_become_method': 'sudo', 'ansible_become_user': 'root',
+                'ansible_password': '', 'ansible_ssh_pass': '', 'ansible_become_password': '',
+                'ansible_ssh_args': '-o ControlMaster=no -o ControlPath=none -o ForwardAgent=no -o PreferredAuthentications=publickey -o PasswordAuthentication=no -o KbdInteractiveAuthentication=no'} | to_json }}
+      delegate_to: localhost
+      become: false
+      environment:
+        ANSIBLE_CONFIG: "{{ playbook_dir }}/../ansible.cfg"
+        CCDC_RESULT_DIR: ''
+      changed_when: false
+
+    - name: Make controller credential directories private
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../{{ item }}"
+        state: directory
+        mode: '0700'
+      loop: [secrets, secrets/root]
+      delegate_to: localhost
+      become: false
+
+    - name: Generate an independent ten-character root password for this host
+      ansible.builtin.set_fact:
+        ccdc_root_password: "{{ lookup('ansible.builtin.password', '/dev/null', length=10, chars=['ascii_letters', 'digits']) }}"
+      no_log: true
+
+    - name: Validate the generated password before constructing chpasswd input
+      ansible.builtin.assert:
+        that: ccdc_root_password is match('^[A-Za-z0-9]{10}$')
+      no_log: true
+
+    - name: Save the candidate password first and retain the previous recovery copy
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/../secrets/root/{{ inventory_hostname }}.password"
+        content: "{{ ccdc_root_password }}\n"
+        mode: '0600'
+        backup: true
+      delegate_to: localhost
+      become: false
+      register: init_root_password_copy
+      no_log: true
+
+    - name: Flush the saved controller credential and its directory before rotation
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_playbook_python }}"
+          - -c
+          - |
+            import os, sys
+            for path in filter(None, sys.argv[1:]):
+                with open(path, 'rb') as stream:
+                    os.fsync(stream.fileno())
+            directory = os.open(os.path.dirname(sys.argv[1]), os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+          - "{{ playbook_dir }}/../secrets/root/{{ inventory_hostname }}.password"
+          - "{{ init_root_password_copy.backup_file | default('') }}"
+      delegate_to: localhost
+      become: false
+      changed_when: false
+
+    - name: Locate the native password update command
+      ansible.builtin.shell: |
+        command -v chpasswd || { [ -x /usr/sbin/chpasswd ] && echo /usr/sbin/chpasswd; } || { [ -x /sbin/chpasswd ] && echo /sbin/chpasswd; }
+      register: init_chpasswd
+      changed_when: false
+
+    - name: Rotate root password without exposing it in argv or logs
+      block:
+        - name: Feed the password to the native tool through encrypted SSH stdin
+          ansible.builtin.command:
+            argv: ["{{ init_chpasswd.stdout | trim }}"]
+            stdin: "root:{{ ccdc_root_password }}"
+            stdin_add_newline: true
+          no_log: true
+      rescue:
+        - name: Explain an unsuccessful password update without disclosing credentials
+          ansible.builtin.fail:
+            msg: Root password update failed. The saved candidate may not be active; previous recovery files remain as backups. Check the host password policy and chpasswd availability via oski/console.
+
+    - name: Report recovery credential location without printing the password
+      ansible.builtin.debug:
+        msg: "Root password rotated; recovery file: secrets/root/{{ inventory_hostname }}.password (previous versions kept as backups). Root SSH policy is unchanged."

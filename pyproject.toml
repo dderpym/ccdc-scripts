@@ -1,0 +1,6 @@
+[project]
+name = "berke1337-ccdc"
+version = "0.1.0"
+description = "Inventory-wide CCDC SSH bootstrap, firewall control, and drift monitoring"
+requires-python = ">=3.12"
+dependencies = ["ansible-core>=2.21,<2.22"]

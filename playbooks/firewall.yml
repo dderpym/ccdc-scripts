@@ -1,0 +1,13 @@
+---
+# Runtime-only: no boot persistence. The role saves --snapshot JSON on the
+# controller; discovery (no args) is normalized state, NOT a snapshot.
+# Apply: -e '{"firewall_action":"apply","firewall_tcp_ports":[22],"firewall_udp_ports":[]}'
+# Restore: -e firewall_action=restore -e firewall_restore_file=/controller/snapshot.json
+- name: Enforce or restore the host firewall, one host at a time
+  hosts: all
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+  become: true
+  roles:
+    - role: firewall
