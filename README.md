@@ -1,11 +1,12 @@
-# CCDC access + inbound firewall
+# CCDC access, firewall, integrity + LSE
 
 Bootstrap team SSH access, rotate root passwords, harden SSH, review listening
-services, enforce inbound firewall rules, and poll for drift across one Ansible
-inventory. **Commands target the whole inventory by default.**
+services, enforce inbound firewall rules, verify packaged system state, and triage
+security findings across one Ansible inventory. **Commands target the whole inventory by default.**
 
 - [Quickstart guide](#quickstart-guide)
 - [Command reference and internals](#command-reference-and-internals)
+- [Disposable local hatchery/tarpit lab](lab/README.md) — intentional package and permission faults, host-loopback services only
 
 ## Quickstart guide
 
@@ -185,8 +186,44 @@ Do not baseline an unexplained or failed configuration. Firewall enforcement is
 Root recovery passwords are for console/login or `su` where permitted, **not a
 root SSH backdoor after hardening**.
 
-### 5. Open the three monitoring panes
+### 5. Triage current vulnerabilities and start the combined monitor
 
+Beginning-of-competition workflow (review and baseline **only** SSH/firewall as
+explained above):
+
+```sh
+./scripts/ccdcctl init
+./scripts/ccdcctl ssh configure
+./scripts/ccdcctl firewall configure
+./scripts/ccdcctl ssh baseline       # only after reviewing effective policy
+./scripts/ccdcctl firewall baseline  # only after reviewing effective policy
+
+# Find non-stock/tampered system state:
+./scripts/ccdcctl integrity
+# Find high-confidence dangerous Linux configuration:
+./scripts/ccdcctl lse
+
+# Teammates investigate and remediate findings, then run continuously:
+./scripts/ccdcctl monitor
+```
+
+Integrity and LSE are **not baseline-driven**. An initially compromised binary
+or dangerous sudo/persistence condition remains a finding until fixed. Each
+new scan evaluates current state; it never accepts the initial vulnerability as
+trusted. Detection does not perform repairs. Detailed evidence is saved under
+`reports/<host>/`; terminal output is severity-ranked and capped at 40 findings
+per host, with remaining findings available in JSON.
+
+The combined monitor uses independent workers: SSH/firewall default to 10s,
+integrity to 60s, and LSE to 180s. A slow LSE run does not hold up SSH/firewall.
+Startup lists intervals; afterwards it prints only new/changed/resolved findings
+or scanner/connectivity failures, not periodic `OK` lines.
+
+### 6. Optional separate tmux views
+
+Use the combined monitor above for all four modules. The following optional
+three-pane arrangement focuses on the existing network views; it does **not**
+include integrity/LSE unless you run the combined monitor in another window.
 The three views use existing commands, not a separate dashboard application:
 
 ```text
@@ -526,42 +563,141 @@ timer-based automatic rollback daemon.
 It neither changes rules nor provides rollback. Enforcement is **runtime-only**,
 not a distro-specific boot firewall manager: reapply after reboot.
 
-### `monitor [ssh|firewall]`: polling and alerts
+### `integrity [status] [host|all] [--deep]`
 
 ```sh
-./scripts/ccdcctl monitor                          # both kinds, every 60 seconds
-./scripts/ccdcctl monitor ssh --interval 30
-./scripts/ccdcctl monitor firewall --host hatchery
-./scripts/ccdcctl monitor ssh --host hatchery --once
-./monitor/ssh-monitor --interval 30                # wrapper for monitor ssh
-./monitor/firewall-monitor --interval 30           # wrapper for monitor firewall
+./scripts/ccdcctl integrity
+./scripts/ccdcctl integrity hatchery
+./scripts/ccdcctl integrity status hatchery --deep
+./scripts/ccdcctl monitor integrity
+make integrity HOST=hatchery
 ```
 
-Omitting the kind monitors both SSH and firewall. `--host` defaults to `all`;
-`--interval` defaults to 60 seconds and must be at least 5. A cycle's duration is
-in addition to the sleep interval. `--once` performs one cycle and returns nonzero
-if any alerts are present.
+Uses native package-manager verification plus a small critical-file metadata
+check. Its source of truth is the operating system/package database, **not an
+initial competition baseline**. Anything differing from known package/system
+state remains visible until fixed. There is no integrity baseline command.
 
-Every cycle re-enumerates inventory and reruns the same privileged discovery
-scripts used by status/baseline commands. Normalized JSON is compared with the
-controller baselines. Healthy hosts are quiet; changed alert conditions print:
+Normal verification uses Alpine `apk audit --system --check-permissions` (with
+installed-option detection), plus a bounded native `--backup` audit of `/etc`
+because `--system` skips protected configuration contents. Added-file codes from
+that configuration pass are discarded; vendor config differences remain findings.
+RPM systems use `rpm -Va --noscripts` (never verifier scripts), Debian/Ubuntu
+use `dpkg --verify` (no debsums dependency), and Void uses XBPS file verification.
+Unsupported options, verification errors, and timeouts produce warnings, not a
+false clean result. XBPS verification uses a temporary metadata copy inside a
+private mount namespace because its verifier can write/convert the database;
+without namespace privileges it reports incomplete coverage rather than touching
+the live database. Coverage differs by distribution: dpkg in particular cannot
+verify all metadata. The bounded critical-path check supplements that with
+numeric UID/GID, mode, file type, and symlink metadata; conservative security
+rules are explicit checks, not learned first-run values.
 
-- `CRITICAL`: observed state differs, with an expected/observed diff.
-- `WARNING`: missing/invalid baseline, unreachability, or failed discovery.
-- `INFO`: a previously alerting host recovers/matches its baseline.
+Modified privileged executables and dangerous ownership/mode changes are
+`CRITICAL`; important security configurations are `WARNING`; ordinary package
+configuration differences are `REVIEW`. Configuration differences are never
+permanently suppressed, including intentional SSH changes made by this repo.
+Investigate rather than blindly restoring scoring configurations.
 
-Identical alerts do not repeat every cycle. SSH source changes and firewall rule
-ordering are meaningful; timestamps/traffic counters are excluded. Newly added
-hosts need initialization and explicit baselines. This is **state polling**, not
-SSH login-log auditing, service health monitoring, or automatic remediation.
+`--deep` is a manual expanded audit: Alpine may use `--full` to include added
+files. Normal polling uses neither `--full` nor `--details`. Other package
+managers already verify their installed package set. Raw evidence and normalized
+records replace `reports/<host>/integrity/{raw.txt,report.json}` each scan.
+No scan executes reinstall/fix/restore commands or automatically changes modes,
+owners, or package-owned configuration. A compromised package database/verifier
+can lie; corroborate serious findings through a trusted console/vendor source.
 
-Baselines **never auto-update**. Both baseline commands leave failed hosts'
-previous baselines intact. After a legitimate change, inspect status before
-explicitly accepting a new baseline; do not hide unexplained drift by rebaselining.
+### `lse [status] [host|all] [--deep]`
+
+```sh
+./scripts/ccdcctl lse
+./scripts/ccdcctl lse hatchery
+./scripts/ccdcctl lse hatchery --deep
+./scripts/ccdcctl monitor lse
+make lse HOST=hatchery
+```
+
+Provides a high-signal security and privilege/persistence triage pass using the
+pinned, vendored Linux Smart Enumeration script: version **4.14nw**, commit
+`fcad39438dc10ac8a8e9c2e2800bf3864c6ab826`, GPL-3.0. See
+[`vendor/LSE-PROVENANCE.md`](vendor/LSE-PROVENANCE.md) for upstream and license.
+The scanner never downloads executable code.
+The default run uses only LSE's highest-priority (level-0) findings, no color,
+noninteractive operation, and no process-watching delay. Only affirmative
+security tests are summarized; informational enumeration stays out of the live
+terminal. Stable test IDs and normalized context identify findings where possible.
+LSE runs as the configured login account (normally `oski`), **without become**:
+root readability/writability is not evidence of an unprivileged escalation.
+The team's intentionally passwordless sudo is still reported for review, not
+silently accepted. Only selected level-0 tests and required dependencies execute
+normally; manual deep mode also selects actionable level-1 tests. Process-watcher
+tests are excluded because this pinned version would wait with `-p 0`.
+Missing optional utilities and BusyBox `find` lacking `-writable` generate explicit
+coverage warnings; other tests still run. Install compatible tools separately if
+full coverage is needed. Coverage warnings do not resolve previously detected
+conditions for affected tests, but do not block unrelated resolutions.
+
+`--deep` runs level 1 for a more thorough manual investigation, not the normal
+monitor loop. Complete human-readable output replaces `reports/<host>/lse.txt`
+and `reports/<host>/lse/raw.txt`; parsed records replace
+`reports/<host>/lse/report.json`. Reports can contain sensitive data and are
+private/gitignored. LSE is triage, not a proof that the host is secure.
+
+Findings are **not baselined or accepted as normal** merely because they were
+present when the competition started. There is no LSE baseline command.
+The workflow for both scanners is **finding → investigate/fix → next scan verifies
+it is gone**, not first scan → accept vulnerability → ignore forever.
+Scanner commands return nonzero for findings or incomplete/failed scans.
+
+### `monitor [ssh|firewall|integrity|lse]`: polling and alerts
+
+```sh
+./scripts/ccdcctl monitor                          # all four, independent schedules
+./scripts/ccdcctl monitor ssh --interval 30
+./scripts/ccdcctl monitor firewall --host hatchery
+./scripts/ccdcctl monitor integrity
+./scripts/ccdcctl monitor lse --host hatchery
+./scripts/ccdcctl monitor ssh --host hatchery --once
+./monitor/ssh-monitor --interval 30                # existing wrapper
+./monitor/firewall-monitor --interval 30           # existing wrapper
+make monitor
+```
+
+Omitting the kind monitors all four. `--host` defaults to `all`. Set intervals in
+inventory `all.vars` or individual host variables:
+
+```yaml
+ssh_poll_interval: 10
+firewall_poll_interval: 10
+integrity_poll_interval: 60
+lse_poll_interval: 180
+```
+
+These are also the defaults. `--interval SECONDS` explicitly overrides all
+selected modules; intervals must be 5..86400 seconds. Each module has its own
+worker and schedule; scans never overlap themselves, and a slow scan does not
+block other modules. The inventory is refreshed periodically. `--once` scans
+each selected module once and returns nonzero if active alerts exist.
+
+SSH/firewall alone compare effective policy with reviewed controller baselines.
+Integrity/LSE repeatedly evaluate current known-good/security state. Runtime
+alert deduplication suppresses repeat **terminal messages**, not findings: status
+and latest reports still show persistent conditions. New or materially changed
+findings alert immediately; disappeared findings emit one `RESOLVED` event.
+A failed/incomplete scan does not claim previous findings were fixed. Scanner
+and connectivity failures are deduplicated too. Restarting rediscovers all
+current findings; no persistent integrity/LSE acceptance state is stored.
+
+Healthy hosts are quiet. This is state polling, not login-log auditing,
+service health monitoring, or automatic remediation. New hosts need init and
+explicit reviewed **SSH/firewall only** baselines. Those baselines never
+auto-update; failed baseline commands leave previous trust intact. After a
+legitimate SSH/firewall policy change, inspect status before explicitly accepting
+it; do not hide unexplained drift by rebaselining.
 
 ### Make aliases and controller files
 
-`make ping/init/ssh/listeners/firewall/baseline/monitor` wrap the corresponding
+`make ping/init/ssh/listeners/firewall/integrity/lse/baseline/monitor` wrap the corresponding
 commands. `make ssh HOST=hatchery` targets one inventory alias. `make baseline`
 accepts **both** SSH and firewall state; use it only after review. First-run
 password storage uses the explicit CLI flag from the quickstart, not `make init`.
@@ -576,7 +712,10 @@ Use an activated environment, or `uv run make ping` / `uv run make test`.
 | `secrets/root/<host>.password` and backups | Plaintext generated recovery passwords |
 | `reports/listeners.{txt,json}` | Latest selected-host listener inventory |
 | `reports/rollback/<host>/firewall.json` | Latest pre-apply firewall snapshot |
-| `baselines/<host>/{ssh,firewall}.json` | Explicitly accepted monitoring state |
+| `baselines/<host>/{ssh,firewall}.json` | Explicitly accepted SSH/firewall monitoring state only |
+| `reports/<host>/{integrity,lse}/{raw.txt,report.json}` | Latest raw evidence and current normalized findings |
+| `reports/<host>/lse.txt` | Latest human-readable LSE report |
+| `vendor/lse.sh` | Pinned upstream security triage script; never downloaded at runtime |
 
 Private keys belong outside the repository. Secrets, report contents, baselines,
 and `.venv` are gitignored; the placeholder directory markers remain tracked.
@@ -589,9 +728,10 @@ and target Python compatible with the locked Ansible release. Do not assume
 systemd. Test representative distro/init VMs before competition; offline checks
 do not establish compatibility with every legacy release.
 
-There are no package upgrades, kernel/application/database hardening, generic
-persistence hunts, or vulnerability scans. Delegate those tasks using the
-listener inventory. Init's missing Python/sudo prerequisites are its only package
+There are no automatic package upgrades/repairs, kernel/application/database
+hardening, CVE scanning, dashboards, SIEM, antivirus, or generic malware scans.
+LSE provides bounded security/persistence triage, not automatic remediation.
+Delegate repairs using scanner evidence and the listener inventory. Init's missing Python/sudo prerequisites are its only package
 installations; firewall forwarding/NAT and unrelated policy are not targets.
 
 ```sh
@@ -600,6 +740,7 @@ uv run make test
 uv run ansible-playbook playbooks/init.yml --syntax-check
 uv run ansible-playbook playbooks/ssh.yml --syntax-check
 uv run ansible-playbook playbooks/firewall.yml --syntax-check
+uv run ansible-playbook playbooks/lse.yml --syntax-check
 ```
 
 Tests do not contact sample inventory hosts or change real root passwords.

@@ -27,7 +27,9 @@ class CallbackModule(CallbackBase):
         path.chmod(0o600)
 
     def v2_runner_on_ok(self, result):
-        self._save(result)
+        task = os.environ.get("CCDC_RESULT_TASK")
+        if not task or result._task.get_name().split(" : ")[-1] == task:
+            self._save(result)
 
     def v2_runner_on_failed(self, result, ignore_errors=False):
         self._save(result)

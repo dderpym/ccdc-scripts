@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Inventory-wide controller. Ansible owns transport; host scripts own state."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import difflib
 import getpass
 import json
@@ -18,7 +19,7 @@ ROOT = Path(__file__).resolve().parent.parent
 EXTRA = shlex.split(os.environ.get("ANSIBLE_ARGS", ""))
 
 
-def run(args, capture=True, result_dir=None):
+def run(args, capture=True, result_dir=None, result_task=None):
     env = dict(os.environ, ANSIBLE_CONFIG=str(ROOT / "ansible.cfg"),
                ANSIBLE_NOCOLOR="1")
     if result_dir:
@@ -26,6 +27,10 @@ def run(args, capture=True, result_dir=None):
                    ANSIBLE_CALLBACKS_ENABLED="ccdc_results")
     else:
         env.pop("CCDC_RESULT_DIR", None)
+    if result_task:
+        env["CCDC_RESULT_TASK"] = result_task
+    else:
+        env.pop("CCDC_RESULT_TASK", None)
     return subprocess.run(args, cwd=ROOT, env=env, text=True,
                           stdout=subprocess.PIPE if capture else None,
                           stderr=subprocess.PIPE if capture else None, check=False)
@@ -62,9 +67,14 @@ def collect(kind, hosts, args=()):
     """One Ansible batch; retain successful hosts even if another is unreachable."""
     module_args = shlex.join([str(ROOT / "scripts" / f"discover-{kind}"), *args])
     with tempfile.TemporaryDirectory(prefix="ccdc-results-") as directory:
-        result = run(["ansible", "all", "--limit", ":".join(hosts), "--become",
-                      "-m", "ansible.builtin.script", "-a", module_args,
-                      *EXTRA], result_dir=directory)
+        if kind == "lse":
+            result = run(["ansible-playbook", "playbooks/lse.yml", "--limit", ":".join(hosts),
+                          *EXTRA, "--extra-vars", json.dumps({"lse_deep": "--deep" in args})],
+                         result_dir=directory, result_task="Collect LSE security state")
+        else:
+            result = run(["ansible", "all", "--limit", ":".join(hosts), "--become",
+                          "-m", "ansible.builtin.script", "-a", module_args,
+                          *EXTRA], result_dir=directory)
         states, errors = {}, {}
         for host in hosts:
             try:
@@ -525,6 +535,8 @@ def rollback(hosts):
 
 
 def baseline(kind, hosts):
+    if kind not in ("ssh", "firewall"):
+        raise RuntimeError("Only SSH and firewall have trusted baselines")
     states, errors = collect(kind, hosts)
     for host, state in states.items():
         save(ROOT / "baselines" / host / f"{kind}.json", state)
@@ -539,40 +551,237 @@ def drift(expected, observed):
     return "\n".join(difflib.unified_diff(before, after, fromfile="expected", tofile="observed", lineterm=""))
 
 
-def monitor(kinds, target, interval, once=False):
-    previous = {}
-    hosts, _ = select(target)
-    print(f"Monitoring {len(hosts)} hosts...", flush=True)
-    while True:
-        hosts, _ = select(target)
-        current = {}
-        for kind in kinds:
-            states, errors = collect(kind, hosts)
-            for host in hosts:
-                key = (host, kind)
-                if host in errors:
-                    current[key] = "WARNING - unreachable/discovery failed: " + errors[host]
-                    continue
-                path = ROOT / "baselines" / host / f"{kind}.json"
+SCANNERS = ("integrity", "lse")
+POLL_INTERVALS = {"ssh": 10, "firewall": 10, "integrity": 60, "lse": 180}
+SEVERITIES = {"critical": 0, "warning": 1, "review": 2}
+
+
+def terminal(text):
+    """Remote text is evidence, not terminal escape sequences."""
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", str(text))
+    return "".join(c if c.isprintable() or c == "\n" else "?" for c in text)
+
+
+def scanner_state(state):
+    if not isinstance(state, dict) or not isinstance(state.get("findings"), list):
+        raise ValueError("Invalid scanner result")
+    for finding in state["findings"]:
+        if not isinstance(finding, dict) or not isinstance(finding.get("id"), str) or not finding["id"] or not isinstance(finding.get("summary"), str):
+            raise ValueError("Invalid scanner finding")
+        if not isinstance(finding.get("severity"), str) or finding["severity"] not in SEVERITIES:
+            raise ValueError("Invalid scanner severity")
+        if "path" in finding and not isinstance(finding["path"], str):
+            raise ValueError("Invalid scanner path")
+    if not isinstance(state.get("errors", []), list) or not all(isinstance(e, str) for e in state.get("errors", [])):
+        raise ValueError("Invalid scanner errors")
+    if not isinstance(state.get("raw", ""), str):
+        raise ValueError("Invalid scanner diagnostics")
+    if not isinstance(state.get("incomplete_ids", []), list) or not all(isinstance(item, str) for item in state.get("incomplete_ids", [])):
+        raise ValueError("Invalid scanner coverage")
+    return state
+
+
+def scan(kind, hosts, deep=False):
+    states, errors = collect(kind, hosts, ["--deep"] if deep else [])
+    valid = {}
+    for host, state in states.items():
+        try:
+            scanner_state(state)
+            report = {k: v for k, v in state.items() if k != "raw"}
+            save(ROOT / "reports" / host / kind / "report.json", report)
+            text_file(ROOT / "reports" / host / kind / "raw.txt", state.get("raw", ""))
+            if kind == "lse":
+                text_file(ROOT / "reports" / host / "lse.txt", state.get("raw", ""))
+            valid[host] = state
+        except (OSError, ValueError) as exc:
+            errors[host] = str(exc)
+    for host, error in errors.items():
+        # Never leave a stale clean report when transport or validation fails.
+        save(ROOT / "reports" / host / kind / "report.json", {"findings": [], "errors": [error], "incomplete": True})
+        text_file(ROOT / "reports" / host / kind / "raw.txt", "Scanner/transport failure: " + error + "\n")
+        if kind == "lse":
+            text_file(ROOT / "reports" / host / "lse.txt", "Scanner/transport failure: " + error + "\n")
+    return valid, errors
+
+
+def security_status(kind, hosts, deep=False):
+    states, errors = scan(kind, hosts, deep)
+    active = bool(errors)
+    for host in hosts:
+        print(f"\n{'=' * 50}\n{host} - {'SYSTEM INTEGRITY' if kind == 'integrity' else 'LSE'}\n{'=' * 50}")
+        if host in errors:
+            print("WARNING\n    " + terminal(errors[host]))
+            continue
+        state = states[host]
+        findings = sorted(state["findings"], key=lambda f: (SEVERITIES[f["severity"]], f.get("path", f["id"]), f["summary"]))
+        shown = 0
+        for severity in SEVERITIES:
+            matching = [f for f in findings if f["severity"] == severity]
+            if not matching:
+                continue
+            print("\n" + severity.upper())
+            for finding in matching:
+                if shown >= 40:
+                    break
+                print("\n" + terminal(finding.get("path") or finding["id"]))
+                print("    " + terminal(finding["summary"]).replace("\n", "\n    "))
+                for detail in ("expected", "observed", "context"):
+                    if detail in finding:
+                        evidence = terminal(finding[detail])
+                        if len(evidence) > 1000:
+                            evidence = evidence[:1000] + " ... (full evidence in report)"
+                        print(f"    {detail}: " + evidence.replace("\n", "\n    "))
+                shown += 1
+        if len(findings) > shown:
+            print(f"\n{len(findings) - shown} additional findings in reports/{host}/{kind}/report.json")
+        for error in state.get("errors", [])[:5]:
+            print("WARNING scanner: " + terminal(error)[:1000])
+        if len(state.get("errors", [])) > 5:
+            print(f"{len(state['errors']) - 5} additional scanner diagnostics in report")
+        print("\nSummary: " + ", ".join(f"{sum(f['severity'] == s for f in findings)} {s}" for s in SEVERITIES))
+        if state.get("errors"):
+            print("Scan incomplete; absence of findings does not prove clean state.")
+        active = active or bool(findings or state.get("errors"))
+    return active
+
+
+def monitor_poll(kind, hosts):
+    try:
+        return scan(kind, hosts) if kind in SCANNERS else collect(kind, hosts)
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
+        return {}, {host: str(exc) for host in hosts}
+
+
+def monitor_events(previous, kind, hosts, states, errors):
+    """Temporary alert deduplication; never trusted security state."""
+    events = []
+    for host in hosts:
+        key = (host, kind)
+        old = previous.get(key, {"findings": {}, "error": ""})
+        error = errors.get(host, "")
+        findings = {}
+        incomplete = set()
+        if not error:
+            state = states.get(host)
+            if state is None:
+                error = "No scanner result"
+            elif kind in SCANNERS:
+                error = "; ".join(state.get("errors", []))
+                incomplete = set(state.get("incomplete_ids", []))
+                for finding in state["findings"]:
+                    # LSE groups independent contexts under each stable test ID.
+                    identity = (finding["id"], finding.get("path", ""))
+                    findings[identity] = finding
+            else:
                 try:
-                    expected = json.loads(path.read_text())
+                    expected = json.loads((ROOT / "baselines" / host / f"{kind}.json").read_text())
+                    if state != expected:
+                        findings[("drift",)] = {"severity": "critical", "summary": "drift\n" + drift(expected, state)}
                 except (OSError, ValueError) as exc:
-                    current[key] = f"WARNING - missing/invalid baseline: {exc}"
+                    error = "missing/invalid baseline: " + str(exc)
+        if error and error != old["error"]:
+            events.append(("WARNING", host, kind, "scanner/connectivity failure: " + error))
+        elif not error and old["error"]:
+            events.append(("RESOLVED", host, kind, "scanner/connectivity recovered"))
+        for identity, finding in findings.items():
+            if finding != old["findings"].get(identity):
+                change = "CHANGED" if identity in old["findings"] else "NEW"
+                label = finding.get("path") or finding.get("id", "")
+                details = "".join(f"\n    {field}: {terminal(finding[field])[:1000]}" for field in ("expected", "observed", "context") if field in finding)
+                events.append((finding["severity"].upper(), host, kind, f"{change}: {label} {finding['summary']}{details}"))
+        if not error:
+            for identity, finding in old["findings"].items():
+                if identity not in findings and finding.get("id") in incomplete:
+                    findings[identity] = finding
                     continue
-                if states[host] != expected:
-                    current[key] = "CRITICAL - drift\n" + drift(expected, states[host])
-                else:
-                    current[key] = ""
-        for (host, kind), message in current.items():
-            key = (host, kind)
-            if message and message != previous.get(key):
-                print(f"[{time.strftime('%H:%M:%S')}] {host} {kind}: {message}", flush=True)
-            elif not message and previous.get(key):
-                print(f"[{time.strftime('%H:%M:%S')}] INFO - {host} {kind} recovered / baseline matches", flush=True)
-        previous = current
-        if once:
-            return any(current.values())
-        time.sleep(interval)
+                if identity not in findings:
+                    label = finding.get("path") or finding.get("id", "policy")
+                    resolution = (f"{label}: {finding['summary']} no longer detected" if kind in SCANNERS
+                                  else f"{label} policy matches expected state")
+                    events.append(("RESOLVED", host, kind, resolution))
+        else:
+            # Failed/partial scans cannot establish that a previous finding was fixed.
+            findings = {**old["findings"], **findings}
+        previous[key] = {"findings": findings, "error": error}
+    return events
+
+
+def emit_monitor_events(events):
+    batches = {}
+    for event in events:
+        batches.setdefault((event[1], event[2]), []).append(event)
+    for (host, kind), batch in batches.items():
+        batch.sort(key=lambda event: SEVERITIES.get(event[0].lower(), 3))
+        notices = [e for e in batch if "scanner/connectivity" in e[3] or e[0] == "RESOLVED"]
+        findings = [e for e in batch if e not in notices]
+        for severity, _, _, message in notices + findings[:40]:
+            rendered = terminal(message)
+            if kind in SCANNERS and len(rendered) > 4096:
+                rendered = rendered[:4096] + " ... (full evidence in report)"
+            print(f"[{time.strftime('%H:%M:%S')}] {severity} {host} {kind.upper()}\n" + rendered, flush=True)
+        if len(findings) > 40:
+            print(f"[{time.strftime('%H:%M:%S')}] WARNING {host} {kind.upper()}\n"
+                  f"{len(findings) - 40} additional finding events; inspect current status/reports.", flush=True)
+
+
+def polling_intervals(kinds, hosts, variables, override=None):
+    result = {}
+    for kind in kinds:
+        for host in hosts:
+            value = override if override is not None else variables.get(host, {}).get(kind + "_poll_interval", POLL_INTERVALS[kind])
+            seconds = float(value)
+            if not 5 <= seconds <= 86400:
+                raise ValueError(f"{host}: {kind}_poll_interval must be 5..86400 seconds")
+            result[(host, kind)] = seconds
+    return result
+
+
+def monitor(kinds, target, interval=None, once=False):
+    hosts, variables = select(target)
+    intervals = polling_intervals(kinds, hosts, variables, interval)
+    print(f"Monitoring {len(hosts)} hosts", flush=True)
+    for kind in kinds:
+        values = sorted({intervals[(host, kind)] for host in hosts})
+        print(f"{kind.upper():10} {','.join(f'{v:g}s' for v in values)}", flush=True)
+    previous, pending, due, completed = {}, {}, {}, set()
+    refresh = time.monotonic() + 10
+    executor = ThreadPoolExecutor(max_workers=len(kinds))
+    try:
+        while True:
+            now = time.monotonic()
+            if not once and now >= refresh:
+                hosts, variables = select(target)
+                intervals = polling_intervals(kinds, hosts, variables, interval)
+                refresh = now + 10
+                previous = {key: value for key, value in previous.items() if key[0] in hosts}
+            for kind in kinds:
+                if kind in pending or (once and kind in completed):
+                    continue
+                ready = [host for host in hosts if due.get((host, kind), 0) <= now]
+                if ready:
+                    pending[kind] = (executor.submit(monitor_poll, kind, ready), ready)
+                    for host in ready:
+                        due[(host, kind)] = now + intervals[(host, kind)]
+            if once and len(completed) == len(kinds):
+                return any(item["error"] or item["findings"] for item in previous.values())
+            wake = [refresh] if not once else []
+            wake += [due.get((host, kind), now) for kind in kinds if kind not in pending and not (once and kind in completed) for host in hosts]
+            timeout = max(0, min(wake) - time.monotonic()) if wake else None
+            futures = [future for future, _ in pending.values()]
+            if futures:
+                done, _ = wait(futures, timeout=timeout, return_when=FIRST_COMPLETED)
+            else:
+                time.sleep(timeout if timeout is not None else 1)
+                done = set()
+            for kind, (future, batch) in list(pending.items()):
+                if future not in done:
+                    continue
+                states, errors = future.result()
+                emit_monitor_events(monitor_events(previous, kind, batch, states, errors))
+                completed.add(kind)
+                del pending[kind]
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def main():
@@ -590,16 +799,29 @@ def main():
         cmd = sub.add_parser(command)
         cmd.add_argument("action", choices=["status", "configure", "baseline"] + (["rollback"] if command == "firewall" else []))
         cmd.add_argument("target", nargs="?", default="all")
+    for command in SCANNERS:
+        cmd = sub.add_parser(command, help="read-only current security findings; no baseline")
+        cmd.add_argument("action_or_target", nargs="?", default="status", metavar="[status|HOST]")
+        cmd.add_argument("target", nargs="?", help="inventory hostname (after status)")
+        cmd.add_argument("--deep", action="store_true", help="manual deeper scan; never used by monitor")
     cmd = sub.add_parser("monitor")
-    cmd.add_argument("kind", nargs="?", choices=["ssh", "firewall"])
+    cmd.add_argument("kind", nargs="?", choices=list(POLL_INTERVALS))
     cmd.add_argument("--host", default="all")
-    cmd.add_argument("--interval", type=int, default=60)
+    cmd.add_argument("--interval", type=int, default=None, help="override all selected module intervals; otherwise use inventory/defaults")
     cmd.add_argument("--once", action="store_true", help="one poll, nonzero if alerts (debugging)")
     args = parser.parse_args()
     if args.command == "monitor":
-        if args.interval < 5:
+        if args.interval is not None and args.interval < 5:
             parser.error("--interval must be at least 5 seconds")
-        return monitor([args.kind] if args.kind else ["ssh", "firewall"], args.host, args.interval, args.once)
+        return monitor([args.kind] if args.kind else list(POLL_INTERVALS), args.host, args.interval, args.once)
+    if args.command in SCANNERS:
+        if args.action_or_target == "baseline":
+            parser.error(f"{args.command} has no baseline acceptance")
+        if args.action_or_target != "status" and args.target is not None:
+            parser.error("use MODULE [status] [HOST]")
+        target = (args.target or "all") if args.action_or_target == "status" else args.action_or_target
+        hosts, _ = select(target)
+        return security_status(args.command, hosts, args.deep)
     hosts, variables = select(args.target)
     if args.command == "init":
         return initialize(hosts, args.target, args.bootstrap_password_file, args.save_bootstrap_password, not args.no_bootstrap_password)
@@ -622,7 +844,7 @@ if __name__ == "__main__":
     try:
         sys.exit(int(bool(main())))
     except KeyboardInterrupt:
-        print("\nInterrupted; baselines unchanged.", file=sys.stderr)
+        print("\nInterrupted; no security state accepted.", file=sys.stderr)
         sys.exit(130)
     except EOFError:
         print("\nInput closed; no further changes applied.", file=sys.stderr)

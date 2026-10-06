@@ -1,0 +1,253 @@
+"""Offline LSE fixtures, real subprocesses, and optional local Ansible transport.
+
+No production-host scans, downloads, privilege escalation or network needed.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import MagicMock, patch
+
+from test_controller import ROOT, load
+
+lse = load('discover-lse')
+
+
+def block(test_id, summary, body, marker='!', status='yes!'):
+    return '[%s] %s %s....... %s\n---\n%s\n---\n' % (marker, test_id, summary, status, body)
+
+
+FIXTURE = (
+    '\x1b[32m LSE Version: 4.14nw\x1b[0m\n User ID: 1000\n Hostname: fixture\n'
+    + block('fst000', 'Writable files outside home', '/tmp/inventory', '*')
+    + block('fst010', 'Binaries with setuid bit', '/usr/bin/sudo', '*')
+    + block('fst030', 'Writable setuid binaries', '/opt/suid\n/opt/suid')
+    + block('fst160', 'Writable critical files', '-rw-rw-r-- 1 root staff 432 Oct 5 10:22 /etc/sudoers')
+    + block('fst210', 'NFS exports', '# /disabled *(no_root_squash)\n/export *(rw,no_root_squash)')
+    + block('fst210', 'NFS exports', '/ignored *(no_root_squash)', status='nope')
+    + block('sys020', 'Passwd hashes', 'locked:!:1:1::/:/bin/sh\nempty::2000:2000::/:/bin/sh')
+    + block('sys030', 'Readable shadow', '/etc/shadow\n---\nroot:$6$SECRET:20000:0:99999:7:::')
+    + block('sys040', 'Other superusers', 'backdoor', '*')
+    + block('sof020', 'PostgreSQL template0 as postgres', 'version')
+    + block('sof020', 'PostgreSQL template1 as postgres', 'version')
+    + block('sof020', 'PostgreSQL template0 as psql', 'version')
+    + block('sof020', 'PostgreSQL template1 as psql', 'version')
+    + block('sof020', 'PostgreSQL template1 as psql', 'version')
+    + block('sof000', 'MySQL root/root', 'Server version 8.0\nUptime: 2381\nThreads: 2 Questions: 7')
+    + block('sys060', 'Shell inventory', '/bin/bash', 'i')
+    + block('srv500', 'Writable systemd services', '/etc/systemd/hidden.service', status='skip')
+    + '================( FINISHED )================\n'
+)
+
+
+class LSETests(unittest.TestCase):
+    def test_affirmative_actionable_only_and_multiple_independent_contexts(self):
+        result = lse.parse(FIXTURE)
+        by_id = {finding['id']: finding for finding in result['findings']}
+        self.assertEqual(set(result), {'findings', 'raw', 'errors'})
+        self.assertEqual(set(by_id), {'fst030', 'fst160', 'fst210', 'sys020', 'sys030', 'sof020', 'sof000'})
+        self.assertEqual(len(by_id['sof020']['context']), 4)
+        self.assertEqual(by_id['fst030']['context'][0]['evidence'], ['/opt/suid'])
+        self.assertEqual(by_id['sys030']['context'][0]['evidence'], ['/etc/shadow'])
+        self.assertEqual(by_id['fst160']['context'][0]['evidence'], ['-rw-rw-r-- root staff /etc/sudoers'])
+        for unwanted in ('SECRET', 'inventory', 'fixture', 'Uptime', 'Threads', 'Oct 5', '/disabled', '/ignored', 'locked:', 'hidden.service', '\x1b'):
+            self.assertNotIn(unwanted, json.dumps(result['findings']))
+        self.assertEqual(result['raw'], FIXTURE)
+        self.assertEqual(result['errors'], [])
+        self.assertEqual(by_id['fst210']['severity'], 'critical')
+        self.assertIn('sys040', {finding['id'] for finding in lse.parse(FIXTURE, deep=True)['findings']})
+
+    def test_long_titles_without_dot_padding_are_not_lost(self):
+        text = '[!] sof010 Can we connect to mysql as root without password and execute commands? yes!\n---\nServer version 8\n---\n'
+        finding = lse.parse(text)['findings'][0]
+        self.assertEqual(finding['id'], 'sof010')
+        self.assertFalse(finding['context'][0]['summary'].endswith('.'))
+
+    def test_normalized_reruns_identical_without_losing_distinct_evidence(self):
+        first = FIXTURE + block('fst200', 'Possible history credentials',
+                                '2026-10-05T10:20:30Z PID=812 login=test\nRuntime: 3.1s\nElapsed: 4s')
+        second = first.replace('Oct 5 10:22', 'Nov 6 2025').replace('432', '999')
+        second = second.replace('2026-10-05T10:20:30Z', '2027-11-06T11:21:31Z').replace('PID=812', 'PID=991')
+        self.assertEqual(lse.parse(first)['findings'], lse.parse(second)['findings'])
+        text = block('fst030', 'Writable setuid binaries', '/opt/a') + block('fst030', 'Writable setuid binaries', '/opt/b')
+        self.assertEqual(len(lse.parse(text)['findings'][0]['context']), 2)
+        sockets = block('sof160', 'Writable screen sockets', 'srw-rw-rw- 1 other other 0 Oct 5 10:22 /run/screen/S-other/123.pts-0.host')
+        self.assertEqual(lse.parse(sockets)['findings'], lse.parse(sockets.replace('/123.', '/999.'))['findings'])
+        mongo = block('sof170', 'MongoDB without credentials', 'admin 0.005GB', '*')
+        self.assertEqual(lse.parse(mongo, True)['findings'], lse.parse(mongo.replace('0.005GB', '1.000GB'), True)['findings'])
+
+    def test_negative_skipped_warning_and_inventory_not_findings(self):
+        text = block('fst030', 'Writable setuid', '/fake', status='skip')
+        text += block('fst030', 'Writable setuid', '/fake', status='nope')
+        text += block('fst030', 'Writable setuid', 'WARNING: missing utility')
+        text += block('net550', 'TCP inventory', '0.0.0.0:80', 'i')
+        text += block('sys020', 'Passwd hashes', 'locked:*:1:1\nlocked2:!!:2:2')
+        self.assertEqual(lse.parse(text), {'findings': [], 'raw': text, 'errors': []})
+
+    def test_root_permissions_not_misreported_as_vulnerabilities(self):
+        text = FIXTURE.replace('User ID: 1000', 'User ID: 0')
+        ids = {finding['id'] for finding in lse.parse(text)['findings']}
+        self.assertNotIn('fst030', ids)
+        self.assertNotIn('sys030', ids)
+        self.assertIn('fst210', ids)
+        self.assertIn('LSE ran as root; permission checks cannot assess an unprivileged account', lse.parse(text)['errors'])
+
+    def test_pin_and_selection_match_actual_upstream_source(self):
+        data = (ROOT / 'vendor/lse.sh').read_bytes()
+        self.assertEqual(hashlib.sha256(data).hexdigest(), 'a0c526f560189c81bc66303b81e828edabc68deed7e7bd28aed55a792c6d25c3')
+        source = data.decode()
+        self.assertIn('lse_version="4.14nw"', source)
+        for test_id in lse.selection(True).split(','):
+            self.assertIn('lse_test "%s"' % test_id, source)
+        self.assertNotIn('sys040', lse.SELECTION.split(','))
+        self.assertNotIn('sof170', lse.SELECTION.split(','))
+        self.assertIn('sys040', lse.selection(True).split(','))
+        for test_id in ('fst000', 'fst010', 'usr070', 'sec010', 'ret050'):
+            self.assertIn(test_id, lse.SELECTION.split(','))
+        for omitted in ('net010', 'pro000', 'sys060', 'srv010', 'srv510', 'ctn010', 'cve'):
+            self.assertNotIn(omitted, lse.SELECTION.split(','))
+
+    def test_pinned_flags_execute_without_interaction_or_monitor_wait(self):
+        # Only a harmless account check; never run a full scan of the test host.
+        with tempfile.TemporaryDirectory() as directory:
+            env = dict(os.environ, TMPDIR=directory, LC_ALL='C')
+            result = subprocess.run(['/bin/sh', str(ROOT / 'vendor/lse.sh'), '-c', '-i', '-l', '1', '-p', '0', '-s', 'sys040'],
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True, env=env, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('sys040', result.stdout)
+            self.assertIn('Current Output Verbosity Level: 1', result.stdout)
+            self.assertNotIn('\x1b', result.stdout)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_cli_execution_default_deep_and_warnings(self):
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / 'fixture with spaces.sh'
+            script.write_text('#!/bin/sh\ncase "$4" in 0) expected="' + lse.SELECTION + '";; 1) expected="' + lse.selection(True) + '";; esac\n'
+                              '[ "$1 $2 $3 $5 $6 $7 $8" = "-c -i -l -p 0 -s $expected" ] || exit 9\n'
+                              'read answer && exit 8\n'
+                              'printf "%s\\n" "level=$4" >&2\n'
+                              "cat <<'OUTPUT'\n" + FIXTURE + 'OUTPUT\nexit 3\n')
+            for deep in (False, True):
+                args = [sys.executable, str(ROOT / 'scripts/discover-lse'), '--script', str(script)]
+                result = subprocess.run(args + (['--deep'] if deep else []), capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr, '')
+                state = json.loads(result.stdout)
+                self.assertIn('level=%d' % deep, state['errors'])
+                self.assertIn('LSE exited with status 3; findings may be incomplete', state['errors'])
+                self.assertEqual(state['findings'], lse.parse(FIXTURE, deep)['findings'])
+                self.assertIn(FIXTURE, state['raw'])
+                self.assertIn('level=%d' % deep, state['raw'])
+
+    def test_missing_script_returns_json_error(self):
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/discover-lse'), '--script', '/nonexistent/ccdc/lse.sh'],
+                                capture_output=True, text=True, timeout=10)
+        state = json.loads(result.stdout)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(state['findings'], [])
+        self.assertTrue(state['errors'])
+
+    def test_unprivileged_login_path_can_still_find_admin_utilities(self):
+        process = MagicMock()
+        process.__enter__.return_value = process
+        process.returncode = 0
+        process.communicate.return_value = (FIXTURE, '')
+        with patch.dict(lse.os.environ, {'PATH': '/usr/bin:/bin'}), \
+                patch.object(lse, 'coverage', return_value=[]), \
+                patch.object(lse.subprocess, 'Popen', return_value=process) as popen:
+            lse.scan('/pinned/lse.sh')
+        self.assertIn('/usr/sbin', popen.call_args.kwargs['env']['PATH'].split(':'))
+
+    def test_optional_utility_gaps_are_explicit_and_scoped(self):
+        with patch.object(lse.shutil, 'which', return_value=None):
+            gaps = lse.coverage('/unused')
+        self.assertEqual({gap[0] for gap in gaps}, {'find', 'getcap', 'sudo'})
+        with patch.object(lse.shutil, 'which', return_value='/usr/bin/tool'), \
+                patch.object(lse.subprocess, 'run', return_value=subprocess.CompletedProcess([], 1, b'', b'unsupported -writable')):
+            busybox = lse.coverage('/unused')
+        self.assertEqual(busybox[0][0], 'find-writable')
+        self.assertIn('fst160', busybox[0][2])
+        process = MagicMock()
+        process.__enter__.return_value = process
+        process.returncode = 0
+        process.communicate.return_value = (FIXTURE, '')
+        with patch.object(lse.subprocess, 'Popen', return_value=process), patch.object(lse, 'coverage', return_value=busybox):
+            state = lse.scan('/pinned/local.sh')
+        self.assertFalse(state['errors'])
+        self.assertIn('fst160', state['incomplete_ids'])
+        self.assertIn('scanner-find-writable', {f['id'] for f in state['findings']})
+        self.assertEqual(state['raw'], FIXTURE)
+
+    def test_timeout_kills_children_keeps_partial_and_cleans_scratch(self):
+        process = MagicMock()
+        process.__enter__.return_value = process
+        process.pid = 123456
+        process.returncode = -9
+        process.communicate.side_effect = [subprocess.TimeoutExpired('lse', 180), (FIXTURE, 'warning: partial scan\n')]
+        with patch.object(lse.subprocess, 'Popen', return_value=process) as popen, \
+                patch.object(lse.os, 'killpg') as kill, patch.object(lse, 'coverage', return_value=[]):
+            state = lse.scan('/local/pinned.sh')
+        kill.assert_called_once_with(123456, lse.signal.SIGKILL)
+        self.assertTrue(state['findings'])
+        self.assertIn('LSE timed out after 180 seconds; findings may be incomplete', state['errors'])
+        self.assertFalse(Path(popen.call_args.kwargs['env']['TMPDIR']).exists())
+        self.assertTrue(popen.call_args.kwargs['start_new_session'])
+
+    @unittest.skipUnless(shutil.which('ansible-playbook'), 'Ansible is optional for offline parser tests')
+    def test_playbook_callback_preserves_stdout_after_cleanup(self):
+        # Copy the deployment layout with a fixture vendor script: exercise the
+        # REAL playbook/modules/callback, without scanning the development host.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in ('playbooks/lse.yml', 'scripts/discover-lse', 'vendor/LSE-LICENSE', 'callback_plugins/ccdc_results.py'):
+                dest = root / name
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(ROOT / name, dest)
+            seen = root / 'seen-deployment-directory'
+            (root / 'vendor/lse.sh').write_text('#!/bin/sh\nprintf "%s" "${0%/*}" > "' + str(seen) + '"\n'
+                                               + "cat <<'OUTPUT'\n" + FIXTURE + 'OUTPUT\n')
+            results = root / 'results'
+            results.mkdir(mode=0o700)
+            config = root / 'ansible.cfg'
+            config.write_text('[defaults]\ncallback_plugins = ' + str(root / 'callback_plugins') + '\ncallbacks_enabled = ccdc_results\n')
+            env = dict(os.environ, ANSIBLE_CONFIG=str(config), CCDC_RESULT_DIR=str(results), ANSIBLE_NOCOLOR='1')
+            env.pop('CCDC_RESULT_TASK', None)
+            command = ['ansible-playbook', str(root / 'playbooks/lse.yml'), '-i', 'fixture,', '-c', 'local',
+                       '-e', json.dumps({'ansible_python_interpreter': sys.executable, 'ansible_become': False, 'lse_deep': True})]
+            run = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            response = json.loads((results / 'fixture').read_text())
+            self.assertEqual(response['rc'], 0)
+            self.assertEqual(json.loads(response['stdout']), lse.parse(FIXTURE, deep=True))
+            self.assertEqual((results / 'fixture').stat().st_mode & 0o777, 0o600)
+            # The final command argv uses no removed scan path. Cleanup was run.
+            self.assertIn('Remove the host scratch directory', run.stdout)
+            self.assertEqual(response['cmd'][0], sys.executable)
+            self.assertFalse(Path(seen.read_text()).exists())
+            env['CCDC_RESULT_TASK'] = 'Collect LSE security state'
+            (results / 'fixture').unlink()
+            run = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            response = json.loads((results / 'fixture').read_text())
+            self.assertEqual(json.loads(response['stdout']), lse.parse(FIXTURE, deep=True))
+            self.assertFalse(Path(seen.read_text()).exists())
+            # A transfer failure must also clean up and publish an errors JSON,
+            # rather than letting a successful cleanup hide the original failure.
+            (root / 'scripts/discover-lse').unlink()
+            run = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            response = json.loads((results / 'fixture').read_text())
+            state = json.loads(response['stdout'])
+            self.assertEqual(state['findings'], [])
+            self.assertEqual(state['raw'], '')
+            self.assertTrue(state['errors'])
+            self.assertIn('Remove the host scratch directory', run.stdout)
+
+
+if __name__ == '__main__':
+    unittest.main()

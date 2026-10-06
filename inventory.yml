@@ -1,5 +1,10 @@
 # Add hosts here; verify their SSH host keys before use.
 all:
+  vars:
+    ssh_poll_interval: 10
+    firewall_poll_interval: 10
+    integrity_poll_interval: 60
+    lse_poll_interval: 180
   hosts:
     hatchery:
       ansible_host: 192.168.220.70

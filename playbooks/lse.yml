@@ -1,0 +1,79 @@
+---
+# Controller: run this playbook with CCDC_RESULT_DIR and ccdc_results enabled,
+# NOT the ad-hoc script collector (both pinned LSE and wrapper need transfer).
+# ccdc_lse_result is the command result; JSON is in .stdout. The final command
+# republishes it AFTER cleanup because ccdc_results saves the latest host task.
+# --extra-vars '{"lse_deep": true}' enables level 1. Never become root for
+# permission checks: authorized oski sudo access is expected, not a new exploit.
+- name: Discover actionable local privilege risks with pinned LSE
+  hosts: all
+  gather_facts: false
+  become: false
+  tasks:
+    - name: Run and remove private LSE scan files
+      when: not ansible_check_mode
+      block:
+        - name: Allocate a private host scratch directory
+          ansible.builtin.tempfile:
+            state: directory
+            prefix: ccdc-lse-deploy-
+          register: ccdc_lse_tmp
+          changed_when: false
+
+        - name: Restrict the scratch directory explicitly
+          ansible.builtin.file:
+            path: "{{ ccdc_lse_tmp.path }}"
+            state: directory
+            mode: '0700'
+          changed_when: false
+
+        - name: Transfer pinned LSE, its license, and the stdlib wrapper
+          ansible.builtin.copy:
+            src: "{{ playbook_dir }}/../{{ item.src }}"
+            dest: "{{ ccdc_lse_tmp.path }}/{{ item.dest }}"
+            mode: '0600'
+          loop:
+            - {src: vendor/lse.sh, dest: lse.sh}
+            - {src: vendor/LSE-LICENSE, dest: LSE-LICENSE}
+            - {src: scripts/discover-lse, dest: discover-lse}
+          changed_when: false
+
+        - name: Run selected checks without passwords, color, or process monitoring
+          ansible.builtin.command:
+            argv: >-
+              {{ [ansible_facts.discovered_interpreter_python | default(ansible_python_interpreter | default('/usr/bin/python3')),
+                  ccdc_lse_tmp.path ~ '/discover-lse', '--script', ccdc_lse_tmp.path ~ '/lse.sh']
+                 + (['--deep'] if lse_deep | default(false) | bool else []) }}
+          register: ccdc_lse_result
+          changed_when: false
+
+      rescue:
+        - name: Retain deployment failure as a scan error for the controller
+          ansible.builtin.set_fact:
+            ccdc_lse_result:
+              stdout: >-
+                {{ {'findings': [], 'raw': '', 'errors':
+                    [ansible_failed_result.stderr | default(ansible_failed_result.msg | default('LSE deployment failed'), true)]}
+                   | to_json }}
+
+      always:
+        - name: Remove the host scratch directory on success or failure
+          ansible.builtin.file:
+            path: "{{ ccdc_lse_tmp.path }}"
+            state: absent
+          when: ccdc_lse_tmp.path is defined
+          changed_when: false
+
+    # Do not replace with debug/set_fact: the existing collector needs top-level
+    # stdout/rc, not msg.stdout or ansible_facts. This task MUST remain last.
+    - name: Collect LSE security state
+      ansible.builtin.command:
+        argv:
+          - "{{ ansible_facts.discovered_interpreter_python | default(ansible_python_interpreter | default('/usr/bin/python3')) }}"
+          - -c
+          - 'import sys; sys.stdout.write(sys.stdin.read())'
+        stdin: "{{ ccdc_lse_result.stdout }}"
+        stdin_add_newline: false
+      register: ccdc_lse_result
+      changed_when: false
+      when: not ansible_check_mode
