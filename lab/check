@@ -1,0 +1,103 @@
+#!/usr/bin/env python3
+"""Opt-in live smoke suite through ccdcctl and its public reports. Lab only."""
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import urllib.request
+
+ROOT = Path(__file__).resolve().parents[1]
+INVENTORY = ROOT / 'lab/inventory.yml'
+# Never inherit transport overrides that could accidentally select real hosts.
+os.environ['ANSIBLE_INVENTORY'] = str(INVENTORY)
+os.environ['ANSIBLE_ARGS'] = ''
+loader = importlib.machinery.SourceFileLoader('ccdcctl_lab', str(ROOT / 'scripts/ccdcctl'))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+ctl = importlib.util.module_from_spec(spec)
+loader.exec_module(ctl)
+
+
+def main():
+    checks = []
+    hosts, variables = ctl.select()
+    if hosts != ['hatchery', 'tarpit'] or any(variables[h]['ansible_host'] != '127.0.0.1' for h in hosts):
+        raise RuntimeError('Not the generated two-host loopback lab inventory')
+
+    def passed(label):
+        print('PASS ' + label, flush=True)
+        checks.append({'check': label, 'passed': True})
+
+    def command(*args, expected=0):
+        result = subprocess.run([sys.executable, str(ROOT / 'scripts/ccdcctl'), *args],
+                                cwd=ROOT, capture_output=True, text=True, timeout=180)
+        checks.append({'command': list(args), 'rc': result.returncode,
+                       'stdout': result.stdout, 'stderr': result.stderr})
+        if result.returncode != expected:
+            raise RuntimeError('ccdcctl ' + ' '.join(args) + ': ' + result.stderr + result.stdout)
+        return result.stdout
+
+    secret = ROOT / 'secrets/lab/root.password'
+    if secret.exists():
+        password = ctl.read_secret(secret)
+        for host in hosts:
+            success, _, error = ctl.probe_root(host, password)
+            if not success:
+                raise RuntimeError(host + ' root authentication: ' + error)
+        passed('root password SSH authentication, both hosts')
+
+    for host in hosts:
+        for key in ('lab_http_port', 'lab_app_port'):
+            with urllib.request.urlopen(f"http://127.0.0.1:{variables[host][key]}", timeout=5) as response:
+                if response.status != 200 or host not in response.read().decode():
+                    raise RuntimeError(host + ': HTTP fixture did not respond correctly')
+    passed('nginx and fixture HTTP services visible on host loopback')
+    peer = variables['tarpit']['lab_private_ip']
+    result = subprocess.run(['docker', 'exec', 'ccdc-lab-hatchery', 'python3', '-c',
+                             'import sys, urllib.request; print(urllib.request.urlopen(sys.argv[1], timeout=5).read().decode())',
+                             f'http://{peer}:9000'], capture_output=True, text=True, timeout=10, check=True)
+    if 'tarpit - disposable CCDC lab' not in result.stdout:
+        raise RuntimeError('Containers cannot communicate over their private virtual network')
+    passed('private bridge connectivity between hatchery and tarpit')
+
+    for args in [('ping',), ('ssh', 'status'), ('firewall', 'status'), ('listeners',)]:
+        command(*args)
+        passed('ccdcctl ' + ' '.join(args) + ', both inventory hosts')
+
+    for _ in range(2):
+        command('integrity', expected=1)
+        for host in hosts:
+            state = json.loads((ROOT / 'reports' / host / 'integrity/report.json').read_text())
+            if state.get('errors'):
+                raise RuntimeError(host + ': integrity scan incomplete: ' + str(state['errors']))
+            critical = {f.get('path') for f in state['findings'] if f['severity'] == 'critical'}
+            if not {'/usr/bin/ssh', '/usr/bin/scp', '/etc/passwd'} <= critical:
+                raise RuntimeError(host + ': failed to detect known package/permission faults')
+    passed('package tampering/missing files and critical modes persist across scans')
+
+    command('lse', expected=1)
+    for host in hosts:
+        state = json.loads((ROOT / 'reports' / host / 'lse/report.json').read_text())
+        if state.get('errors') or state.get('incomplete_ids'):
+            raise RuntimeError(host + ': LSE coverage incomplete')
+        if not {'fst160', 'ret010', 'sud000'} <= {f['id'] for f in state['findings']}:
+            raise RuntimeError(host + ': failed to detect known LSE conditions')
+    passed('LSE detects writable critical file, recurring task, and sudo access')
+
+    output = command('monitor', '--once', expected=1)
+    for kind in ('SSH', 'FIREWALL', 'INTEGRITY', 'LSE'):
+        if kind not in output:
+            raise RuntimeError('Combined monitor did not include ' + kind)
+    passed('combined monitor includes all four modules, without accepting baselines')
+    ctl.save(ROOT / 'reports/lab/check.json', {'checks': checks})
+    print('Live suite passed; evidence: reports/lab/check.json')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, RuntimeError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+        print('FAIL ' + ctl.terminal(exc), file=sys.stderr)
+        sys.exit(1)

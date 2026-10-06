@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Create/remove ONLY the disposable local ccdc-lab Docker Compose project."""
+import argparse
+import asyncio
+import getpass
+import json
+import os
+from pathlib import Path
+import stat
+import subprocess
+import sys
+import signal
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+SECRETS = ROOT / 'secrets/lab'
+INVENTORY = ROOT / 'lab/inventory.yml'
+HOSTS = ('hatchery', 'tarpit')
+COMPOSE = ['docker', 'compose', '-f', str(ROOT / 'lab/compose.yml')]
+MANAGE = Path(__file__).resolve()
+PID = SECRETS / 'relay.pid'
+READY = SECRETS / 'relay.ready'
+RELAY = SECRETS / 'relay.json'
+
+
+def run(args, **kwargs):
+    env = dict(os.environ, CCDC_LAB_UID=str(os.getuid()))
+    return subprocess.run(args, cwd=ROOT, text=True, check=True, env=env, **kwargs)
+
+
+def local_docker():
+    # DOCKER_CONTEXT takes precedence over DOCKER_HOST in the Docker CLI.
+    context = os.environ.get('DOCKER_CONTEXT')
+    host = os.environ.get('DOCKER_HOST') if not context else None
+    if context or host is None:
+        context = context or run(['docker', 'context', 'show'], capture_output=True).stdout.strip()
+        host = run(['docker', 'context', 'inspect', context, '--format', '{{.Endpoints.docker.Host}}'],
+                   capture_output=True).stdout.strip()
+    if not host.startswith('unix://'):
+        raise RuntimeError('This vulnerable lab must use a local Unix-socket Docker daemon')
+
+
+def password_file(path):
+    info = path.lstat()
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o077:
+        raise RuntimeError('Password file must be an owned regular file with mode 0600')
+    password = path.read_text().rstrip('\n')
+    if not password or any(c in password for c in '\n\r\0'):
+        raise RuntimeError('Password must be nonempty and single-line')
+    return password
+
+
+def pin_socket(source, destination):
+    """Pin an inode outside container mounts; never follow mutable socket symlinks."""
+    destination.unlink(missing_ok=True)
+    os.link(source, destination, follow_symlinks=False)
+    if not stat.S_ISSOCK(destination.lstat().st_mode):
+        destination.unlink()
+        raise RuntimeError('Container relay endpoint is not a real Unix socket')
+
+
+def stop_relay():
+    if PID.exists():
+        pid = int(PID.read_text())
+        proc = Path('/proc') / str(pid)
+        try:
+            command = (proc / 'cmdline').read_bytes().split(b'\0')
+            if proc.stat().st_uid != os.getuid() or command[1:3] != [os.fsencode(MANAGE), b'_forward']:
+                raise RuntimeError('Relay PID is not our lab process; refusing to signal it')
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(50):
+                if not READY.exists():
+                    break
+                time.sleep(.1)
+        except FileNotFoundError:
+            pass
+    PID.unlink(missing_ok=True)
+    READY.unlink(missing_ok=True)
+
+
+async def forward(reader, writer, path):
+    remote = None
+    try:
+        source, remote = await asyncio.wait_for(asyncio.open_unix_connection(path), timeout=3)
+        async def copy(source, destination):
+            while data := await source.read(65536):
+                destination.write(data)
+                await destination.drain()
+            if destination.can_write_eof():
+                destination.write_eof()
+        await asyncio.gather(copy(reader, remote), copy(source, writer))
+    except (OSError, TimeoutError):
+        pass  # A stopped container closes only its own connection, not the relay.
+    finally:
+        writer.close()
+        if remote:
+            remote.close()
+
+
+async def serve():
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+    servers = []
+    try:
+        for endpoint in json.loads(RELAY.read_text()):
+            port, path = endpoint['port'], endpoint['socket']
+            servers.append(await asyncio.start_server(
+                lambda r, w, path=path: forward(r, w, path), '127.0.0.1', port))
+        READY.write_text(str(os.getpid()))
+        await stop.wait()
+    finally:
+        for server in servers:
+            server.close()
+            await server.wait_closed()
+        READY.unlink(missing_ok=True)
+
+
+def up(password):
+    if not password or any(c in password for c in '\n\r\0'):
+        raise RuntimeError('Password must be nonempty and single-line')
+    local_docker()
+    stop_relay()
+    SECRETS.mkdir(parents=True, exist_ok=True, mode=0o700)
+    SECRETS.chmod(0o700)
+    key = SECRETS / 'id_ed25519'
+    if not key.exists():
+        run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'disposable-ccdc-lab', '-f', str(key)])
+    if key.stat().st_uid != os.geteuid() or key.stat().st_mode & 0o077:
+        raise RuntimeError('Lab private key must be owned by you with mode 0600')
+    # Derive the public key in case a previous interrupted setup lost only .pub.
+    public = run(['ssh-keygen', '-y', '-f', str(key)], capture_output=True).stdout
+    key.with_suffix('.pub').write_text(public)
+    for name in HOSTS:
+        directory = SECRETS / 'sockets' / name
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
+    run([*COMPOSE, 'up', '--build', '--detach', '--wait', '--wait-timeout', '90'])
+    hosts, keys, endpoints = {}, [], []
+    pins = SECRETS / 'relay-sockets'
+    pins.mkdir(exist_ok=True, mode=0o700)
+    pins.chmod(0o700)
+    for name in HOSTS:
+        container = 'ccdc-lab-' + name
+        info = json.loads(run(['docker', 'inspect', container], capture_output=True).stdout)[0]
+        labels = info['Config']['Labels']
+        for service in ('ssh', 'http', 'app'):
+            port = int(labels['ccdc.lab.' + service + '_port'])
+            path = SECRETS / 'sockets' / name / service
+            if not 1024 <= port <= 65535:
+                raise RuntimeError('Invalid loopback port')
+            pinned = pins / (name + '-' + service)
+            pin_socket(path, pinned)
+            endpoints.append({'port': port, 'socket': str(pinned)})
+        # Password goes through stdin, not docker argv/environment/image layers.
+        run(['docker', 'exec', '--interactive', container, 'chpasswd'], input='root:' + password + '\n')
+        port = int(labels['ccdc.lab.ssh_port'])
+        hosts[name] = {'ansible_host': '127.0.0.1', 'ansible_port': port,
+                       'lab_http_port': int(labels['ccdc.lab.http_port']),
+                       'lab_app_port': int(labels['ccdc.lab.app_port'])}
+        public = run(['docker', 'exec', container, 'cat', '/etc/ssh/ssh_host_ed25519_key.pub'],
+                     capture_output=True).stdout.split()
+        # Trust the key read from our own local container, not an unverified scan.
+        keys.append(f'[127.0.0.1]:{port} {public[0]} {public[1]}')
+        address = info['NetworkSettings']['Networks']['ccdc-lab-internal']['IPAddress']
+        hosts[name]['lab_private_ip'] = address
+        print(f'{name}: bridge {address}; SSH 127.0.0.1:{port}')
+    known = SECRETS / 'known_hosts'
+    known.write_text('\n'.join(keys) + '\n')
+    known.chmod(0o600)
+    RELAY.write_text(json.dumps(endpoints))
+    RELAY.chmod(0o600)
+    logfile = SECRETS / 'relay.log'
+    logfile.touch(mode=0o600)
+    with logfile.open('w') as log:
+        process = subprocess.Popen([sys.executable, str(MANAGE), '_forward'], cwd=ROOT,
+                                   stdout=log, stderr=log, start_new_session=True)
+    PID.write_text(str(process.pid))
+    for _ in range(100):
+        if READY.exists() and READY.read_text() == str(process.pid):
+            break
+        if process.poll() is not None:
+            raise RuntimeError('Loopback relay failed; inspect secrets/lab/relay.log')
+        time.sleep(.1)
+    else:
+        stop_relay()
+        raise RuntimeError('Loopback relay did not become ready')
+    variables = {
+        'ansible_user': 'oski',
+        'ansible_ssh_private_key_file': '{{ inventory_dir }}/../secrets/lab/id_ed25519',
+        'ansible_ssh_common_args': '-o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ inventory_dir }}/../secrets/lab/known_hosts',
+    }
+    # JSON is valid YAML. Validated loopback endpoints feed the inventory;
+    # no second host list or port guess is used by ccdcctl.
+    INVENTORY.write_text(json.dumps({'all': {'vars': variables, 'hosts': hosts}}, indent=2) + '\n')
+    print('Lab ready. Activate .venv and export ANSIBLE_INVENTORY=lab/inventory.yml')
+    print('HTTP: http://127.0.0.1:8080 / :8081; fixture apps: :9070 / :9170')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='action', required=True)
+    cmd = sub.add_parser('up')
+    cmd.add_argument('--password-file', type=Path, help='private one-line root password file; otherwise prompt')
+    sub.add_parser('down')
+    sub.add_parser('_forward', help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    if args.action == '_forward':
+        asyncio.run(serve())
+        return
+    if args.action == 'up':
+        password = password_file(args.password_file) if args.password_file else getpass.getpass('Disposable lab root password: ')
+        up(password)
+    else:
+        local_docker()
+        stop_relay()
+        run([*COMPOSE, 'down', '--remove-orphans'])
+        INVENTORY.unlink(missing_ok=True)
+        print('Removed only ccdc-lab containers/network; test key retained in secrets/lab')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
+        print('Lab setup failed: ' + str(exc), file=sys.stderr)
+        sys.exit(1)

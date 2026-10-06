@@ -1,0 +1,67 @@
+name: ccdc-lab
+services:
+  hatchery:
+    build:
+      context: .
+      target: hatchery
+      network: host  # Package downloads only; runtime remains isolated.
+    image: ccdc-lab-hatchery
+    hostname: hatchery
+    container_name: ccdc-lab-hatchery
+    cap_add: [NET_ADMIN]  # Container firewall namespace only; never --privileged.
+    cpus: 1
+    mem_limit: 384m
+    pids_limit: 256
+    environment:
+      LAB_SOCKET_OWNER: "${CCDC_LAB_UID:?Run lab/manage up}"
+    labels:
+      ccdc.lab.ssh_port: "22270"
+      ccdc.lab.http_port: "8080"
+      ccdc.lab.app_port: "9070"
+    volumes:
+      - ../secrets/lab/id_ed25519.pub:/run/lab-key.pub:ro
+      - ../secrets/lab/sockets/hatchery:/run/lab-sockets
+    networks:
+      isolated:
+        ipv4_address: 172.30.133.70
+    healthcheck:
+      test: [CMD, python3, -c, "import socket; [socket.create_connection(('127.0.0.1', p), 2).close() for p in (22, 80, 9000)]"]
+      interval: 2s
+      timeout: 7s
+      retries: 30
+  tarpit:
+    build:
+      context: .
+      target: tarpit
+      network: host
+    image: ccdc-lab-tarpit
+    hostname: tarpit
+    container_name: ccdc-lab-tarpit
+    cap_add: [NET_ADMIN]
+    cpus: 1
+    mem_limit: 384m
+    pids_limit: 256
+    environment:
+      LAB_SOCKET_OWNER: "${CCDC_LAB_UID:?Run lab/manage up}"
+    labels:
+      ccdc.lab.ssh_port: "22170"
+      ccdc.lab.http_port: "8081"
+      ccdc.lab.app_port: "9170"
+    volumes:
+      - ../secrets/lab/id_ed25519.pub:/run/lab-key.pub:ro
+      - ../secrets/lab/sockets/tarpit:/run/lab-sockets
+    networks:
+      isolated:
+        ipv4_address: 172.30.133.170
+    healthcheck:
+      test: [CMD, python3, -c, "import socket; [socket.create_connection(('127.0.0.1', p), 2).close() for p in (22, 80, 9000)]"]
+      interval: 2s
+      timeout: 7s
+      retries: 30
+networks:
+  isolated:
+    name: ccdc-lab-internal
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.133.0/24
