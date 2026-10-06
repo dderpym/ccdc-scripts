@@ -48,13 +48,17 @@ def main():
                 raise RuntimeError(host + ' root authentication: ' + error)
         passed('root password SSH authentication, both hosts')
 
+    # Service metadata belongs to the fixture, not the SSH inventory.
+    containers = dict(zip(hosts, json.loads(subprocess.check_output(
+        ['docker', 'inspect', *('ccdc-lab-' + host for host in hosts)], text=True))))
     for host in hosts:
-        for key in ('lab_http_port', 'lab_app_port'):
-            with urllib.request.urlopen(f"http://127.0.0.1:{variables[host][key]}", timeout=5) as response:
+        for service in ('http', 'app'):
+            port = int(containers[host]['Config']['Labels']['ccdc.lab.' + service + '_port'])
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}", timeout=5) as response:
                 if response.status != 200 or host not in response.read().decode():
                     raise RuntimeError(host + ': HTTP fixture did not respond correctly')
     passed('nginx and fixture HTTP services visible on host loopback')
-    peer = variables['tarpit']['lab_private_ip']
+    peer = containers['tarpit']['NetworkSettings']['Networks']['ccdc-lab-internal']['IPAddress']
     result = subprocess.run(['docker', 'exec', 'ccdc-lab-hatchery', 'python3', '-c',
                              'import sys, urllib.request; print(urllib.request.urlopen(sys.argv[1], timeout=5).read().decode())',
                              f'http://{peer}:9000'], capture_output=True, text=True, timeout=10, check=True)

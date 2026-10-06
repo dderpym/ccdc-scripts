@@ -156,15 +156,12 @@ def up(password):
         # Password goes through stdin, not docker argv/environment/image layers.
         run(['docker', 'exec', '--interactive', container, 'chpasswd'], input='root:' + password + '\n')
         port = int(labels['ccdc.lab.ssh_port'])
-        hosts[name] = {'ansible_host': '127.0.0.1', 'ansible_port': port,
-                       'lab_http_port': int(labels['ccdc.lab.http_port']),
-                       'lab_app_port': int(labels['ccdc.lab.app_port'])}
+        hosts[name] = {'ansible_host': '127.0.0.1', 'ansible_port': port}
         public = run(['docker', 'exec', container, 'cat', '/etc/ssh/ssh_host_ed25519_key.pub'],
                      capture_output=True).stdout.split()
         # Trust the key read from our own local container, not an unverified scan.
         keys.append(f'[127.0.0.1]:{port} {public[0]} {public[1]}')
         address = info['NetworkSettings']['Networks']['ccdc-lab-internal']['IPAddress']
-        hosts[name]['lab_private_ip'] = address
         print(f'{name}: bridge {address}; SSH 127.0.0.1:{port}')
     known = SECRETS / 'known_hosts'
     known.write_text('\n'.join(keys) + '\n')
@@ -186,16 +183,16 @@ def up(password):
     else:
         stop_relay()
         raise RuntimeError('Loopback relay did not become ready')
-    variables = {
-        'ansible_user': 'oski',
-        'ansible_ssh_private_key_file': '{{ inventory_dir }}/../secrets/lab/id_ed25519',
-        'ansible_ssh_common_args': '-o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ inventory_dir }}/../secrets/lab/known_hosts',
-    }
-    # JSON is valid YAML. Validated loopback endpoints feed the inventory;
-    # no second host list or port guess is used by ccdcctl.
-    INVENTORY.write_text(json.dumps({'all': {'vars': variables, 'hosts': hosts}}, indent=2) + '\n')
+    # Same YAML layout as inventory.yml, with validated lab transport endpoints.
+    write_inventory(hosts)
     print('Lab ready. Activate .venv and export ANSIBLE_INVENTORY=lab/inventory.yml')
     print('HTTP: http://127.0.0.1:8080 / :8081; fixture apps: :9070 / :9170')
+
+
+def write_inventory(hosts):
+    import yaml  # Already required by Ansible; the relay itself remains stdlib-only.
+    INVENTORY.write_text('# Disposable lab hosts; main inventory.yml is unchanged.\n' +
+                         yaml.safe_dump({'all': {'hosts': hosts}}, sort_keys=False))
 
 
 def main():

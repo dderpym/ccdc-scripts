@@ -17,6 +17,18 @@ loader.exec_module(lab)
 
 
 class LabSafetyTests(unittest.TestCase):
+    def test_inventory_contains_only_standard_host_connection_fields(self):
+        import yaml
+        hosts = {'hatchery': {'ansible_host': '127.0.0.1', 'ansible_port': 22270},
+                 'tarpit': {'ansible_host': '127.0.0.1', 'ansible_port': 22170}}
+        with tempfile.TemporaryDirectory() as directory:
+            inventory = Path(directory) / 'inventory.yml'
+            with patch.object(lab, 'INVENTORY', inventory):
+                lab.write_inventory(hosts)
+            text = inventory.read_text()
+            self.assertIn('\nall:\n  hosts:\n', text)
+            self.assertEqual(yaml.safe_load(text), {'all': {'hosts': hosts}})
+
     def test_remote_docker_host_is_rejected_without_contacting_it(self):
         with patch.dict(os.environ, {'DOCKER_HOST': 'tcp://example.invalid:2375'}, clear=True), \
                 patch.object(lab.subprocess, 'run') as run:

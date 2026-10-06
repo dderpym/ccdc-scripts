@@ -54,7 +54,11 @@ there is no implicit baseline during lab startup.
 | tarpit | 172.30.133.170 | 127.0.0.1:22170 | http://127.0.0.1:8081 | http://127.0.0.1:9170 |
 
 `manage up` derives the lab inventory from validated loopback relay endpoints
-specified by the deployed containers' labels.
+specified by the deployed containers' labels. Like the regular inventory, it is
+plain YAML; each host has only `ansible_host` and `ansible_port`. The default user
+comes from the existing `ansible.cfg`, and lab key/known-hosts settings live in
+`lab/group_vars/all.yml`. HTTP ports and bridge addresses are read from Docker
+by the smoke suite, not stored in the SSH inventory.
 The regular `inventory.yml` is untouched. Scans use the existing controller and
 Ansible inventory interface; there is no hardcoded controller-side host list.
 The separate lab inventory contains only these two hosts.
