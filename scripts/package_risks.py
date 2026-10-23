@@ -58,6 +58,17 @@ def read_regular(path):
     return data.decode('utf-8', 'strict')
 
 
+RPM_VENDORS = ('fedora', 'rhel', 'centos', 'rocky', 'almalinux', 'ol', 'amzn', 'sles',
+               'opensuse-leap', 'opensuse-tumbleweed')
+
+
+def package_manager(vendor):
+    """Only managers with a query implementation; None for anything else (apk, xbps, ...)."""
+    if vendor in ('debian', 'ubuntu'):
+        return 'dpkg'
+    return 'rpm' if vendor in RPM_VENDORS else None
+
+
 def os_release(root):
     """Parse assignments as data, without expansion, shell sourcing or ID_LIKE."""
     values = {}
@@ -265,9 +276,16 @@ def scan(deep=False, *, root=Path('/'), runner=None):
     except (OSError, ValueError, UnicodeError) as exc:
         vendor, release = '', ''
         details.append('os-release unavailable: ' + str(exc))
-    manager = 'dpkg' if vendor in ('debian', 'ubuntu') else 'rpm'
-    records, gaps = query_packages(root, manager, runner)
-    raw.append('Userspace release: %s %s; package manager: %s' % (vendor, release, manager))
+    manager = package_manager(vendor)
+    raw.append('Userspace release: %s %s; package manager: %s' % (vendor, release, manager or 'unsupported'))
+    if manager is None:
+        if not vendor:
+            incomplete.update('package:' + cve for cve in RULES)
+        else:
+            raw.append('Package CVE checks not applicable: no query support for ' + vendor)
+        records, gaps = {}, {}
+    else:
+        records, gaps = query_packages(root, manager, runner)
     for cve, (source, packages) in RULES.items():
         test_id = 'package:' + cve
         applicable = [p for p in packages if p in (DEB_NAMES if manager == 'dpkg' else RPM_NAMES)]

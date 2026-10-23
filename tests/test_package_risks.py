@@ -248,6 +248,13 @@ class PackageRisksTests(unittest.TestCase):
         self.assertEqual(self.scan()['incomplete_ids'], ['package:CVE-2026-41651'])
         self.assertFalse(self.cves(self.scan()))
 
+    def test_unsupported_distribution_is_not_applicable_not_rpm(self):
+        self.release('alpine', '3.22.7')
+        result = self.scan()
+        self.assertNotIn('incomplete_ids', result)
+        self.assertFalse(self.cves(result))
+        self.assertFalse(self.calls)
+
     def test_rpm_keeps_epoch_revision_source_and_vendor_without_vendor_verdict(self):
         self.release('fedora', '43')
         self.installed('PackageKit', '2:1.3.4-3.fc43', state='installed', source='PackageKit-1.3.4-3.fc43.src.rpm',
