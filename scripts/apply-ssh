@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Apply a first-value-wins SSH policy, validate, then reload (never restart).
+"""Apply authoritative SSH settings, validate, then reload (never restart).
 
 Usage: apply-ssh yes|no  (PasswordAuthentication). Requires root and oski.
 SSH_CONNECTION supplies the current oski test context; CCDC_SSH_CONTEXT can
-supply explicit sshd -C fields instead. Conflicting Match directives, conditional
-Includes and authentication/config/port startup overrides are refused.
+supply explicit sshd -C fields instead. Owned directives are removed from all
+parsed sources, including Match blocks. Conditional Includes and authentication/
+config/port startup overrides are refused.
 Socket-activated service authentication is reloaded; socket bindings are unchanged.
 """
 import fcntl
@@ -32,6 +33,64 @@ CRYPTO_OPTIONS = {"ciphers", "macs", "kexalgorithms", "hostkeyalgorithms",
                   "gssapikexalgorithms", "casignaturealgorithms", "requiredrsasize"}
 
 
+def directive(line):
+    # OpenSSH strdelim allows a quoted keyword or suffix: Ma"tch", too.
+    match = re.match(r'^\s*(?:([^"\s=#]*)"([^"]*)"|([^"\s=#]+))[\s=]*(.*)$', line)
+    if not match:
+        return "", ""
+    return (match[3] or (match[1] + match[2])).lower(), match[4]
+
+
+def arguments(text):
+    """OpenSSH argv_split semantics, not shell escaping/comment semantics.
+
+    Keep in sync with discover-ssh: targets receive each script standalone.
+    """
+    result, index = [], 0
+    text = text.rstrip("\r\n")
+    while index < len(text):
+        if text[index] in " \t":
+            index += 1
+            continue
+        if text[index] == "#":
+            break
+        token, quote = [], None
+        while index < len(text):
+            char = text[index]
+            if char == "\\" and index + 1 < len(text) and (
+                    text[index + 1] in "\\\"'" or (quote is None and text[index + 1] == " ")):
+                index += 1
+                token.append(text[index])
+            elif quote is None and char in " \t":
+                break
+            elif quote is None and char in "\"'":
+                quote = char
+            elif char == quote:
+                quote = None
+            else:
+                token.append(char)
+            index += 1
+        if quote is not None:
+            raise ValueError("Unclosed quote in SSH directive")
+        result.append("".join(token))
+    return result
+
+
+def include_files(pattern):
+    # Python glob does not implement glob(3)'s backslash escapes. Fail closed.
+    if "\\" in pattern:
+        raise RuntimeError("Unsupported escaped SSH Include pattern: " + pattern)
+    if not os.path.isabs(pattern):
+        pattern = os.path.join("/etc/ssh", pattern)
+    return sorted(glob.glob(pattern))
+
+
+def strip_policy(text, desired):
+    keys = set(desired) | {"challengeresponseauthentication"}
+    return "".join(line for line in text.splitlines(keepends=True)
+                   if directive(line)[0] not in keys)
+
+
 def policy_config(main, desired):
     # An owned top-of-file layer also works on OpenSSH <8.2 (no server Include).
     if main.startswith(BEGIN):
@@ -43,7 +102,7 @@ def policy_config(main, desired):
     policy = "".join(key + " " + value + "\n" for key, value in desired.items())
     # Older OpenSSH has a separate ChallengeResponseAuthentication switch.
     policy += "ChallengeResponseAuthentication " + desired["kbdinteractiveauthentication"] + "\n"
-    return BEGIN + policy + END + main
+    return BEGIN + policy + END + strip_policy(main, desired)
 
 
 def run(args, check=True):
@@ -270,7 +329,7 @@ def service():
 
 
 def inspect(path, desired):
-    """Track Match scope across includes; conflicting conditional settings fail closed."""
+    """Track local Match scope; conflicting conditional settings fail closed."""
     hashes, stack = {}, []
 
     def visit(filename, conditional=False):
@@ -281,24 +340,20 @@ def inspect(path, desired):
         hashes[filename] = hashlib.sha256(raw).hexdigest()
         stack.append(filename)
         for number, line in enumerate(raw.decode("utf-8").splitlines(), 1):
-            match = re.match(r"^\s*([^\s=#]+)[\s=]+(.*)$", line)
-            if not match:
+            key, text = directive(line)
+            if not key:
                 continue
-            key, text = match.groups()
-            key = key.lower()
             if key == "challengeresponseauthentication":
                 key = "kbdinteractiveauthentication"
-            values = shlex.split(text, comments=True)
+            values = arguments(text)
             if key == "match":
                 conditional = True
             elif key == "include":
                 if conditional:
                     raise RuntimeError("Unsafe conditional Include at %s:%d" % (filename, number))
                 for pattern in values:
-                    if not os.path.isabs(pattern):
-                        pattern = os.path.join("/etc/ssh", pattern)
-                    for included in sorted(glob.glob(pattern)):
-                        conditional = visit(included, conditional)
+                    for included in include_files(pattern):
+                        visit(included, conditional)
             elif conditional and key in desired:
                 value = " ".join(values)
                 if key != "authorizedkeysfile":
@@ -307,10 +362,27 @@ def inspect(path, desired):
                     raise RuntimeError("Match can defeat %s=%s at %s:%d; remove/align that rule first" %
                                        (key, desired[key], filename, number))
         stack.pop()
-        return conditional
 
     visit(path)
     return hashes
+
+
+def stage_configs(configs, directory):
+    """Validate the entire proposed include graph without changing live files."""
+    staged = {path: os.path.join(directory, str(index)) for index, path in enumerate(configs)}
+    for path, content in configs.items():
+        lines = []
+        for line in content.decode("utf-8").splitlines(keepends=True):
+            key, text = directive(line)
+            if key == "include":
+                included = []
+                for pattern in arguments(text):
+                    included.extend(staged[os.path.abspath(source)] for source in include_files(pattern))
+                # An unmatched Include contributes no settings.
+                line = "Include " + " ".join(json.dumps(source) for source in included) + "\n" if included else ""
+            lines.append(line)
+        Path(staged[path]).write_text("".join(lines))
+    return staged
 
 
 def verify(sshd, path, desired, context):
@@ -390,29 +462,38 @@ def apply(password):
         main_original = snapshot(CONFIG)
         if main_original is None:
             raise RuntimeError("Missing " + CONFIG)
-        final_main = policy_config(main_original[0].decode("utf-8"), desired).encode()
         name, reload_command, status_command = service()
-        temporary_paths = []
-        try:
-            fd, candidate = tempfile.mkstemp(prefix=".ccdc-config-", dir=os.path.dirname(CONFIG))
-            temporary_paths.append(candidate)
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(final_main)
-            hashes = inspect(candidate, desired)
-            verify(sshd, candidate, desired, context)
-            changed = final_main != main_original[0]
-            if not changed:
+        hashes = inspect(CONFIG, {})
+        raw = {path: Path(path).read_bytes() for path in hashes}
+        if raw[CONFIG] != main_original[0]:
+            raise RuntimeError("Main SSH config changed during discovery")
+        configs = {path: (policy_config(content.decode("utf-8"), desired) if path == CONFIG
+                          else strip_policy(content.decode("utf-8"), desired)).encode()
+                   for path, content in raw.items()}
+        changed_paths = [path for path in configs if configs[path] != raw[path]]
+        # Only files we will replace need writable-file safety checks and backups.
+        # Unchanged crypto-policy Includes may legitimately be symlinks.
+        originals = {path: snapshot(path) for path in changed_paths}
+        if any(original is None or original[0] != raw[path] for path, original in originals.items()):
+            raise RuntimeError("SSH config source changed during discovery")
+        with tempfile.TemporaryDirectory(prefix=".ccdc-config-", dir=os.path.dirname(CONFIG)) as directory:
+            staged = stage_configs(configs, directory)
+            inspect(staged[CONFIG], desired)
+            verify(sshd, staged[CONFIG], desired, context)
+            # Also catch new Includes or files added to an Include glob.
+            if inspect(CONFIG, {}) != hashes or any(
+                    hashlib.sha256(content).hexdigest() != hashes[path]
+                    for path, content in raw.items()):
+                raise RuntimeError("Configuration changed during validation")
+            if not changed_paths:
                 verify(sshd, CONFIG, desired, context)
                 print(json.dumps({"changed": False, "password_auth": password, "service": name}, sort_keys=True))
                 return
-            # Refuse concurrent edits to any parsed source before installing.
-            for path, digest in hashes.items():
-                if hashlib.sha256(Path(path).read_bytes()).hexdigest() != digest:
-                    raise RuntimeError("Configuration changed during validation: " + path)
-            if Path(CONFIG).read_bytes() != main_original[0]:
-                raise RuntimeError("Main SSH config changed during validation")
+            attempted = []
             try:
-                install(CONFIG, final_main, main_original)
+                for path in changed_paths:
+                    attempted.append(path)
+                    install(path, configs[path], originals[path])
                 inspect(CONFIG, desired)
                 verify(sshd, CONFIG, desired, context)
                 run(reload_command)
@@ -420,7 +501,8 @@ def apply(password):
                 verify(sshd, CONFIG, desired, context)
             except Exception as exc:
                 errors = []
-                for path, original in ((CONFIG, main_original),):
+                for path in reversed(attempted):
+                    original = originals[path]
                     try:
                         restore(path, original)
                     except Exception as rollback_exc:
@@ -434,10 +516,6 @@ def apply(password):
                 suffix = "rollback FAILED: " + "; ".join(errors) if errors else "original configuration restored and reloaded"
                 raise RuntimeError(str(exc) + "; " + suffix) from exc
             print(json.dumps({"changed": True, "password_auth": password, "service": name}, sort_keys=True))
-        finally:
-            for path in temporary_paths:
-                if os.path.exists(path):
-                    os.unlink(path)
 
 
 if __name__ == "__main__":

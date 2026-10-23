@@ -65,6 +65,12 @@ def integration(script, parent_netns):
         call(prefix, '-A', 'FORWARD', '-j', 'DROP')
         call(prefix, '-A', 'OUTPUT', '-p', 'tcp', '--dport', '25', '-j', 'REJECT')
         call(prefix, '-t', 'nat', '-A', 'POSTROUTING', '-j', 'MASQUERADE')
+    # Docker embedded DNS uses OUTPUT DNAT plus POSTROUTING SNAT. These are
+    # unsafe to flush through nft, but must survive the iptables INPUT path.
+    call('iptables', '-t', 'nat', '-N', 'DOCKER_OUTPUT')
+    call('iptables', '-t', 'nat', '-A', 'OUTPUT', '-d', '127.0.0.11', '-j', 'DOCKER_OUTPUT')
+    call('iptables', '-t', 'nat', '-A', 'DOCKER_OUTPUT', '-p', 'udp', '--dport', '53',
+         '-j', 'DNAT', '--to-destination', '127.0.0.11:55212')
     original = discover()
     assert original['backend'] == 'iptables'
     saved = json.loads(call(script, '--snapshot').stdout)
@@ -100,6 +106,36 @@ class FirewallTests(unittest.TestCase):
     def test_backend_self_checks_include_second_family_failure_rollback(self):
         with contextlib.redirect_stdout(io.StringIO()):
             firewall.self_test()
+
+    def test_docker_dns_nat_is_compat_only_when_save_tools_account_for_it(self):
+        raw = ('*nat\n:OUTPUT ACCEPT [0:0]\n:POSTROUTING ACCEPT [0:0]\n'
+               ':DOCKER_OUTPUT - [0:0]\n:DOCKER_POSTROUTING - [0:0]\n'
+               '-A OUTPUT -d 127.0.0.11/32 -j DOCKER_OUTPUT\n'
+               '-A POSTROUTING -d 127.0.0.11/32 -j DOCKER_POSTROUTING\n'
+               '-A DOCKER_OUTPUT -d 127.0.0.11/32 -p udp --dport 53 -j DNAT --to-destination 127.0.0.11:55212\n'
+               '-A DOCKER_POSTROUTING -s 127.0.0.11/32 -p udp --sport 55212 -j SNAT --to-source :53\n'
+               'COMMIT\n')
+        entries = [{'table': {'family': 'ip', 'name': 'nat'}}]
+        for name, hook, priority in [('OUTPUT', 'output', -100), ('POSTROUTING', 'postrouting', 100)]:
+            entries.append({'chain': {'family': 'ip', 'table': 'nat', 'name': name,
+                                      'hook': hook, 'type': 'nat', 'prio': priority, 'policy': 'accept'}})
+        for name in ('DOCKER_OUTPUT', 'DOCKER_POSTROUTING'):
+            entries.append({'chain': {'family': 'ip', 'table': 'nat', 'name': name}})
+        for chain, expression in [('OUTPUT', {'jump': {'target': 'DOCKER_OUTPUT'}}),
+                                  ('POSTROUTING', {'jump': {'target': 'DOCKER_POSTROUTING'}}),
+                                  ('DOCKER_OUTPUT', {'xt': {'name': 'DNAT', 'type': 'target'}}),
+                                  ('DOCKER_POSTROUTING', {'xt': {'name': 'SNAT', 'type': 'target'}})]:
+            entries.append({'rule': {'family': 'ip', 'table': 'nat', 'chain': chain, 'expr': [expression]}})
+        info = {'nft': entries, 'tables': {}, 'impl': {}, 'extra_legacy': {}}
+        self.assertEqual(firewall.choose_backend(info), 'nftables')
+        with self.assertRaisesRegex(firewall.Refusal, 'nft replacement refuses'):
+            firewall.check_nft_replacement(entries)
+        info.update(tables={'ip': firewall.parse_save(raw), 'ip6': {}},
+                    impl={'ip': 'nf_tables', 'ip6': 'nf_tables'})
+        self.assertEqual(firewall.choose_backend(info), 'iptables')
+        program = firewall.iptables_program(info['tables']['ip'], {'tcp': [22, 80, 9000], 'udp': []})
+        self.assertTrue(program.startswith('*filter\n'))
+        self.assertNotIn('nat', program)
 
     def test_counters_change_neither_rules_nor_hints_but_limits_remain_semantic(self):
         before = {'nftables': [{'rule': {'family': 'inet', 'table': 'test', 'chain': 'input',

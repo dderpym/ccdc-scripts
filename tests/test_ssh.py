@@ -1,5 +1,6 @@
 import contextlib
 import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -28,10 +29,17 @@ update_command() {
 
 
 class SSHTests(unittest.TestCase):
-    def test_owned_layer_precedes_original_and_has_no_include_dependency(self):
-        original = 'PermitRootLogin yes\nPasswordAuthentication yes\n'
+    def test_owned_layer_removes_controlled_directives_and_has_no_include_dependency(self):
+        original = ('Port 22\nPermitRootLogin yes\nPasswordAuthentication yes\n'
+                    '  pUbKeYaUtHeNtIcAtIoN=no # manual change\n'
+                    'Match User root\n  PermitRootLogin yes\n'
+                    '  ChallengeResponseAuthentication yes\nAllowUsers oski\n')
         managed = ssh.policy_config(original, POLICY)
-        self.assertLess(managed.index('permitrootlogin no'), managed.index('PermitRootLogin yes'))
+        self.assertNotIn('PermitRootLogin yes', managed)
+        self.assertNotIn('PasswordAuthentication yes', managed)
+        self.assertNotIn('pUbKeYaUtHeNtIcAtIoN', managed)
+        self.assertNotIn('ChallengeResponseAuthentication yes', managed)
+        self.assertTrue(managed.endswith('Port 22\nMatch User root\nAllowUsers oski\n'))
         self.assertIn('ChallengeResponseAuthentication no', managed)
         self.assertNotIn('Include', managed)
         self.assertEqual(ssh.policy_config(managed, POLICY), managed)
@@ -120,6 +128,89 @@ class SSHTests(unittest.TestCase):
         self.assertIn('allowusers', result)
         self.assertIn('denygroups', result)
 
+    def test_discovery_tracks_match_semantics_without_hash_or_formatting_noise(self):
+        for text, expected in [
+                (r'User nobo\dy # comment', ['User', r'nobo\dy']),
+                ('User nobody#suffix # comment', ['User', 'nobody#suffix']),
+                ('User "no"body', ['User', 'nobody']),
+                ('"/path with space#hash" # comment', ['/path with space#hash']),
+                (r'"echo \"yes\""', ['echo "yes"'])]:
+            self.assertEqual(ssh.arguments(text), expected)
+            self.assertEqual(discovery.arguments(text), expected)
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'sshd_config'
+            config.write_text('PermitRootLogin no\nMatch User root\nPermitRootLogin yes\n')
+            hashes, _, rules = discovery.sources(str(config))
+            self.assertEqual(rules, [{'directive': 'match', 'arguments': ['User', 'root']},
+                                     {'directive': 'permitrootlogin', 'arguments': ['yes']}])
+            config.write_text('# changed comment\nPermitRootLogin no\n  Match   User root # comment\n'
+                              '  permitrootlogin=yes\n')
+            new_hashes, _, new_rules = discovery.sources(str(config))
+            self.assertNotEqual(hashes, new_hashes)
+            self.assertEqual(rules, new_rules)
+            config.write_text('PermitRootLogin no\nMatch User root\nPermitRootLogin no\n')
+            self.assertNotEqual(rules, discovery.sources(str(config))[2])
+
+    @unittest.skipUnless(shutil.which('sshd') and shutil.which('ssh-keygen'), 'OpenSSH tools unavailable')
+    def test_monitor_preserves_include_scope_boundaries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = root / 'hostkey'
+            subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(key)], check=True)
+            config, first, second = (root / name for name in ('config', 'first', 'second'))
+            config.write_text(f'HostKey {key}\nPasswordAuthentication no\nInclude "{first}" "{second}"\n')
+            first.write_text('Match User root\nPermitRootLogin no\n')
+            second.write_text('PasswordAuthentication yes\n')
+            command = [shutil.which('sshd'), '-T', '-f', str(config), '-C', CONTEXT.replace('user=oski,', 'user=root,')]
+            before = discovery.effective(ssh.run(command).stdout)
+            # Match scope in the first Include must not leak into the second.
+            self.assertEqual(set(ssh.inspect(str(config), POLICY)), {str(config), str(first), str(second)})
+            rules = discovery.sources(str(config))[2]
+            first.write_text('Match User root\nPermitRootLogin no\nPasswordAuthentication yes\n')
+            second.write_text('')
+            after = discovery.effective(ssh.run(command).stdout)
+            self.assertEqual(before['passwordauthentication'], ['no'])
+            self.assertEqual(after['passwordauthentication'], ['yes'])
+            self.assertNotEqual(rules, discovery.sources(str(config))[2])
+
+    @unittest.skipUnless(shutil.which('sshd') and shutil.which('ssh-keygen'), 'OpenSSH tools unavailable')
+    def test_quoted_keywords_cannot_bypass_enforcement_or_monitoring(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = root / 'hostkey'
+            subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(key)], check=True)
+            config = root / 'config'
+            command = [shutil.which('sshd'), '-T', '-f', str(config), '-C', CONTEXT.replace('user=oski,', 'user=nobody,')]
+            for match, password in [('"Match"', '"PasswordAuthentication"'),
+                                    ('Ma"tch"', 'Pass"wordAuthentication"')]:
+                original = f'HostKey {key}\n{match} User nobody\n{password} yes\n'
+                config.write_text(ssh.policy_config(original, POLICY))
+                self.assertEqual(discovery.effective(ssh.run(command).stdout)['passwordauthentication'], ['no'])
+                config.write_text('PasswordAuthentication no\n')
+                rules = discovery.sources(str(config))[2]
+                config.write_text(f'PasswordAuthentication no\n{match} User nobody\n{password} yes\n')
+                self.assertNotEqual(rules, discovery.sources(str(config))[2])
+                with self.assertRaises(RuntimeError):
+                    ssh.inspect(str(config), POLICY)
+            # SSH arguments are not shell arguments: unknown escapes and an
+            # embedded # are literal, not shell escapes/comments.
+            for user in (r'nobo\dy', 'nobody#suffix'):
+                config.write_text(f'HostKey {key}\nPasswordAuthentication no\nMatch User {user}\nPasswordAuthentication yes\n')
+                self.assertEqual(discovery.effective(ssh.run(command).stdout)['passwordauthentication'], ['no'])
+                rules = discovery.sources(str(config))[2]
+                config.write_text(f'HostKey {key}\nPasswordAuthentication no\nMatch User nobody\nPasswordAuthentication yes\n')
+                self.assertEqual(discovery.effective(ssh.run(command).stdout)['passwordauthentication'], ['yes'])
+                self.assertNotEqual(rules, discovery.sources(str(config))[2])
+            # Native glob handles escaped metacharacters differently from Python.
+            included = root / 'name?.conf'
+            included.write_text('Match User nobody\nPasswordAuthentication yes\n')
+            pattern = str(included).replace('?', r'\?')
+            config.write_text(f'HostKey {key}\nPasswordAuthentication no\nInclude {pattern}\n')
+            self.assertEqual(discovery.effective(ssh.run(command).stdout)['passwordauthentication'], ['yes'])
+            for inspect in (discovery.sources, lambda path: ssh.inspect(path, POLICY)):
+                with self.assertRaisesRegex(RuntimeError, 'Unsupported escaped SSH Include'):
+                    inspect(str(config))
+
     @unittest.skipUnless(shutil.which('sshd') and shutil.which('ssh-keygen'), 'OpenSSH tools unavailable')
     def test_real_sshd_validation_and_effective_policy(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -131,6 +222,103 @@ class SSHTests(unittest.TestCase):
                 desired = dict(POLICY, passwordauthentication=enabled, kbdinteractiveauthentication=enabled)
                 config.write_text(ssh.policy_config(original, desired))
                 ssh.verify(shutil.which('sshd'), str(config), desired, CONTEXT)
+                output = io.StringIO()
+                with patch.object(discovery, 'daemon', return_value=shutil.which('sshd')), \
+                        patch.object(discovery, 'socket_listeners', return_value={}), \
+                        patch('sys.argv', ['discover-ssh', '--config', str(config), '--context', CONTEXT]), \
+                        contextlib.redirect_stdout(output):
+                    discovery.main()
+                state = json.loads(output.getvalue())
+                self.assertEqual(state['match_rules'], [])
+                for key, value in desired.items():
+                    self.assertEqual(state['effective'][key], [value])
+
+    @unittest.skipUnless(shutil.which('sshd') and shutil.which('ssh-keygen'), 'OpenSSH tools unavailable')
+    def test_apply_repairs_included_match_settings_and_rolls_back_all_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            key = root / 'hostkey'
+            subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(key)], check=True)
+            dropins = root / 'sshd_config.d'
+            dropins.mkdir()
+            config, dropin, nested = root / 'sshd_config', dropins / 'vendor.conf', root / 'nested # config.conf'
+            crypto = root / 'crypto-policy'
+            crypto.write_text('Ciphers aes256-ctr\n')
+            crypto_link = root / 'crypto-link'
+            crypto_link.symlink_to(crypto)
+            config.write_text(f'HostKey {key}\nPort 22\nInclude "{crypto_link}"\n'
+                              f'Include "{dropins}/*.conf"\nPasswordAuthentication yes\n')
+            dropin.write_text(f'PubkeyAuthentication no\n"Include" "{nested}"\n')
+            nested.write_text('"Match" User root\n  "PermitRootLogin" yes\n  "ChallengeResponseAuthentication" yes\n'
+                              '  AuthorizedKeysFile .ssh/team_keys\n')
+            originals = {path: path.read_bytes() for path in (config, dropin, nested)}
+            commands = []
+            real_run = ssh.run
+            def snapshot(path):
+                if Path(path).is_symlink():
+                    raise RuntimeError('snapshot must not touch an unchanged symlink')
+                return Path(path).read_bytes(), None, {}
+            def run(argv, check=True):
+                commands.append(argv)
+                if argv == ['reload']:
+                    if commands.count(['reload']) == 1:
+                        raise RuntimeError('injected reload failure')
+                    return subprocess.CompletedProcess(argv, 0, '', '')
+                if argv == ['status']:
+                    return subprocess.CompletedProcess(argv, 0, '', '')
+                return real_run(argv, check)
+            with patch.object(ssh, 'CONFIG', str(config)), \
+                    patch.object(ssh.os, 'geteuid', return_value=0), \
+                    patch.object(ssh.pwd, 'getpwnam'), \
+                    patch.object(ssh, 'daemon', return_value=shutil.which('sshd')), \
+                    patch.object(ssh, 'connection_context', return_value=CONTEXT), \
+                    patch.object(ssh, 'service', return_value=('ssh', ['reload'], ['status'])), \
+                    patch.object(ssh, 'snapshot', side_effect=snapshot), \
+                    patch.object(ssh, 'install', side_effect=lambda path, content, original: Path(path).write_bytes(content)), \
+                    patch.object(ssh, 'run', side_effect=run), contextlib.redirect_stdout(io.StringIO()):
+                with self.assertRaisesRegex(RuntimeError, 'original configuration restored'):
+                    ssh.apply('no')
+                self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+                ssh.apply('no')
+                self.assertNotIn('PasswordAuthentication yes', config.read_text())
+                self.assertEqual(dropin.read_text(), f'"Include" "{nested}"\n')
+                self.assertTrue(crypto_link.is_symlink())
+                self.assertEqual(crypto.read_text(), 'Ciphers aes256-ctr\n')
+                self.assertEqual(nested.read_text(), '"Match" User root\n  AuthorizedKeysFile .ssh/team_keys\n')
+                self.assertEqual(commands.count(['reload']), 3)
+                ssh.apply('no')
+                self.assertEqual(commands.count(['reload']), 3)
+                # Reapply must remove tampered duplicates, not just trust its block.
+                with config.open('a') as out:
+                    out.write('PasswordAuthentication yes\n')
+                with nested.open('a') as out:
+                    out.write('PermitRootLogin yes\n')
+                ssh.apply('no')
+                self.assertEqual(commands.count(['reload']), 4)
+                self.assertNotIn('PasswordAuthentication yes', config.read_text())
+                self.assertNotIn('PermitRootLogin yes', nested.read_text())
+                # A new file under an Include glob invalidates staged validation.
+                clean = {path: path.read_bytes() for path in originals}
+                attack = dropins / 'new.conf'
+                real_verify = ssh.verify
+                def concurrent_edit(*args):
+                    real_verify(*args)
+                    attack.write_text('PermitRootLogin yes\n')
+                with patch.object(ssh, 'verify', side_effect=concurrent_edit):
+                    with self.assertRaisesRegex(RuntimeError, 'changed during validation'):
+                        ssh.apply('no')
+                self.assertEqual({path: path.read_bytes() for path in originals}, clean)
+                self.assertEqual(commands.count(['reload']), 4)
+                ssh.apply('no')
+                self.assertEqual(attack.read_text(), '')
+                self.assertEqual(commands.count(['reload']), 5)
+                # An Include symlink needing policy edits is refused, not replaced.
+                crypto.write_text('Ciphers aes256-ctr\nPasswordAuthentication yes\n')
+                with self.assertRaisesRegex(RuntimeError, 'snapshot must not touch'):
+                    ssh.apply('no')
+                self.assertTrue(crypto_link.is_symlink())
+                self.assertEqual(crypto.read_text(), 'Ciphers aes256-ctr\nPasswordAuthentication yes\n')
+                self.assertEqual(commands.count(['reload']), 5)
 
     def test_reload_failure_restores_original_and_idempotent_apply_does_not_reload(self):
         with tempfile.TemporaryDirectory() as directory:

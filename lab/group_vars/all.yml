@@ -1,3 +1,4 @@
-# Lab-only authentication; oski comes from the existing ansible.cfg.
-ansible_ssh_private_key_file: '{{ inventory_dir }}/../secrets/lab/id_ed25519'
-ansible_ssh_common_args: '-o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ inventory_dir }}/../secrets/lab/known_hosts'
+# Connection credentials for this fixture; repository defaults remain unchanged.
+ansible_ssh_private_key_file: '{{ inventory_dir }}/secrets/id_ed25519'
+ccdc_known_hosts_file: '{{ inventory_dir }}/secrets/known_hosts'
+ansible_ssh_common_args: '-o StrictHostKeyChecking=yes -o UserKnownHostsFile={{ ccdc_known_hosts_file }}'

@@ -2,6 +2,10 @@
 # ONLY for disposable containers: these are intentional security faults.
 set -eu
 mkdir -p /run/sshd /run/nginx /var/log/nginx
+case "$LAB_SOCKET_OWNER" in
+    ''|*[!0-9]*) echo 'LAB_SOCKET_OWNER must be a numeric UID' >&2; exit 1 ;;
+esac
+printf '%s\n' "$LAB_SOCKET_OWNER" > /var/lib/ccdc-lab/socket-owner
 
 if ! id oski >/dev/null 2>&1; then
     useradd --create-home --shell /bin/sh oski
@@ -38,10 +42,6 @@ SSH
 fi
 
 printf '%s - disposable CCDC lab\n' "$(hostname)" > /var/lib/ccdc-lab/www/index.html
-# Separate scoring-like service on tcp/9000. nginx remains on tcp/80.
-python3 -m http.server 9000 --bind 0.0.0.0 --directory /var/lib/ccdc-lab/www &
-app=$!
-
 # Apply fixtures once; restarts must not append unlimited tamper bytes/comments.
 if [ ! -f /var/lib/ccdc-lab/faults-applied ]; then
     printf '\nCCDC-LAB-INTENTIONALLY-MODIFIED\n' >> /usr/bin/ssh
@@ -72,17 +72,14 @@ fi
 
 nginx -t
 /usr/sbin/sshd -t
-nginx -g 'daemon off;' &
-web=$!
-/usr/sbin/sshd -D -e &
-ssh=$!
-# Private bind-mounted Unix sockets avoid host VPN routing entirely.
-# Only the invoking host UID can connect; no host key/password is mounted here.
-socat "UNIX-LISTEN:/run/lab-sockets/ssh,fork,unlink-early,mode=0600,user=$LAB_SOCKET_OWNER" TCP:127.0.0.1:22 &
-ssh_relay=$!
-socat "UNIX-LISTEN:/run/lab-sockets/http,fork,unlink-early,mode=0600,user=$LAB_SOCKET_OWNER" TCP:127.0.0.1:80 &
-web_relay=$!
-socat "UNIX-LISTEN:/run/lab-sockets/app,fork,unlink-early,mode=0600,user=$LAB_SOCKET_OWNER" TCP:127.0.0.1:9000 &
-app_relay=$!
-trap 'kill "$app" "$web" "$ssh" "$ssh_relay" "$web_relay" "$app_relay" 2>/dev/null || true; wait' TERM INT
-wait
+if [ -x /lib/systemd/systemd ]; then
+    # Docker mounts this container's private cgroup namespace read-only.
+    # Remount only that namespace, never bind-mount the host's cgroup tree.
+    [ "$(stat -f -c %T /sys/fs/cgroup)" = cgroup2fs ] || {
+        echo 'The systemd lab requires Docker with private cgroup v2 namespaces' >&2
+        exit 1
+    }
+    mount -o remount,rw /sys/fs/cgroup
+fi
+# BusyBox init + OpenRC on Alpine; systemd on Debian. No shell supervision.
+exec /sbin/init

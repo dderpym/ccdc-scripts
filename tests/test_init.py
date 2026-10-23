@@ -112,6 +112,35 @@ class BootstrapTests(unittest.TestCase):
                 run.message = message
                 self.assertFalse(ctl.probe_root('a', 'sensitive-password')[1])
 
+    def test_host_key_replacement_is_explicit_and_precedes_authentication(self):
+        def probe(host, password):
+            play.assert_called_once_with('host-keys', 'a', {'replace_host_keys': True})
+            return True, False, ''
+        with patch.object(ctl, 'playbook', return_value=True) as play, \
+                patch.object(ctl, 'probe_root', side_effect=probe):
+            self.assertFalse(ctl.initialize(['a'], 'a', replace_host_keys=True))
+        self.assertEqual(play.call_args_list[-1].args[0], 'init')
+        self.assertNotIn('ansible_host_key_checking', play.call_args.args[2])
+        self.assertNotIn('StrictHostKeyChecking=no', play.call_args.args[2]['ansible_ssh_args'])
+
+    def test_failed_key_replacement_does_not_send_passwords_or_run_init(self):
+        with patch.object(ctl, 'playbook', return_value=False) as play, \
+                patch.object(ctl, 'probe_root') as probe:
+            self.assertTrue(ctl.initialize(['a'], 'a', replace_host_keys=True))
+        play.assert_called_once_with('host-keys', 'a', {'replace_host_keys': True})
+        probe.assert_not_called()
+
+    def test_host_key_override_cli_is_only_available_for_init(self):
+        with patch('sys.argv', ['ccdcctl', 'init', 'a', '--replace-host-keys']), \
+                patch.object(ctl, 'select', return_value=(['a'], {})), \
+                patch.object(ctl, 'initialize', return_value=False) as initialize:
+            self.assertFalse(ctl.main())
+        self.assertTrue(initialize.call_args.kwargs['replace_host_keys'])
+        with patch('sys.argv', ['ccdcctl', 'ping', '--replace-host-keys']), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+            ctl.main()
+        self.assertEqual(error.exception.code, 2)
+
     def test_default_then_one_hidden_prompt_per_host(self):
         with patch.object(ctl, 'probe_root', side_effect=[(False, True, 'authentication failed'), (True, False, '')]) as probe, \
                 patch.object(ctl.sys.stdin, 'isatty', return_value=True), \
@@ -154,6 +183,24 @@ class BootstrapTests(unittest.TestCase):
         self.assertEqual(play.call_args.args[2]['ansible_user'], 'oski')
         self.assertNotIn('ansible_become', play.call_args.args[2])
         self.assertEqual(play.call_args.args[2]['ansible_become_method'], 'sudo')
+
+    def test_explicit_bootstrap_ignores_stale_recovery_and_oski_preflight(self):
+        ctl.text_file(self.root / 'secrets/root/a.password', 'staleRootPW1\n')
+        for options in ({'password_file': str(self.default)}, {'save_bootstrap': True}):
+            for key_works in (False, True):
+                with self.subTest(options=options, key_works=key_works), \
+                        patch.object(ctl.sys.stdin, 'isatty', return_value=True), \
+                        patch.object(ctl.getpass, 'getpass', return_value='competition-default'), \
+                        patch.object(ctl, 'verify_admin_access', return_value=key_works) as verify, \
+                        patch.object(ctl, 'probe_root', return_value=(True, False, '')) as probe, \
+                        patch.object(ctl, 'playbook', return_value=True) as play:
+                    self.assertFalse(ctl.initialize(['a'], 'a', **options))
+                    probe.assert_called_once_with('a', 'competition-default')
+                    verify.assert_not_called()
+                    self.assertEqual(play.call_args.args[2]['ansible_user'], 'root')
+                    self.assertFalse(play.call_args.args[2]['ansible_become'])
+                    self.assertEqual(play.call_args.args[2]['ansible_password'], 'competition-default')
+                    self.assertEqual(ctl.read_secret(self.root / 'secrets/root/a.password'), 'staleRootPW1')
 
     def test_recovery_password_is_used_instead_of_guessing_shared_default_again(self):
         ctl.text_file(self.root / 'secrets/root/a.password', 'oldRootPW1\n')

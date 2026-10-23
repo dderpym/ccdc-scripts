@@ -1,0 +1,6 @@
+#!/sbin/openrc-run
+description="Private CCDC host relay"
+command="/usr/local/bin/ccdc-lab-relay"
+command_args="$RC_SVCNAME"
+command_background=true
+pidfile="/run/$RC_SVCNAME.pid"

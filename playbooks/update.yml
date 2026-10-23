@@ -1,0 +1,62 @@
+---
+# The controller limits this play to one host and stops the rollout on failure.
+- name: Guarded native package update action
+  hosts: all
+  gather_facts: true
+  become: true
+  tasks:
+    - name: Validate update request
+      ansible.builtin.assert:
+        that:
+          - update_request.action in ['plan', 'select', 'apply', 'services', 'restart']
+          - update_request.action != 'apply' or update_request.token is match('^[a-f0-9]{32}$')
+        quiet: true
+
+    - name: Allocate private update script directory
+      ansible.builtin.tempfile:
+        state: directory
+        prefix: ccdc-update-
+      register: update_temp
+
+    - name: Run and clean up update script
+      block:
+        - name: Stage trusted update helpers
+          ansible.builtin.copy:
+            src: "../scripts/{{ item }}"
+            dest: "{{ update_temp.path }}/{{ item }}"
+            owner: root
+            group: root
+            mode: '0700'
+          loop:
+            - manage-updates
+            - update-services.py
+            - discover-listeners
+
+        - name: Run guarded update action
+          ansible.builtin.command:
+            argv:
+              - "{{ ansible_facts.python.executable }}"
+              - "{{ update_temp.path }}/manage-updates"
+            stdin: "{{ update_request | to_json }}"
+            stdin_add_newline: true
+          register: update_result
+          changed_when: update_request.action in ['plan', 'apply', 'restart']
+
+        - name: Validate recovery archive path
+          ansible.builtin.assert:
+            that:
+              - (update_result.stdout | from_json).backup_archive is match('^/var/backups/ccdc-updates/' + update_request.token + '/[^/]+$')
+            quiet: true
+          when: update_request.action == 'apply'
+
+        - name: Copy private configuration recovery archive to controller
+          ansible.builtin.fetch:
+            src: "{{ (update_result.stdout | from_json).backup_archive }}"
+            dest: "{{ update_backup_destination }}/configs.tar.gz"
+            flat: true
+          when: update_request.action == 'apply'
+      always:
+        - name: Remove staged update script
+          ansible.builtin.file:
+            path: "{{ update_temp.path }}"
+            state: absent

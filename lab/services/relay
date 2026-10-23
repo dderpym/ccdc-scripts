@@ -1,0 +1,12 @@
+#!/bin/sh
+# Each listener is independently managed, including after an SSH-side restart.
+set -eu
+name=${1#ccdc-relay-}
+case "$name" in
+    ssh) port=22 ;;
+    http) port=80 ;;
+    app) port=9000 ;;
+    *) exit 1 ;;
+esac
+owner=$(cat /var/lib/ccdc-lab/socket-owner)
+exec socat "UNIX-LISTEN:/run/lab-sockets/$name,fork,unlink-early,mode=0600,user=$owner" "TCP:127.0.0.1:$port"

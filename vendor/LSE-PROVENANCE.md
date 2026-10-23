@@ -13,8 +13,8 @@
 ## Invocation and scope
 
 `scripts/discover-lse --script vendor/lse.sh [--deep]` uses Python 3 stdlib
-and `/bin/sh`. It runs the local file with **`-c -i -l 0 -p 0 -s SELECTION`**;
-`--deep` changes only the level to **1**, never 2. These flags are verified
+and `/bin/sh`. It runs the local file with **`-c -i -l 1 -p 0 -s SELECTION`**;
+`--deep` expands the selection, never requesting output level 2. These flags are verified
 against this pinned source's `lse_help` and `getopts`: color disabled,
 noninteractive, important/interesting verbosity, zero-second process watch,
 explicit selected tests. No fetch, self-update, CVE exploit bundle, packet
@@ -24,11 +24,12 @@ The allowlist in `discover-lse` focuses on writable privileged files, cron and
 services, unusual setuid binaries, exposed credentials, weak local database
 authentication, dangerous NFS exports, extra UID-zero accounts, and container
 administrative groups. Inventory prerequisites (`usr070`, `fst000`, `fst010`,
-`sec010`, `ret050`) run to populate upstream variables but never appear as findings.
-Deep mode additionally selects ownership anomalies, UID-zero accounts,
-writable cron paths, and MongoDB connection checks. Normal mode selects only
-level-0 tests and their required dependencies: output level alone does not
-prevent upstream from executing level-1 tests.
+`sec010`) run to populate upstream variables but never appear as findings.
+Normal mode selects 30 reportable checks and these four prerequisites, including
+promoted level-1 checks for UID-zero accounts (`sys040`) and writable cron paths
+(`ret050`). Output level 1 preserves their evidence without selecting unrelated
+tests. Deep mode additionally selects ownership anomalies and MongoDB connection
+checks: output level alone does not prevent upstream from executing level-1 tests.
 
 Only affirmative (`yes!`) allowlisted tests with nonempty actionable evidence
 are emitted. `nope`, `skip`, informational tests, banners, inventory, and
@@ -49,8 +50,11 @@ Findings are **review candidates**, not automatic fixes. Run as the account
 whose access is being assessed (the playbook disables become). Permission
 findings are suppressed if upstream reports UID 0, since root readability
 and writability are expected; `errors` includes a coverage warning in that case.
-Passwordless sudo for the team's oski account
-is expected after bootstrap; it is still reported, never silently accepted.
+Passwordless sudo for the team's oski account is expected after bootstrap.
+Its `sud000` evidence is retained in raw output but excluded from normalized
+findings when the effective account, resolved by UID rather than environment or
+banner text, is `oski`. Other or unknown accounts retain the critical finding.
+This is explicit repository policy, not an accepted initial baseline.
 Missing find/getcap/sudo and unsupported find `-writable` (notably BusyBox) yield
 explicit coverage warnings. `incomplete_ids` identifies affected tests so the
 monitor retains their previous findings without preventing resolution of other
@@ -63,6 +67,24 @@ No secrets are requested on stdin. Complete raw output is retained separately fr
 banners, inventory prerequisites, and diagnostic stderr. Raw reports may contain
 password hashes and credentials from mount configuration/history: keep controller
 results private.
+
+## Passive supplemental checks
+
+Original Python helpers `scripts/lse_extras.py`, `scripts/lse_host_risks.py`,
+`scripts/kernel_risks.py` and `scripts/package_risks.py` add a curated subset
+of LinPEAS coverage gaps to the same result. LSE itself is
+still unmodified; its parser/allowlist contract below remains unchanged. See
+[LINPEAS-GAPS.md](LINPEAS-GAPS.md) for the pinned comparison, implemented checks,
+remaining gaps, kernel rule sources and limits. Supplements do not run LinPEAS,
+execute exploits, probe AF_ALG, load modules, contact runtime/agent APIs or
+download code. `sudo -n -l` and `doas -C` only list/match policy, never execute
+a delegated command. Trusted native `systemctl` and package utilities only read
+metadata. Credential supplements retain permission paths, never secret contents.
+Kernel checks use running metadata; permission checks assess the actual effective
+account and preserve scoped incomplete coverage when run as root or unavailable.
+A private `getcap` forwarding shim records the native exit status while preserving
+LSE stdout, with no second filesystem enumeration. This distinguishes an empty
+successful capability inventory from LSE's indistinguishable `nope` failure output.
 
 ## Result and transport contract
 
@@ -82,10 +104,11 @@ upstream `nope`/`skip`; upstream suppresses many command errors, so an empty
 result is **not** a proof of a secure or fully inspected host.
 
 Controller integration must invoke **`playbooks/lse.yml`**, not the existing
-ad-hoc `collect('lse')` script transport: two files need transfer. The playbook
+ad-hoc `collect('lse')` script transport: pinned source, license and helpers need transfer. The playbook
 creates a mode-0700 directory, copies vendor script/license and wrapper as
 mode-0600 files, uses the Ansible-selected/discovered Python interpreter,
-registers **`ccdc_lse_result`**, and always removes the directory. No role is
+also transfers the passive supplemental helpers, registers **`ccdc_lse_result`**,
+and always removes the directory. No role is
 needed. `lse_deep: true` (a boolean extra-var) enables the deeper mode.
 
 By default, `ccdc_results` overwrites each per-host result on every callback;

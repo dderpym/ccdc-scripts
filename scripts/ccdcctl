@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shlex
 import stat
 import subprocess
@@ -17,11 +18,15 @@ import time
 
 ROOT = Path(__file__).resolve().parent.parent
 EXTRA = shlex.split(os.environ.get("ANSIBLE_ARGS", ""))
+VERBOSE = False
 
 
 def run(args, capture=True, result_dir=None, result_task=None):
     env = dict(os.environ, ANSIBLE_CONFIG=str(ROOT / "ansible.cfg"),
                ANSIBLE_NOCOLOR="1")
+    if not capture and not VERBOSE:
+        env.update(ANSIBLE_STDOUT_CALLBACK="ccdc_progress", ANSIBLE_LOAD_CALLBACK_PLUGINS="1",
+                   ANSIBLE_CALLBACKS_ENABLED="ccdc_results")
     if result_dir:
         env.update(CCDC_RESULT_DIR=result_dir, ANSIBLE_LOAD_CALLBACK_PLUGINS="1",
                    ANSIBLE_CALLBACKS_ENABLED="ccdc_results")
@@ -80,7 +85,17 @@ def collect(kind, hosts, args=()):
             try:
                 response = json.loads((Path(directory) / host).read_text())
                 if response.get("unreachable") or response.get("failed") or response.get("rc", 0):
-                    raise ValueError(response.get("stderr") or response.get("msg") or "remote command failed")
+                    # SSH script tasks use a PTY: the script's stderr can land
+                    # in stdout, leaving only SSH's close notice in stderr.
+                    for stream in ("stdout", "stderr"):
+                        try:
+                            document = json.loads(response.get(stream) or "")
+                        except ValueError:
+                            continue
+                        if isinstance(document, dict) and isinstance(document.get("error"), str):
+                            raise ValueError(document["error"])
+                    raise ValueError("\n".join(response[key].strip() for key in ("stdout", "stderr")
+                                              if response.get(key)) or response.get("msg") or "remote command failed")
                 states[host] = json.loads(response["stdout"])
             except (OSError, ValueError, KeyError) as exc:
                 errors[host] = str(exc) if not isinstance(exc, FileNotFoundError) else (
@@ -161,10 +176,14 @@ def probe_root(host, password):
         return False, authentication, message.replace(password, '[redacted]')
 
 
-def initialize(hosts, target, password_file=None, save_bootstrap=False, use_saved=True):
+def initialize(hosts, target, password_file=None, save_bootstrap=False, use_saved=True, replace_host_keys=False):
+    if not use_saved and (password_file or save_bootstrap):
+        raise RuntimeError('--no-bootstrap-password cannot be combined with a password-file/save option')
+    if replace_host_keys:
+        print('WARNING: replacing saved host keys for selected endpoints; trusting current keys without independent verification.')
+        if not playbook('host-keys', target, {'replace_host_keys': True}):
+            return True
     if not use_saved:
-        if password_file or save_bootstrap:
-            raise RuntimeError('--no-bootstrap-password cannot be combined with a password-file/save option')
         return not playbook('init', target)
     path = Path(password_file).expanduser().absolute() if password_file else ROOT / 'secrets/bootstrap.password'
     if save_bootstrap:
@@ -190,8 +209,11 @@ def initialize(hosts, target, password_file=None, save_bootstrap=False, use_save
     for index, host in enumerate(hosts, 1):
         heading(host, index, len(hosts))
         recovery = ROOT / 'secrets/root' / (host + '.password')
+        use_recovery = recovery.exists() and not (password_file or save_bootstrap)
         try:
-            if recovery.exists() and verify_admin_access(host):
+            if use_recovery:
+                print(f'Existing recovery credential: {recovery}; checking oski key access for a rerun.')
+            if use_recovery and verify_admin_access(host):
                 # Reinitialization after hardening must not depend on root SSH.
                 # Use the playbook's become: true, not a global extra-var:
                 # extra-vars would also force sudo on controller delegates.
@@ -199,9 +221,10 @@ def initialize(hosts, target, password_file=None, save_bootstrap=False, use_save
                              "ansible_become_user": "root", "ansible_password": "",
                              "ansible_ssh_pass": "", "ansible_become_password": ""}
             else:
-                # Only one automatic password attempt: saved per-host credential
-                # on reruns, otherwise the shared competition bootstrap password.
-                password = read_secret(recovery) if recovery.exists() else default
+                # Explicit bootstrap options override stale recovery state;
+                # ordinary reruns retain one saved per-host password attempt.
+                print(f'Trying root password from {recovery if use_recovery else path}')
+                password = read_secret(recovery) if use_recovery else default
                 success, auth_failure, error = probe_root(host, password)
                 if not success and auth_failure and sys.stdin.isatty():
                     print('Saved credential rejected; one manual retry is available.')
@@ -234,34 +257,80 @@ def value(state, key):
 
 def problems(errors):
     for host, error in errors.items():
-        print(f"{host}: FAILED - {error}", file=sys.stderr)
+        print(terminal(f"{host}: FAILED - {error}"), file=sys.stderr)
 
 
-def status(kind, hosts):
+def items_text(items):
+    if items is None:
+        return "unknown"
+    return ", ".join(map(str, items)) or "none"
+
+
+def ssh_text(state):
+    lines = [
+        f"  Root login: {value(state, 'permitrootlogin')}   Password: {value(state, 'passwordauthentication')}",
+        f"  Public key: {value(state, 'pubkeyauthentication')}   Interactive: {value(state, 'kbdinteractiveauthentication')}",
+        f"  Ports: {value(state, 'port')}   Listen: {value(state, 'listenaddress')}",
+        "  Scope: " + (state.get("context") or "global defaults") + "; Match rules may differ for other connections",
+    ]
+    for key, label in (("allowusers", "Allow users"), ("allowgroups", "Allow groups"),
+                       ("denyusers", "Deny users"), ("denygroups", "Deny groups"),
+                       ("authenticationmethods", "Auth methods"), ("authorizedkeysfile", "Key files")):
+        if state.get("effective", {}).get(key):
+            lines.append(f"  {label}: {value(state, key)}")
+    for name, binding in state.get("socket_listeners", {}).items():
+        lines.append(f"  Active socket {name}: {binding}")
+    if state.get("match_rules"):
+        lines.append("  WARNING: conditional Match/Include rules present; inspect with --json or --verbose.")
+    for note in state.get("caveats", []):
+        if note.startswith("Effective values describe only the specified context"):
+            continue  # Already covered by Scope above.
+        if note.startswith("Service command-line overrides are not represented"):
+            note = "Service command-line overrides are not included in these settings."
+        lines.append("  Note: " + note)
+    return terminal("\n".join(lines))
+
+
+def firewall_text(state):
+    inbound = state.get("default_inbound") or "unknown"
+    ssh22 = {True: "allowed", False: "blocked", None: "unknown"}[state.get("ssh22")]
+    lines = [f"  Backend: {state.get('backend', 'unknown')}   Default inbound: {inbound}   TCP/22: {ssh22}",
+             f"  Allowed TCP: {items_text(state.get('allowed_tcp'))}",
+             f"  Allowed UDP: {items_text(state.get('allowed_udp'))}"]
+    if state.get("allowed_tcp") is None or state.get("allowed_udp") is None:
+        lines.append("  WARNING: allowed ports are not proven for this ruleset; candidates are NOT reachability.")
+        candidates = sorted({hint['protocol'] + '/' + str(port)
+                             for hint in state.get('explicit_inbound_accepts', []) for port in hint['ports']})
+        if candidates:
+            lines.append("  ACCEPT candidates (conditions/order may deny): " + items_text(candidates))
+        for policy in state.get("input_policies", []):
+            lines.append(f"  INPUT policy {policy['family']}/{policy['table']}/{policy['chain']}: "
+                         + (policy.get("policy") or "unknown"))
+    if state.get("source_rules"):
+        lines.append(f"  WARNING: {len(state['source_rules'])} source/interface-conditional rules; restrictions are NOT retained on apply.")
+    rules = state.get("rules", {})
+    if rules.get("managers"):
+        lines.append("  WARNING: active managers: " + items_text(rules["managers"]))
+    if rules.get("uninspected_legacy"):
+        lines.append("  WARNING: uninspected legacy backends: " + items_text(rules["uninspected_legacy"]))
+    return terminal("\n".join(lines))
+
+
+def show_state(kind, state, title):
+    print(terminal(title))
+    print(ssh_text(state) if kind == "ssh" else firewall_text(state))
+    if VERBOSE:
+        print(json.dumps(state, indent=2, sort_keys=True))
+
+
+def status(kind, hosts, json_output=False):
     states, errors = collect(kind, hosts)
-    if len(hosts) == 1:
-        if states:
-            print(json.dumps(states[hosts[0]], indent=2, sort_keys=True))
-    elif kind == "ssh":
-        print(f"{'HOST':20} {'ROOT LOGIN':12} {'PASSWORD AUTH':15} {'PUBKEY AUTH':12} PORT")
-        for host, state in states.items():
-            print(f"{host:20} {value(state, 'permitrootlogin'):12} "
-                  f"{value(state, 'passwordauthentication'):15} "
-                  f"{value(state, 'pubkeyauthentication'):12} {value(state, 'port')}")
+    if json_output:
+        print(json.dumps({"hosts": states, "errors": errors}, indent=2, sort_keys=True))
     else:
-        print(f"{'HOST':20} {'BACKEND':16} {'INBOUND':14} TCP / UDP / SSH22")
         for host, state in states.items():
-            print(f"{host:20} {state.get('backend', 'unknown'):16} "
-                  f"{str(state.get('default_inbound', 'unknown')):14} "
-                  f"{state.get('allowed_tcp', [])} / {state.get('allowed_udp', [])} / "
-                  f"{state.get('ssh22', 'unknown')}")
-            if state.get('allowed_tcp') is None:
-                candidates = sorted({hint['protocol'] + '/' + str(port)
-                                     for hint in state.get('explicit_inbound_accepts', [])
-                                     for port in hint['ports']})
-                print("  Explicit ACCEPT candidates (conditions/order may deny): " + ', '.join(candidates))
-                print("  Base INPUT policies: " + json.dumps(state.get('input_policies', []), sort_keys=True))
-    problems(errors)
+            show_state(kind, state, f"{host} · {kind.upper()}")
+        problems(errors)
     return bool(errors)
 
 
@@ -274,7 +343,7 @@ def ask(prompt, choices, default):
 
 
 def heading(host, index, count):
-    print(f"\n{'=' * 50}\nHost {index}/{count}: {host}\n{'=' * 50}")
+    print(f"\n-- {host} ({index}/{count}) --")
 
 
 def verify_admin_access(host):
@@ -303,7 +372,7 @@ def configure_ssh(hosts):
             problems(errors)
             summary.append((host, "unknown", "unknown", "FAILED"))
             continue
-        print("Current SSH state:\n" + json.dumps(states[host], indent=2, sort_keys=True))
+        show_state("ssh", states[host], "Current SSH")
         if bulk is not None:
             print(f"Bulk password-auth choice: {'enabled' if bulk else 'disabled'} (override available)")
             choice = ask("[enter] reuse, [y] enable, [n] disable, [s] skip", ["reuse", "y", "n", "s"], "reuse")
@@ -327,7 +396,7 @@ def configure_ssh(hosts):
         success = playbook("ssh", host, {"password_auth": enabled})
         states, errors = collect("ssh", [host])
         if not errors:
-            print("Effective state after apply:\n" + json.dumps(states[host], indent=2, sort_keys=True))
+            show_state("ssh", states[host], "Observed SSH after apply")
             desired = {"permitrootlogin": "no", "passwordauthentication": "yes" if enabled else "no",
                        "kbdinteractiveauthentication": "yes" if enabled else "no", "pubkeyauthentication": "yes"}
             success = success and all(value(states[host], k) == v for k, v in desired.items())
@@ -390,18 +459,23 @@ def groups(items):
 
 
 def policy_text(policies):
-    lines = ["\n" + "=" * 50, "PROPOSED FIREWALL POLICY", "=" * 50,
+    lines = ["\nPROPOSED FIREWALL POLICY",
              "Only approved ports remain open; other unsolicited inbound traffic is blocked."]
     for host, policy in policies.items():
         lines.append("\n" + host)
         for protocol in ("tcp", "udp"):
-            for port in policy[protocol]:
-                lines.append(f"  ALLOW {protocol}/{port}")
+            lines.append(f"  ALLOW {protocol.upper()}: {items_text(policy[protocol])}")
         lines.extend("  " + line for line in policy["review"])
     return "\n".join(lines)
 
 
 def configure_firewall(hosts):
+    print("Preparing missing networking tools with Ansible; no firewall policy is applied yet.")
+    if not playbook("firewall", ":".join(hosts), {"firewall_action": "prepare"}):
+        return True
+    print("Default: ALLOW tcp/22, loopback, established/related and essential IPv6 ICMP; BLOCK other unsolicited inbound.")
+    print("nft replaces ALL tables atomically (unsafe NAT/forward/output is refused); iptables overrides INPUT.")
+    print("Prior source restrictions are NOT retained. Approved ports open to all sources on IPv4 and IPv6.")
     remembered = {}
     while True:
         states, errors = collect("listeners", hosts)
@@ -414,11 +488,8 @@ def configure_firewall(hosts):
             if host in errors:
                 print("Skipping failed discovery; no policy applied.")
                 continue
-            print("Current firewall:\n" + json.dumps(firewalls[host], indent=2, sort_keys=True))
-            print("Default: ALLOW tcp/22, loopback, established/related and essential IPv6 ICMP; BLOCK other unsolicited inbound.")
-            print("nft replaces ALL existing tables/input policy atomically (unsafe NAT/forward/output is refused).")
-            print("iptables overrides prior INPUT policy with a first owned jump; existing source restrictions do not carry over.")
-            print("Approved ports are open to all sources, for IPv4 and IPv6. Non-loopback bindings below.")
+            show_state("firewall", firewalls[host], "Current firewall")
+            print("Non-loopback bindings (not proven network reachability):")
             policy = {"tcp": [22], "udp": [], "review": []}
             skipped = False
             for identity, ports in groups(states[host]):
@@ -507,7 +578,7 @@ def configure_firewall(hosts):
             problems(failure)
             success = False
         elif observed:
-            print("Effective firewall after apply:\n" + json.dumps(observed[host], indent=2, sort_keys=True))
+            show_state("firewall", observed[host], "Observed firewall after apply")
         if success:
             success = verify_admin_access(host)
         results.append((host, "OK" if success else "FAILED - inspect/rollback before proceeding"))
@@ -534,13 +605,28 @@ def rollback(hosts):
     return any(not success for _, success in results)
 
 
+def ssh_policy(state):
+    """Trust effective settings and their scope, never source hashes/diagnostics."""
+    if not isinstance(state, dict):
+        raise ValueError("Invalid SSH settings document")
+    effective = state.get("effective")
+    if not isinstance(effective, dict) or not effective:
+        raise ValueError("Missing effective SSH settings")
+    return {"effective": effective, "context": state.get("context"),
+            "socket_listeners": state.get("socket_listeners", {}),
+            "match_rules": state.get("match_rules", [])}
+
+
 def baseline(kind, hosts):
     if kind not in ("ssh", "firewall"):
         raise RuntimeError("Only SSH and firewall have trusted baselines")
     states, errors = collect(kind, hosts)
     for host, state in states.items():
-        save(ROOT / "baselines" / host / f"{kind}.json", state)
-        print(f"{host}: accepted {kind} baseline")
+        try:
+            save(ROOT / "baselines" / host / f"{kind}.json", ssh_policy(state) if kind == "ssh" else state)
+            print(f"{host}: accepted {kind} baseline")
+        except (OSError, ValueError) as exc:
+            errors[host] = str(exc)
     problems(errors)
     return bool(errors)
 
@@ -675,6 +761,8 @@ def monitor_events(previous, kind, hosts, states, errors):
             else:
                 try:
                     expected = json.loads((ROOT / "baselines" / host / f"{kind}.json").read_text())
+                    if kind == "ssh":
+                        expected, state = ssh_policy(expected), ssh_policy(state)
                     if state != expected:
                         findings[("drift",)] = {"severity": "critical", "summary": "drift\n" + drift(expected, state)}
                 except (OSError, ValueError) as exc:
@@ -784,14 +872,16 @@ def monitor(kinds, target, interval=None, once=False):
         executor.shutdown(wait=True, cancel_futures=True)
 
 
-def main():
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--verbose", action="store_true", help="show full Ansible logs and discovered SSH/firewall documents")
     sub = parser.add_subparsers(dest="command", required=True)
     cmd = sub.add_parser('init')
     cmd.add_argument('target', nargs='?', default='all')
-    cmd.add_argument('--bootstrap-password-file', help='private single-password file (plaintext or Ansible Vault); defaults to secrets/bootstrap.password if present')
-    cmd.add_argument('--save-bootstrap-password', action='store_true', help='prompt once, save the shared bootstrap password privately, then initialize')
+    cmd.add_argument('--bootstrap-password-file', help='private single-password file (plaintext or Ansible Vault); explicitly selects root bootstrap over saved-host recovery')
+    cmd.add_argument('--save-bootstrap-password', action='store_true', help='prompt once, save the shared bootstrap password privately, then bootstrap as root instead of using saved-host recovery')
     cmd.add_argument('--no-bootstrap-password', action='store_true', help='ignore saved root credentials and use normal Ansible key/admin/-k options')
+    cmd.add_argument('--replace-host-keys', action='store_true', help='explicitly replace selected endpoints\' saved keys with currently presented keys before init; trust reset, not verification')
     for command in ("ping", "listeners"):
         cmd = sub.add_parser(command)
         cmd.add_argument("target", nargs="?", default="all")
@@ -799,6 +889,11 @@ def main():
         cmd = sub.add_parser(command)
         cmd.add_argument("action", choices=["status", "configure", "baseline"] + (["rollback"] if command == "firewall" else []))
         cmd.add_argument("target", nargs="?", default="all")
+        cmd.add_argument("--json", action="store_true", help="status only: emit full host-keyed discovery documents and errors")
+    cmd = sub.add_parser("update", help="discover/review updates interactively; apply then offer individual service restarts")
+    cmd.add_argument("action", choices=["plan", "apply"])
+    cmd.add_argument("target", nargs="?", default="all")
+    cmd.add_argument("--yes", action="store_true", help="install saved reviewed packages without confirmation; never approves service restarts")
     for command in SCANNERS:
         cmd = sub.add_parser(command, help="read-only current security findings; no baseline")
         cmd.add_argument("action_or_target", nargs="?", default="status", metavar="[status|HOST]")
@@ -809,7 +904,110 @@ def main():
     cmd.add_argument("--host", default="all")
     cmd.add_argument("--interval", type=int, default=None, help="override all selected module intervals; otherwise use inventory/defaults")
     cmd.add_argument("--once", action="store_true", help="one poll, nonzero if alerts (debugging)")
+    cmd = sub.add_parser("complete", help="emit candidates for Bash complete -C")
+    cmd.add_argument("words", nargs=argparse.REMAINDER, help="Bash supplies command, current word, previous word")
+    for command, child in sub.choices.items():
+        if command != "complete":
+            child.add_argument("--verbose", action="store_true", default=argparse.SUPPRESS,
+                               help="show full Ansible logs and discovered SSH/firewall documents")
+    return parser
+
+
+def complete(parser, words):
+    """Bash -C supplies argv and COMP_LINE/COMP_POINT, not COMP_WORDS."""
+    if len(words) != 3 or "COMP_LINE" not in os.environ:
+        return
+    invoked, current, previous = words
+    line = os.fsencode(os.environ["COMP_LINE"])[:int(os.environ["COMP_POINT"])].decode(errors="ignore")
+    lexer = shlex.shlex(line, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    before = []
+    try:
+        before.extend(lexer)
+    except ValueError:
+        pass  # An unfinished quoted word is still being completed.
+    else:
+        if line and not line[-1].isspace():
+            before = before[:-1]
+    if invoked not in before:
+        return
+    before = before[before.index(invoked) + 1:]
+    name = Path(invoked).name
+    if name in ("manage", "check-lab"):
+        # Load only known repository scripts, never a path from the command line.
+        path = ROOT / ("lab/manage" if name == "manage" else "scripts/check-lab")
+        parser = runpy.run_path(str(path))["argument_parser"]()
+    elif name in ("ssh-monitor", "firewall-monitor"):
+        parser = next(action.choices["monitor"] for action in parser._actions
+                      if isinstance(action, argparse._SubParsersAction))
+        before.insert(0, name.removesuffix("-monitor"))
+    commands = next((action.choices for action in parser._actions
+                     if isinstance(action, argparse._SubParsersAction)), {})
+    while before and any(before[0] in action.option_strings and action.nargs == 0
+                         for action in parser._actions):
+        before = before[1:]
+    command, arguments = None, before
+    if commands and before:
+        command, *arguments = before
+        if command not in commands or command == "complete" or command.startswith("_"):
+            return
+        parser = commands[command]
+    actions = parser._actions
+    options = {option: action for action in actions for option in action.option_strings}
+    if previous in options and options[previous].nargs != 0:
+        # No output means Bash's -o default handles filenames itself.
+        if previous != "--host":
+            return
+        choices = ["hosts"]
+    else:
+        positional = []
+        skip = False
+        for word in arguments:
+            if skip:
+                skip = False
+            elif word in options:
+                skip = options[word].nargs != 0
+            elif not word.startswith("-"):
+                positional.append(word)
+        choices = list(options)
+        if not current.startswith("-"):
+            if commands and not before:
+                choices += [name for name in commands if not name.startswith("_")]
+            elif command in SCANNERS:
+                if not positional:
+                    choices += ["status", "hosts"]
+                elif positional == ["status"]:
+                    choices += ["hosts"]
+            else:
+                positions = [action for action in actions if not action.option_strings]
+                if len(positional) < len(positions):
+                    action = positions[len(positional)]
+                    if action.choices:
+                        choices += list(action.choices)
+                    elif action.dest == "target":
+                        choices += ["hosts"]
+    if "hosts" in choices:
+        choices.remove("hosts")
+        choices.append("all")
+        try:
+            choices += inventory()[0]
+        except (RuntimeError, OSError, ValueError):
+            pass  # Inventory is optional for completion; never print diagnostics.
+    for choice in choices:
+        if choice.startswith(current):
+            print(choice)
+
+
+def main():
+    global VERBOSE
+    parser = argument_parser()
     args = parser.parse_args()
+    VERBOSE = args.verbose
+    if args.command in ("ssh", "firewall") and args.json and args.action != "status":
+        parser.error("--json is only available for status")
+    if args.command == "complete":
+        return complete(parser, args.words)
     if args.command == "monitor":
         if args.interval is not None and args.interval < 5:
             parser.error("--interval must be at least 5 seconds")
@@ -823,14 +1021,18 @@ def main():
         hosts, _ = select(target)
         return security_status(args.command, hosts, args.deep)
     hosts, variables = select(args.target)
+    if args.command == "update":
+        updates = runpy.run_path(str(ROOT / "scripts/update-controller.py"))["updates"]
+        return updates(globals(), args.action, hosts, variables, args.yes)
     if args.command == "init":
-        return initialize(hosts, args.target, args.bootstrap_password_file, args.save_bootstrap_password, not args.no_bootstrap_password)
+        return initialize(hosts, args.target, args.bootstrap_password_file, args.save_bootstrap_password,
+                          not args.no_bootstrap_password, replace_host_keys=args.replace_host_keys)
     if args.command == "ping":
         return run(["ansible", "all", "--limit", ":".join(hosts), "-m", "ansible.builtin.ping", *EXTRA], False).returncode != 0
     if args.command == "listeners":
         return listeners(hosts, variables)
     if args.action == "status":
-        return status(args.command, hosts)
+        return status(args.command, hosts, args.json)
     if args.action == "baseline":
         return baseline(args.command, hosts)
     if args.action == "rollback":

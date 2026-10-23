@@ -4,14 +4,17 @@ services:
     build:
       context: .
       target: hatchery
-      network: host  # Package downloads only; runtime remains isolated.
+      network: host  # Build downloads only; runtime uses a NATed bridge.
     image: ccdc-lab-hatchery
     hostname: hatchery
     container_name: ccdc-lab-hatchery
+    dns: [1.1.1.1, 8.8.8.8]  # Do not inherit host VPN-only DNS resolvers.
+    dns_search: ["."]  # Do not inherit host VPN search domains either.
     cap_add: [NET_ADMIN]  # Container firewall namespace only; never --privileged.
     cpus: 1
     mem_limit: 384m
     pids_limit: 256
+    tmpfs: [/run, /tmp]
     environment:
       LAB_SOCKET_OWNER: "${CCDC_LAB_UID:?Run lab/manage up}"
     labels:
@@ -19,13 +22,19 @@ services:
       ccdc.lab.http_port: "8080"
       ccdc.lab.app_port: "9070"
     volumes:
-      - ../secrets/lab/id_ed25519.pub:/run/lab-key.pub:ro
-      - ../secrets/lab/sockets/hatchery:/run/lab-sockets
+      - ./secrets/id_ed25519.pub:/run/lab-key.pub:ro
+      - ./secrets/sockets/hatchery:/run/lab-sockets
     networks:
       isolated:
         ipv4_address: 172.30.133.70
     healthcheck:
-      test: [CMD, python3, -c, "import socket; [socket.create_connection(('127.0.0.1', p), 2).close() for p in (22, 80, 9000)]"]
+      test:
+        - CMD-SHELL
+        - >-
+          for name in sshd nginx crond syslog ccdc-app ccdc-relay-ssh ccdc-relay-http ccdc-relay-app; do
+            rc-service "$$name" status >/dev/null || exit 1;
+          done;
+          python3 -c "import socket, os, stat; assert all(stat.S_ISSOCK(os.stat('/run/lab-sockets/' + n).st_mode) for n in ('ssh', 'http', 'app')); [socket.create_connection(('127.0.0.1', p), 2).close() for p in (22, 80, 9000)]"
       interval: 2s
       timeout: 7s
       retries: 30
@@ -37,31 +46,45 @@ services:
     image: ccdc-lab-tarpit
     hostname: tarpit
     container_name: ccdc-lab-tarpit
-    cap_add: [NET_ADMIN]
+    dns: [1.1.1.1, 8.8.8.8]
+    dns_search: ["."]
+    # systemd needs a writable private cgroup tree, not the host's tree.
+    cap_add: [NET_ADMIN, SYS_ADMIN]
+    cgroup: private
+    tmpfs: [/run, /run/lock, /tmp]
     cpus: 1
     mem_limit: 384m
     pids_limit: 256
     environment:
+      container: docker
       LAB_SOCKET_OWNER: "${CCDC_LAB_UID:?Run lab/manage up}"
     labels:
       ccdc.lab.ssh_port: "22170"
       ccdc.lab.http_port: "8081"
       ccdc.lab.app_port: "9170"
     volumes:
-      - ../secrets/lab/id_ed25519.pub:/run/lab-key.pub:ro
-      - ../secrets/lab/sockets/tarpit:/run/lab-sockets
+      - ./secrets/id_ed25519.pub:/run/lab-key.pub:ro
+      - ./secrets/sockets/tarpit:/run/lab-sockets
     networks:
       isolated:
         ipv4_address: 172.30.133.170
     healthcheck:
-      test: [CMD, python3, -c, "import socket; [socket.create_connection(('127.0.0.1', p), 2).close() for p in (22, 80, 9000)]"]
+      test:
+        - CMD-SHELL
+        - >-
+          for name in ssh nginx cron rsyslog dbus systemd-journald ccdc-app ccdc-relay@ssh ccdc-relay@http ccdc-relay@app; do
+            systemctl is-active --quiet "$$name" || exit 1;
+          done;
+          python3 -c "import socket, os, stat; assert all(stat.S_ISSOCK(os.stat('/run/lab-sockets/' + n).st_mode) for n in ('ssh', 'http', 'app')); [socket.create_connection(('127.0.0.1', p), 2).close() for p in (22, 80, 9000)]"
       interval: 2s
       timeout: 7s
       retries: 30
 networks:
   isolated:
     name: ccdc-lab-internal
-    internal: true
+    # Normal Docker bridge NAT permits outbound package downloads.
+    # No container service ports are published; access uses the loopback relay.
+    internal: false
     ipam:
       config:
         - subnet: 172.30.133.0/24

@@ -1,10 +1,11 @@
 ---
 # Controller: run this playbook with CCDC_RESULT_DIR and ccdc_results enabled,
-# NOT the ad-hoc script collector (both pinned LSE and wrapper need transfer).
+# NOT the ad-hoc script collector (pinned LSE and its helpers need transfer).
 # ccdc_lse_result is the command result; JSON is in .stdout. The final command
 # republishes it AFTER cleanup because ccdc_results saves the latest host task.
-# --extra-vars '{"lse_deep": true}' enables level 1. Never become root for
-# permission checks: authorized oski sudo access is expected, not a new exploit.
+# --extra-vars '{"lse_deep": true}' expands the allowlist; both modes request
+# level-1 evidence. Never become root for permission checks: authorized oski
+# sudo access is expected, not a new exploit.
 - name: Discover actionable local privilege risks with pinned LSE
   hosts: all
   gather_facts: false
@@ -27,7 +28,7 @@
             mode: '0700'
           changed_when: false
 
-        - name: Transfer pinned LSE, its license, and the stdlib wrapper
+        - name: Transfer pinned LSE, its license, wrapper and passive stdlib helpers
           ansible.builtin.copy:
             src: "{{ playbook_dir }}/../{{ item.src }}"
             dest: "{{ ccdc_lse_tmp.path }}/{{ item.dest }}"
@@ -36,6 +37,10 @@
             - {src: vendor/lse.sh, dest: lse.sh}
             - {src: vendor/LSE-LICENSE, dest: LSE-LICENSE}
             - {src: scripts/discover-lse, dest: discover-lse}
+            - {src: scripts/lse_extras.py, dest: lse_extras.py}
+            - {src: scripts/kernel_risks.py, dest: kernel_risks.py}
+            - {src: scripts/lse_host_risks.py, dest: lse_host_risks.py}
+            - {src: scripts/package_risks.py, dest: package_risks.py}
           changed_when: false
 
         - name: Run selected checks without passwords, color, or process monitoring

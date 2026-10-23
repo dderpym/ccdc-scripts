@@ -107,6 +107,32 @@ class SecurityControllerTests(unittest.TestCase):
         fixed = {'findings': [], 'errors': []}
         self.assertEqual(ctl.monitor_events(previous, 'lse', ['a'], {'a': fixed}, {})[0][0], 'RESOLVED')
 
+    def test_passive_capability_failures_and_kernel_rc_do_not_resolve_prior_findings(self):
+        extras = load('lse_extras.py')
+        kernel = load('kernel_risks.py')
+        previous = {}
+        caps = dict(FINDING, id='extra-capabilities')
+        pipe = dict(FINDING, id='kernel:CVE-2022-0847')
+        ctl.monitor_events(previous, 'lse', ['a'], {'a': {'findings': [caps, pipe], 'errors': []}}, {})
+        with patch.object(extras.os, 'geteuid', return_value=1000):
+            failed = extras.inspect_capabilities('[!] sec010 Capabilities nope\n', 1)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'proc').mkdir()
+            (root / 'proc/version').write_text('fixture')
+            rc = kernel.inspect_kernel(root=root, release='5.17-rc1')
+        partial = {'findings': failed['findings'] + rc['findings'], 'errors': [],
+                   'incomplete_ids': failed['incomplete_ids'] + rc['incomplete_ids']}
+        events = ctl.monitor_events(previous, 'lse', ['a'], {'a': partial}, {})
+        self.assertNotIn('RESOLVED', [event[0] for event in events])
+        with patch.object(extras.os, 'geteuid', return_value=1000):
+            empty = extras.inspect_capabilities('[!] sec010 Capabilities nope\n', 0)
+        empty['incomplete_ids'] = [kernel.DIRTY_PIPE]
+        events = ctl.monitor_events(previous, 'lse', ['a'], {'a': empty}, {})
+        resolutions = [event[-1] for event in events if event[0] == 'RESOLVED']
+        self.assertTrue(any('extra-capabilities' in event for event in resolutions))
+        self.assertFalse(any('kernel:CVE-2022-0847' in event for event in resolutions))
+
     def test_lse_context_changes_are_changes_not_false_resolutions(self):
         previous = {}
         old = dict(STATE, findings=[dict(FINDING, context=['/path/old'])])

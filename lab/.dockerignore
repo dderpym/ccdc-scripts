@@ -1,0 +1,6 @@
+# Only fixture build inputs; never send lab credentials or reports to Docker.
+*
+!Dockerfile
+!entrypoint.sh
+!services/
+!services/**

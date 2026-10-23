@@ -2,9 +2,9 @@
 - name: Require an explicit firewall operation
   ansible.builtin.assert:
     that:
-      - firewall_action | default('') in ['apply', 'restore']
+      - firewall_action | default('') in ['prepare', 'apply', 'restore']
       - inventory_hostname is match('^[A-Za-z0-9_][A-Za-z0-9_.-]*$')
-    fail_msg: Set firewall_action to apply or restore; discovery uses scripts/discover-firewall directly.
+    fail_msg: Set firewall_action to prepare, apply or restore; discovery uses scripts/discover-firewall directly.
 
 - name: Require both explicit port lists for apply
   ansible.builtin.assert:
@@ -49,6 +49,11 @@
             firewall_connection.stdout.split()[3] | int in
             (firewall_tcp_ports | from_json if firewall_tcp_ports is string else firewall_tcp_ports)
         fail_msg: Approve the actual server-side SSH connection port before firewall application.
+
+- name: Install networking tools before snapshots and enforcement
+  ansible.builtin.include_role:
+    name: network_tools
+  when: firewall_action in ['prepare', 'apply']
 
 - name: Save a controller rollback copy before any application
   when: firewall_action == 'apply' and not ansible_check_mode

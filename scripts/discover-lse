@@ -1,22 +1,28 @@
 #!/usr/bin/env python3
 """Run the vendored LSE on this host; stdout is one JSON object, even on failure.
 
---script is a local pinned lse.sh, never a URL. --deep enables level 1, not 2.
+--script is a local pinned lse.sh, never a URL. --deep expands the allowlist.
+Passive supplemental permission/kernel checks share the same finding contract.
 Findings are review candidates relative to the invoking user's permissions.
+The repository's expected oski passwordless sudo stays in raw evidence only.
 raw retains complete scanner output; only normalized findings reach the terminal.
 """
 import argparse
 import json
 import os
 from pathlib import Path
+import pwd
 import re
+import runpy
+import shlex
 import signal
 import shutil
 import subprocess
 import tempfile
 
 # Only these tests become findings. Dependencies run but are never inventory.
-# Values: minimum output level, severity, stable summary.
+# Values: minimum scan profile (0=normal, 1=deep), severity, stable summary.
+# Upstream output level 1 is needed for promoted sys040/ret050 evidence.
 TESTS = {
     "usr080": (0, "critical", "Current directory in a system PATH"),
     "sud000": (0, "critical", "Passwordless sudo execution"),
@@ -31,11 +37,11 @@ TESTS = {
     "sys020": (0, "critical", "Password hashes or empty passwords in passwd"),
     "sys022": (0, "critical", "Password hashes or empty passwords in group"),
     "sys030": (0, "critical", "Readable shadow password files"),
-    "sys040": (1, "critical", "Additional UID-zero accounts"),
+    "sys040": (0, "critical", "Additional UID-zero accounts"),
     "sec020": (0, "critical", "Writable binaries with capabilities"),
     "sec030": (0, "critical", "Binaries with all capabilities"),
     "ret010": (0, "critical", "Writable cron tasks"),
-    "ret050": (1, "warning", "Writable paths referenced by cron"),
+    "ret050": (0, "warning", "Writable paths referenced by cron"),
     "ret060": (0, "critical", "Writable executables referenced by cron"),
     "ret510": (0, "critical", "Writable systemd timers"),
     "srv000": (0, "critical", "Writable service configuration"),
@@ -55,7 +61,7 @@ TESTS = {
     "ctn020": (0, "critical", "Membership in the docker group"),
     "ctn210": (0, "critical", "Membership in an lxc/lxd group"),
 }
-DEPENDENCIES = ("usr070", "fst000", "fst010", "sec010", "ret050")
+DEPENDENCIES = ("usr070", "fst000", "fst010", "sec010")
 
 
 def selection(deep=False):
@@ -187,8 +193,8 @@ def coverage(directory, env=None):
     return gaps
 
 
-def scan(script, deep=False):
-    command = ["/bin/sh", str(Path(script).resolve()), "-c", "-i", "-l", "1" if deep else "0",
+def scan_lse(script, deep=False):
+    command = ["/bin/sh", str(Path(script).resolve()), "-c", "-i", "-l", "1",
                "-p", "0", "-s", selection(deep)]
     # LSE creates scratch files even with monitoring disabled. Keep these private
     # and remove them on success, warnings, missing commands, or timeout.
@@ -200,6 +206,18 @@ def scan(script, deep=False):
         standard = ('/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin')
         env['PATH'] = os.pathsep.join(dict.fromkeys((*standard, *env.get('PATH', '').split(os.pathsep))))
         gaps = coverage(directory, env)
+        # LSE maps both a successful empty inventory and command failure to 'nope'.
+        # Record the native exit status without a second filesystem traversal or
+        # modifying the pinned script. The private shim forwards stdout unchanged.
+        cap_status = Path(directory) / 'getcap.status'
+        getcap = shutil.which('getcap', path=env['PATH'])
+        if getcap:
+            recorder = Path(directory) / 'getcap'
+            recorder.write_text('#!/bin/sh\n' + shlex.quote(getcap) + ' "$@"\n'
+                                'status=$?\nprintf "%s" "$status" > ' + shlex.quote(str(cap_status))
+                                + '\nexit "$status"\n')
+            recorder.chmod(0o700)
+            env['PATH'] = directory + os.pathsep + env['PATH']
         try:
             with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, universal_newlines=True, errors="replace",
@@ -215,6 +233,18 @@ def scan(script, deep=False):
                         pass  # The group may have exited just as the deadline fired.
                     stdout, stderr = process.communicate()
                 result = parse(stdout, deep)
+                if cap_status.exists():
+                    receipt = cap_status.read_text()
+                    if receipt.isdigit() and len(receipt) <= 3:
+                        result['_capability_status'] = int(receipt)
+                # Bootstrap intentionally grants this account NOPASSWD sudo.
+                # Use the real effective account, not USER or the LSE banner.
+                try:
+                    account = pwd.getpwuid(os.geteuid()).pw_name
+                except KeyError:
+                    account = None
+                if account == "oski":
+                    result["findings"] = [f for f in result["findings"] if f["id"] != "sud000"]
                 result["raw"] = stdout + ("\n--- stderr ---\n" + stderr if stderr else "")
                 if timed_out:
                     result["errors"].append("LSE timed out after 180 seconds; findings may be incomplete")
@@ -229,6 +259,39 @@ def scan(script, deep=False):
                 return result
         except OSError as exc:
             return {"findings": [], "raw": "", "errors": ["Cannot execute local LSE: " + str(exc)]}
+
+
+def supplemental_scan(raw, deep=False, capability_status=None):
+    """Helpers travel with this wrapper; never import scanner code from the target PATH."""
+    states = []
+    for filename, entry, args in (
+            ('lse_extras.py', 'scan', (raw, capability_status)),
+            ('kernel_risks.py', 'inspect_kernel', (deep,)),
+            ('lse_host_risks.py', 'scan', (deep,)),
+            ('package_risks.py', 'scan', (deep,))):
+        try:
+            helper = runpy.run_path(str(Path(__file__).with_name(filename)))[entry]
+            states.append(helper(*args))
+        except (OSError, ValueError, KeyError, RuntimeError) as exc:
+            states.append({'findings': [], 'raw': '', 'errors': [filename + ': ' + str(exc)]})
+    return states
+
+
+def scan(script, deep=False):
+    result = scan_lse(script, deep)
+    incomplete = set(result.get('incomplete_ids', []))
+    capability_status = result.pop('_capability_status', None)
+    for extra in supplemental_scan(result['raw'], deep, capability_status):
+        result['findings'].extend(extra['findings'])
+        result['errors'].extend(extra.get('errors', []))
+        incomplete.update(extra.get('incomplete_ids', []))
+        if extra.get('raw'):
+            result['raw'] += '\n--- passive supplemental checks ---\n' + extra['raw']
+    result['findings'].sort(key=lambda finding: finding['id'])
+    result['errors'] = sorted(set(result['errors']))
+    if incomplete:
+        result['incomplete_ids'] = sorted(incomplete)
+    return result
 
 
 def main():

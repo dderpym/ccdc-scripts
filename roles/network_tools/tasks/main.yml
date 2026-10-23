@@ -1,0 +1,69 @@
+---
+# Install CLI tools only. Never start a firewall manager or switch alternatives.
+- name: Gather distribution and package manager facts for networking tools
+  ansible.builtin.setup:
+    gather_subset: ['!all', '!min', distribution, pkg_mgr]
+
+- name: Detect missing networking tool packages
+  ansible.builtin.shell: |
+    for tool in ip ss; do
+      command -v "$tool" >/dev/null 2>&1 || { echo {{ 'iproute' if ansible_facts.os_family == 'RedHat' else 'iproute2' }}; break; }
+    done
+    command -v nft >/dev/null 2>&1 || echo nftables
+    for tool in iptables ip6tables iptables-save ip6tables-save iptables-restore ip6tables-restore; do
+      command -v "$tool" >/dev/null 2>&1 || {
+        echo {{ 'iptables-nft' if ansible_facts.os_family == 'RedHat' and ansible_facts.distribution_major_version | int >= 8 else 'iptables' }}
+        {% if ansible_facts.distribution == 'Alpine' and ansible_facts.distribution_version is version('3.19', '<') %}
+        echo ip6tables
+        {% endif %}
+        break
+      }
+    done
+    true
+  register: network_tools_missing
+  changed_when: false
+  check_mode: false
+
+- name: Install missing Debian networking tools without starting package services
+  ansible.builtin.apt:
+    name: "{{ network_tools_missing.stdout_lines | unique | list }}"
+    state: present
+    update_cache: true
+    policy_rc_d: 101
+  when:
+    - network_tools_missing.stdout_lines | length > 0
+    - ansible_facts.pkg_mgr == 'apt'
+
+# apk/xbps modules are not in ansible-core; use the native CLI rather than
+# requiring community.general just to install a few missing packages.
+- name: Install missing Alpine networking tools
+  ansible.builtin.command:
+    argv: "{{ ['apk', 'add', '--no-cache'] + (network_tools_missing.stdout_lines | unique | list) }}"
+  when:
+    - network_tools_missing.stdout_lines | length > 0
+    - ansible_facts.pkg_mgr == 'apk'
+    - not ansible_check_mode
+
+- name: Install missing Void networking tools
+  ansible.builtin.command:
+    argv: "{{ ['xbps-install', '-Sy'] + (network_tools_missing.stdout_lines | unique | list) }}"
+  when:
+    - network_tools_missing.stdout_lines | length > 0
+    - ansible_facts.pkg_mgr == 'xbps'
+    - not ansible_check_mode
+
+- name: Install missing networking tools with the native package manager
+  ansible.builtin.package:
+    name: "{{ network_tools_missing.stdout_lines | unique | list }}"
+    state: present
+  when:
+    - network_tools_missing.stdout_lines | length > 0
+    - ansible_facts.pkg_mgr not in ['apt', 'apk', 'xbps']
+
+- name: Verify all dual-stack firewall and listener tools are available
+  ansible.builtin.shell: |
+    for tool in ip ss nft iptables ip6tables iptables-save ip6tables-save iptables-restore ip6tables-restore; do
+      command -v "$tool" >/dev/null 2>&1 || { echo "Missing networking tool: $tool" >&2; exit 1; }
+    done
+  changed_when: false
+  when: not ansible_check_mode

@@ -1,0 +1,58 @@
+---
+# Explicit trust reset before init, not a host-key-checking bypass.
+- name: Replace selected endpoints' controller host keys
+  hosts: all
+  gather_facts: false
+  serial: 1  # Controller known_hosts edits must not race.
+  become: false
+  vars:
+    host_key_address: "{{ ansible_host | default(inventory_hostname) }}"
+    host_key_port: "{{ ansible_port | default(22) | int }}"
+    host_key_name: "{{ host_key_address if host_key_port | int == 22 else '[' ~ host_key_address ~ ']:' ~ (host_key_port | string) }}"
+    host_key_file: "{{ ccdc_known_hosts_file | default(lookup('ansible.builtin.env', 'HOME') ~ '/.ssh/known_hosts') }}"
+    host_key_lines: "{{ host_key_scan.stdout_lines | reject('match', '^#') | reject('equalto', '') | list }}"
+  tasks:
+    - name: Require the explicit init trust override
+      ansible.builtin.assert:
+        that:
+          - replace_host_keys | default(false) | bool
+          - host_key_port | int >= 1
+          - host_key_port | int <= 65535
+        fail_msg: Use ccdcctl init --replace-host-keys only when you intend to trust the currently presented keys.
+
+    - name: Enroll keys on the controller before any password authentication
+      delegate_to: localhost
+      become: false
+      block:
+        - name: Read current host keys without sending credentials
+          ansible.builtin.command:
+            argv: [ssh-keyscan, '-T', '5', '-p', '{{ host_key_port }}', '--', '{{ host_key_address }}']
+          register: host_key_scan
+          changed_when: false
+          failed_when: host_key_scan.rc != 0 or host_key_lines | length == 0
+
+        - name: Ensure the controller SSH directory is private
+          ansible.builtin.file:
+            path: "{{ host_key_file | dirname }}"
+            state: directory
+            mode: '0700'
+
+        - name: Remove all previous key types for only this endpoint
+          ansible.builtin.known_hosts:
+            path: "{{ host_key_file }}"
+            name: "{{ host_key_name }}"
+            state: absent
+
+        - name: Store currently presented keys for strict subsequent connections
+          ansible.builtin.known_hosts:
+            path: "{{ host_key_file }}"
+            name: "{{ host_key_name }}"
+            key: "{{ item }}"
+            state: present
+            hash_host: true
+          loop: "{{ host_key_lines }}"
+
+        - name: Keep the controller host-key file private
+          ansible.builtin.file:
+            path: "{{ host_key_file }}"
+            mode: '0600'

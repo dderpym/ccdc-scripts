@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Source this file to activate the controller environment and all Bash completions.
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    printf 'Use: source %q (setup must update your current Bash shell)\n' "$0" >&2
+    exit 1
+fi
+
+_ccdc_setup_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd) || return 1
+if [[ ! -f $_ccdc_setup_root/.venv/bin/activate ]]; then
+    printf 'Missing .venv; run uv sync in %s, then source setup again.\n' "$_ccdc_setup_root" >&2
+    unset _ccdc_setup_root
+    return 1
+fi
+source "$_ccdc_setup_root/.venv/bin/activate" || { unset _ccdc_setup_root; return 1; }
+source "$_ccdc_setup_root/scripts/ccdcctl-completion.bash" || { unset _ccdc_setup_root; return 1; }
+unset _ccdc_setup_root

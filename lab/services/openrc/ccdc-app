@@ -1,0 +1,6 @@
+#!/sbin/openrc-run
+description="CCDC scoring HTTP fixture"
+command="/usr/bin/python3"
+command_args="-m http.server 9000 --bind 0.0.0.0 --directory /var/lib/ccdc-lab/www"
+command_background=true
+pidfile="/run/$RC_SVCNAME.pid"

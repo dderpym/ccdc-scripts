@@ -12,11 +12,11 @@ import sys
 import signal
 import time
 
-ROOT = Path(__file__).resolve().parents[1]
-SECRETS = ROOT / 'secrets/lab'
-INVENTORY = ROOT / 'lab/inventory.yml'
+LAB = Path(__file__).resolve().parent
+SECRETS = LAB / 'secrets'
+INVENTORY = LAB / 'inventory.yml'
 HOSTS = ('hatchery', 'tarpit')
-COMPOSE = ['docker', 'compose', '-f', str(ROOT / 'lab/compose.yml')]
+COMPOSE = ['docker', 'compose', '-f', str(LAB / 'compose.yml')]
 MANAGE = Path(__file__).resolve()
 PID = SECRETS / 'relay.pid'
 READY = SECRETS / 'relay.ready'
@@ -25,7 +25,7 @@ RELAY = SECRETS / 'relay.json'
 
 def run(args, **kwargs):
     env = dict(os.environ, CCDC_LAB_UID=str(os.getuid()))
-    return subprocess.run(args, cwd=ROOT, text=True, check=True, env=env, **kwargs)
+    return subprocess.run(args, cwd=LAB, text=True, check=True, env=env, **kwargs)
 
 
 def local_docker():
@@ -145,6 +145,11 @@ def up(password):
         container = 'ccdc-lab-' + name
         info = json.loads(run(['docker', 'inspect', container], capture_output=True).stdout)[0]
         labels = info['Config']['Labels']
+        domain = 'dl-cdn.alpinelinux.org' if name == 'hatchery' else 'deb.debian.org'
+        peer = 'tarpit' if name == 'hatchery' else 'hatchery'
+        run(['docker', 'exec', container, 'python3', '-c',
+             'import socket, sys; [socket.getaddrinfo(name, 443, type=socket.SOCK_STREAM) for name in sys.argv[1:]]',
+             domain, peer], timeout=15)
         for service in ('ssh', 'http', 'app'):
             port = int(labels['ccdc.lab.' + service + '_port'])
             path = SECRETS / 'sockets' / name / service
@@ -171,21 +176,21 @@ def up(password):
     logfile = SECRETS / 'relay.log'
     logfile.touch(mode=0o600)
     with logfile.open('w') as log:
-        process = subprocess.Popen([sys.executable, str(MANAGE), '_forward'], cwd=ROOT,
+        process = subprocess.Popen([sys.executable, str(MANAGE), '_forward'], cwd=LAB,
                                    stdout=log, stderr=log, start_new_session=True)
     PID.write_text(str(process.pid))
     for _ in range(100):
         if READY.exists() and READY.read_text() == str(process.pid):
             break
         if process.poll() is not None:
-            raise RuntimeError('Loopback relay failed; inspect secrets/lab/relay.log')
+            raise RuntimeError(f'Loopback relay failed; inspect {logfile}')
         time.sleep(.1)
     else:
         stop_relay()
         raise RuntimeError('Loopback relay did not become ready')
     # Same YAML layout as inventory.yml, with validated lab transport endpoints.
     write_inventory(hosts)
-    print('Lab ready. Activate .venv and export ANSIBLE_INVENTORY=lab/inventory.yml')
+    print(f'Lab ready. Target it with ANSIBLE_INVENTORY={INVENTORY}')
     print('HTTP: http://127.0.0.1:8080 / :8081; fixture apps: :9070 / :9170')
 
 
@@ -195,14 +200,18 @@ def write_inventory(hosts):
                          yaml.safe_dump({'all': {'hosts': hosts}}, sort_keys=False))
 
 
-def main():
+def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
     cmd = sub.add_parser('up')
     cmd.add_argument('--password-file', type=Path, help='private one-line root password file; otherwise prompt')
     sub.add_parser('down')
     sub.add_parser('_forward', help=argparse.SUPPRESS)
-    args = parser.parse_args()
+    return parser
+
+
+def main():
+    args = argument_parser().parse_args()
     if args.action == '_forward':
         asyncio.run(serve())
         return
@@ -214,12 +223,12 @@ def main():
         stop_relay()
         run([*COMPOSE, 'down', '--remove-orphans'])
         INVENTORY.unlink(missing_ok=True)
-        print('Removed only ccdc-lab containers/network; test key retained in secrets/lab')
+        print(f'Removed only ccdc-lab containers/network; test key retained in {SECRETS}')
 
 
 if __name__ == '__main__':
     try:
         main()
-    except (OSError, RuntimeError, ValueError, subprocess.CalledProcessError) as exc:
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
         print('Lab setup failed: ' + str(exc), file=sys.stderr)
         sys.exit(1)

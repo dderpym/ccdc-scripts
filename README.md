@@ -20,7 +20,7 @@ Then, from this repository:
 ```sh
 cd /path/to/berke1337-ccdc       # replace with your actual checkout path
 uv sync
-. .venv/bin/activate
+source ./setup                  # Bash: activate .venv and all CLI completions
 ```
 
 `uv sync` creates `.venv` and installs the versions recorded in `uv.lock`.
@@ -32,10 +32,13 @@ not `.venv`.
 Targets need SSH and initial privileged access. The locked Ansible version needs
 **target Python 3.9+** after bootstrap. Init installs Python 3 and sudo only if
 missing, using the native package manager; it does not upgrade an existing old
-Python. Check legacy hosts before competition. Firewall enforcement also needs
-`nft` or both IPv4/IPv6 iptables save/restore tools; missing firewall tools are
-reported, not installed. Some older Ansible password transports need controller
-`sshpass`.
+Python. Check legacy hosts before competition. Firewall configure provisions
+missing networking tools (`ip`, `ss`, `nft`, and dual-stack iptables save/restore
+tools) through Ansible before discovery (native package modules, or the apk/xbps
+CLI with ansible-core). Direct firewall apply also prepares them before snapshots;
+init only bootstraps access and does not install firewall tools.
+Package installation requires working repositories; status/monitor commands stay
+read-only. Some older Ansible password transports need controller `sshpass`.
 
 ### 2. Set up the inventory and team key
 
@@ -97,6 +100,20 @@ chmod 600 ~/.ssh/known_hosts
 Repeat for every inventory address and its actual SSH port. Use the host's
 supported key type if it lacks Ed25519. **A scan alone is not verification.**
 Host-key checking stays enabled; do not work around failures by disabling it.
+
+When a new CCDC environment reuses old IP addresses, explicitly reset trust
+**only during init**:
+
+```sh
+./scripts/ccdcctl init all --replace-host-keys --save-bootstrap-password
+```
+
+This replaces the selected endpoints' saved keys with keys obtained using
+`ssh-keyscan`, before any password authentication. **It trusts the current
+network peer without independent fingerprint verification**; use it only when
+you intend that trust reset. Failed scans leave existing keys untouched. Strict
+checking remains enabled during init and all later commands; the flag is not
+available on other commands.
 
 ### 3. Start tmux and bootstrap with the default root password
 
@@ -314,13 +331,32 @@ Run commands from the repository with the uv environment active:
 
 ```sh
 uv sync
-. .venv/bin/activate
+source ./setup                  # Bash: activate .venv and all CLI completions
 ./scripts/ccdcctl ssh status
 ```
 
 Alternatively, `uv run ./scripts/ccdcctl ssh status` supplies the environment
 without shell activation; it also makes Ansible available to child processes.
 The same works for wrappers: `uv run ./monitor/ssh-monitor --interval 30`.
+
+`source ./setup` activates `.venv` and enables all Bash completions. Source it
+rather than executing `./setup`, so it updates your current shell. Run `uv sync`
+first if `.venv` is missing. For completion only, without activating `.venv`:
+
+```sh
+source scripts/ccdcctl-completion.bash
+```
+
+Bash's `complete -C` runs `ccdcctl complete` and reads one candidate per line;
+`-C` is an option to Bash's `complete` builtin, not a flag to `ccdcctl`.
+It completes commands, actions, flags (including init-only `--replace-host-keys`),
+password-file paths, and hosts from the selected `ANSIBLE_INVENTORY`.
+The sourced setup also completes `lab/manage` (`up`, `down`, `--password-file`),
+`scripts/check-lab` (`--inventory`, `--password-file`), and both monitor wrappers
+(flags and `--host` values). Lab completion never starts Docker or runs checks.
+Host completion requires Ansible on `PATH` (activate `.venv` first); it never connects
+to hosts. To enable it in future shells, add a `source` line using the script's
+absolute path to `~/.bashrc`.
 
 `all` is the default for commands accepting a target. An exact **inventory alias**
 can be used instead, such as `hatchery`; IP addresses, arbitrary Ansible patterns,
@@ -357,6 +393,29 @@ is effectively root access. Unique root passwords prevent shared-password reuse;
 they do not evict existing root sessions, remove attacker keys/persistence, or
 prevent keylogging on an already-compromised host.
 
+### Output and progress
+
+SSH/firewall status and configure show readable settings instead of raw rulesets,
+config hashes, and JSON. Unknown firewall reachability stays **unknown**; literal
+ACCEPT candidates are not proof that a port is open. SSH summaries retain Match
+scope, active socket bindings, and discovery caveats.
+
+Ansible applies and ping use a compact task display: one updating line in a
+terminal, one summary per task when redirected, followed by host results.
+Failures remain visible, including ignored failures; secret `no_log` results stay
+hidden. Task counts are not a percentage of the entire playbook.
+
+```sh
+./scripts/ccdcctl ssh status hatchery --json       # full discovery for tooling
+./scripts/ccdcctl firewall status all --json
+./scripts/ccdcctl ssh configure all --verbose     # full Ansible logs + discovery
+```
+
+`--json` is status-only and always emits `{"hosts": {...}, "errors": {...}}`, even
+for one host. Partial failures retain successful hosts and return a nonzero exit
+code. `--verbose` works before the command or after its arguments. No extra UI
+dependency is required; configuration confirmations and safety checks are unchanged.
+
 ### `init [host|all]`: access bootstrap and root rotation
 
 ```sh
@@ -371,9 +430,19 @@ prevent keylogging on an already-compromised host.
   file owned by you with no group/other permissions (use mode 0600). Plaintext and
   Ansible Vault-encrypted single-password files are supported; this is **not** a
   YAML `ansible_password:` variables file.
+- Either explicit bootstrap-password option starts with root using that shared
+  credential, bypassing the initial `oski` check and saved per-host recovery
+  passwords. Use this after resetting/recreating hosts; recovery files are retained.
+- `--replace-host-keys` explicitly replaces all saved key types for the selected
+  inventory addresses/ports, retaining unrelated entries. Default trust store:
+  `~/.ssh/known_hosts`. An inventory can set `ccdc_known_hosts_file` when its SSH
+  options use another file (the lab does this). The override does not disable
+  verification; it deliberately establishes new trust without verifying the
+  presented fingerprints. Ordinary `init` never replaces keys automatically.
 - If the default file exists, plain `init` uses it automatically. On saved-host
   reruns it first tries `oski`; if root fallback is necessary, the host's saved
-  recovery password replaces the automatic shared-password attempt.
+  recovery password replaces the automatic shared-password attempt. Init prints
+  the selected credential file path, never its contents.
 - Only one password is attempted automatically per host. An authentication
   rejection offers one hidden manual retry; empty input skips the host. There is
   no retry for timeouts, host-key errors, or mutation/task failures. Noninteractive
@@ -470,13 +539,18 @@ and public-key authentication to `yes`. Password and keyboard-interactive auth
 are changed together. Choices allow per-host enable/disable/skip and reuse on
 remaining hosts, still with overrides and confirmation.
 
-An owned marked block at the **top** of `/etc/ssh/sshd_config` takes precedence
-over original global settings, including on older OpenSSH without server Include
-support. The legacy ChallengeResponseAuthentication setting is aligned. Other
-files and the original configuration below the block are preserved. Candidates
-are checked with `sshd -t`, then `sshd -T` globally and in admin/root contexts;
-validation/reload failures restore the prior configuration. Conflicting Match
-policies require explicit repair, not silent mass editing.
+An owned marked block at the **top** of `/etc/ssh/sshd_config` is the only source
+of truth for these authentication settings, including on older OpenSSH without
+server Include support. Reapplying removes those directives (case-insensitively,
+including quoted keywords and the legacy ChallengeResponseAuthentication alias)
+from the rest of the main file and every parsed Include, including Match blocks. Unrelated settings
+and Include statements are preserved. The entire proposed config graph is staged
+and checked with `sshd -t`, then `sshd -T` globally and in admin/root contexts
+before installation. Validation/reload failures restore changed files. Conditional
+Includes and backslash-escaped Include glob patterns require manual repair;
+unsafe files requiring edits are refused.
+Unchanged symlinked Includes (such as distro crypto policies) remain supported;
+a symlink requiring managed-setting edits is refused rather than replaced.
 
 Reload handles systemd `ssh`/`sshd`, stock Alpine OpenRC defaults, and Void runit,
 without routine restarts. Custom startup config/port/auth overrides are refused.
@@ -484,9 +558,21 @@ Socket-activated SSH supports these authentication-only changes; socket bindings
 are not edited. Fresh key-only `oski`/sudo checks run before and after changes,
 and the effective state is rediscovered. Keep console access available.
 
-**Baseline** saves the currently observed SSH state to
-`baselines/<host>/ssh.json`. It does not configure or validate your security
-judgment: accepting a malicious state would make it the expected state.
+**Baseline** saves effective SSH settings, their connection context, normalized
+Match rules with per-Include scope boundaries, and active socket bindings to
+`baselines/<host>/ssh.json`. Source and drop-in hashes, daemon paths, and diagnostic
+caveats remain available in status
+but are not trusted monitoring state. Comments/whitespace changes do not cause
+hash drift; conditional rule changes still alert even when global `sshd -T`
+values stay the same. Older full-discovery baselines are compared using the same
+settings-only projection; preexisting Match rules absent from an old baseline
+require review. Older flattened Include/Match baselines also require review when
+the new scoped representation differs. Baselines never auto-update on configure
+or monitoring. Accepting a malicious policy explicitly would still make it the
+expected policy.
+
+`sshd -T` evaluates the configuration on disk, not the running daemon's in-memory
+configuration; monitoring does not prove that edits have been reloaded.
 
 ### `listeners [host|all]`: service inventory
 
@@ -526,7 +612,10 @@ conditions, and normalized rules. For arbitrary existing rules, `null` means
 hooks can defeat an ACCEPT. Exact dual-stack summaries are verified for our owned
 policy.
 
-**Configure** gathers listeners and existing firewall state, then collects and
+**Configure** first uses Ansible to install missing networking CLI tools, without
+starting firewall managers or switching existing iptables alternatives. This
+preparation may install packages even if you later abort policy review. It then
+gathers listeners and existing firewall state, and collects and
 reviews **all selected host decisions before applying any**. TCP/22, loopback,
 established/related flows, and essential IPv6 router/neighbor discovery (ICMPv6
 133–136) are allowed. Other unsolicited inbound traffic is blocked unless you
@@ -545,7 +634,9 @@ It refuses active managers, mixed/ambiguous backends, and unsafe configurations:
 
 - **nftables replaces the entire ruleset atomically**; unsafe NAT/forward/output
   hooks are refused rather than discarded silently.
-- **iptables inserts an owned first INPUT jump**, preserving unrelated policy.
+- **iptables inserts an owned first INPUT jump**, preserving unrelated policy,
+  including Docker's DNS OUTPUT/POSTROUTING NAT when its rules are fully accounted
+  for by the iptables compatibility tools.
 - Prior source restrictions do not carry over: approved ports are open to **all
   sources**, for both IPv4 and IPv6.
 
@@ -562,6 +653,87 @@ timer-based automatic rollback daemon.
 **Baseline** accepts current discovery into `baselines/<host>/firewall.json`.
 It neither changes rules nor provides rollback. Enforcement is **runtime-only**,
 not a distro-specific boot firewall manager: reapply after reboot.
+
+### `update plan|apply [host|all] [--yes]`: interactive update review
+
+No package lists, service mappings, or probes need to be configured in inventory.
+The workflow discovers updates on **Debian/systemd** and **Alpine/OpenRC** hosts:
+
+```sh
+./scripts/ccdcctl update plan all    # interactive walkthrough, one host at a time
+./scripts/ccdcctl update apply all   # install the saved selection, then offer restarts
+```
+
+**Plan** refreshes authenticated native repository indexes (like `apt update`),
+shows running services, and separates available updates into:
+
+- **Lower-risk candidates**: ordinary package/library updates. Include this group
+  together or review each package individually and hold anything scoring-critical.
+- **Manual updates**: kernel, init, core runtime/transport, package-manager,
+  database-engine, and container-runtime changes. Their risks are explained and
+  they remain held; this command does not attempt migrations or major recovery work.
+
+“Lower-risk” is a conservative classification, **not a compatibility guarantee**.
+The native resolver checks the selected combination; it cannot silently upgrade
+held packages, add dependencies, remove packages, or downgrade them. Exact-version
+arguments are temporary: successful updates preserve existing APK world constraints
+and APT automatic/manual package selections. If a selected update needs a held
+change, revise the selection or skip the host. The final
+exact old/new-version preview must be explicitly saved (default: skip). Plan
+never installs packages or restarts services, but index refresh writes metadata.
+It requires a terminal; unsuccessful/rejected re-planning invalidates old approval.
+
+**Apply** confirms the saved package transactions (default: abort), backs up
+configuration and installed versions, and installs exactly the reviewed selection,
+one host at a time. A stale/expired plan, failed update, lost fresh oski/sudo access,
+or a previously running service left stopped halts the rollout.
+Plans expire after 24 hours, are consumed before installation, and must be redone
+if installed packages, repository settings/candidates, or connection settings
+change. Old configuration-based plans are incompatible: run `update plan` again.
+Updates verify fresh SSH/sudo access before and after installation/restarts. They
+neither require nor read/write SSH/firewall baselines; policy drift belongs to the
+independent monitors. Existing schema-2 package plans remain usable even if they
+contain an obsolete policy snapshot.
+
+After installation, processes using replaced executable/library mappings are
+mapped to managed services where possible. Each affected service has a separate
+prompt: **restart / defer / stop rollout**, default **defer**. Unknown ownership,
+unmanaged processes, incomplete discovery, and PID 1 are reported for manual
+review, not guessed or killed. Already-stale processes are identified separately;
+not every restart recommendation was caused by this update. SSH/nginx configs
+are validated before an explicitly approved restart; arbitrary application
+configuration and scoring health are **not automatically verified**. Check them
+manually. Service-manager status and fresh admin access are only basic checks.
+Containers or restricted `/proc` access can reduce inspection coverage; incomplete
+inspection is reported and blocks our explicit restart operation. Existing SSH
+sessions or draining workers may retain old mappings after a daemon restart;
+these are reported rather than silently terminated or declared fully patched.
+
+```sh
+# Bypass only the package-install confirmation for an already reviewed plan:
+./scripts/ccdcctl update apply web01 --yes
+```
+
+`--yes` **never approves service restarts**. In a noninteractive apply, restart
+candidates are reported and deferred; the report records pending work. There is
+no reboot or automatic rollback. **Native package hooks may restart services
+before our prompts**, despite deferring our own restarts; choose a maintenance
+window. Reloading configuration alone usually does not activate a patched binary.
+
+Alpine support is limited to apk-tools 2.14.x and untagged HTTPS repositories.
+Other distro/init/parser combinations and transactions requiring new packages
+are refused rather than guessed. Third-party/unowned applications require a
+separate reviewed update procedure.
+
+Recovery files are private under `/var/backups/ccdc-updates/<run-id>/` before
+installation; successful apply copies the configuration archive to
+`reports/<host>/updates/backups/<run-id>/configs.tar.gz`. On transaction/transfer
+failure, inspect the remote recovery directory. Archives may contain credentials;
+protect both disks. They are **not full system snapshots** and cannot guarantee
+package/database rollback. `reports/<host>/updates/result.json` records updates,
+restart decisions and outstanding work; `runs/` retains run history and
+`remote-failure.json` retains private native diagnostics. A compromised root
+account or package database can falsify checks; updating is not malware removal.
 
 ### `integrity [status] [host|all] [--deep]`
 
@@ -621,27 +793,54 @@ Provides a high-signal security and privilege/persistence triage pass using the
 pinned, vendored Linux Smart Enumeration script: version **4.14nw**, commit
 `fcad39438dc10ac8a8e9c2e2800bf3864c6ab826`, GPL-3.0. See
 [`vendor/LSE-PROVENANCE.md`](vendor/LSE-PROVENANCE.md) for upstream and license.
-The scanner never downloads executable code.
-The default run uses only LSE's highest-priority (level-0) findings, no color,
-noninteractive operation, and no process-watching delay. Only affirmative
+The scanner never downloads executable code. Passive Python supplements add
+selected LinPEAS coverage gaps without running LinPEAS: file/process capabilities,
+SGID and sudo/doas risks, runtime sockets, loader hooks, effective root-service
+and process paths, cross-account credential metadata, and kernel/package CVEs. The comparison and remaining gaps are in
+[`vendor/LINPEAS-GAPS.md`](vendor/LINPEAS-GAPS.md). These are review candidates,
+not proof of exploitability; no added check executes exploits, loads modules,
+connects to runtime/agent APIs, dumps credentials, or runs discovered application
+binaries. Native delegation checks only list/match policy; read-only `systemctl`
+and package queries inspect metadata.
+
+The default LSE run selects 30 security checks: curated level-0 tests plus additional
+UID-zero accounts (`sys040`) and writable cron paths (`ret050`). Four supporting
+checks also run. Operation is noninteractive, without color or process-watching delay. Only affirmative
 security tests are summarized; informational enumeration stays out of the live
 terminal. Stable test IDs and normalized context identify findings where possible.
 LSE runs as the configured login account (normally `oski`), **without become**:
 root readability/writability is not evidence of an unprivileged escalation.
-The team's intentionally passwordless sudo is still reported for review, not
-silently accepted. Only selected level-0 tests and required dependencies execute
-normally; manual deep mode also selects actionable level-1 tests. Process-watcher
+The team's intentionally passwordless sudo remains in raw evidence but does not
+produce a `sud000` alert when the effective scanning account is `oski`. Other
+accounts still receive the critical finding; no saved baseline is involved.
+Only allowlisted tests and dependencies execute; manual deep mode expands the
+selection to service ownership checks and MongoDB connection checks; supplements
+also add other-account agent sockets and explicitly uncertain CVE heuristics. Process-watcher
 tests are excluded because this pinned version would wait with `-p 0`.
 Missing optional utilities and BusyBox `find` lacking `-writable` generate explicit
 coverage warnings; other tests still run. Install compatible tools separately if
 full coverage is needed. Coverage warnings do not resolve previously detected
 conditions for affected tests, but do not block unrelated resolutions.
 
-`--deep` runs level 1 for a more thorough manual investigation, not the normal
+Both modes request upstream output level 1 so the promoted checks include their
+evidence. `--deep` selects more checks for manual investigation, not the normal
 monitor loop. Complete human-readable output replaces `reports/<host>/lse.txt`
 and `reports/<host>/lse/raw.txt`; parsed records replace
 `reports/<host>/lse/report.json`. Reports can contain sensitive data and are
 private/gitignored. LSE is triage, not a proof that the host is secure.
+
+Kernel triage covers **Copy Fail (CVE-2026-31431)** using upstream and selected
+running Ubuntu-generic/Debian build evidence, plus upstream-only **Dirty Pipe
+(CVE-2022-0847)**, **nftables (CVE-2026-23111)**, **net/sched
+(CVE-2026-53264)** and **ESP (CVE-2026-43284)** rules. It is a static reviewed subset, not a general
+CVE feed. It uses running-kernel metadata, not installed update packages or a
+container's distro identity. Unknown vendor backports/prerequisites produce
+scoped coverage warnings; `--deep` additionally shows explicitly unverified
+upstream-version candidates. A patch installation is not evidence the running
+kernel changed. Custom patches, module autoload policy and livepatch aren't
+verified. Package triage covers needrestart, PackageKit, PwnKit and sudo using
+reviewed Debian/Ubuntu package boundaries; installed fixes do not prove active
+daemons restarted. See the comparison document for exact supported builds and limits.
 
 Findings are **not baselined or accepted as normal** merely because they were
 present when the competition started. There is no LSE baseline command.
@@ -728,9 +927,10 @@ and target Python compatible with the locked Ansible release. Do not assume
 systemd. Test representative distro/init VMs before competition; offline checks
 do not establish compatibility with every legacy release.
 
-There are no automatic package upgrades/repairs, kernel/application/database
-hardening, CVE scanning, dashboards, SIEM, antivirus, or generic malware scans.
-LSE provides bounded security/persistence triage, not automatic remediation.
+Package updates are available only through the opt-in reviewed `update plan/apply`
+workflow. There are no unattended blanket upgrades/repairs, kernel/application/database
+hardening, comprehensive CVE scanning, dashboards, SIEM, antivirus, or generic malware scans.
+LSE provides bounded security/persistence and selected kernel-CVE triage, not automatic remediation.
 Delegate repairs using scanner evidence and the listener inventory. Init's missing Python/sudo prerequisites are its only package
 installations; firewall forwarding/NAT and unrelated policy are not targets.
 

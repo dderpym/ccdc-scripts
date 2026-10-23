@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Opt-in live smoke suite through ccdcctl and its public reports. Lab only."""
+import argparse
 import importlib.machinery
 import importlib.util
 import json
@@ -10,9 +11,7 @@ import sys
 import urllib.request
 
 ROOT = Path(__file__).resolve().parents[1]
-INVENTORY = ROOT / 'lab/inventory.yml'
 # Never inherit transport overrides that could accidentally select real hosts.
-os.environ['ANSIBLE_INVENTORY'] = str(INVENTORY)
 os.environ['ANSIBLE_ARGS'] = ''
 loader = importlib.machinery.SourceFileLoader('ccdcctl_lab', str(ROOT / 'scripts/ccdcctl'))
 spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -20,7 +19,18 @@ ctl = importlib.util.module_from_spec(spec)
 loader.exec_module(ctl)
 
 
+def argument_parser():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--inventory', type=Path, default=ROOT / 'lab/inventory.yml',
+                        help='lab connection inventory, including a lab outside this repository')
+    parser.add_argument('--password-file', type=Path, help='optional disposable root password file')
+    return parser
+
+
 def main():
+    args = argument_parser().parse_args()
+    inventory = args.inventory.expanduser().resolve()
+    os.environ['ANSIBLE_INVENTORY'] = str(inventory)
     checks = []
     hosts, variables = ctl.select()
     if hosts != ['hatchery', 'tarpit'] or any(variables[h]['ansible_host'] != '127.0.0.1' for h in hosts):
@@ -39,7 +49,7 @@ def main():
             raise RuntimeError('ccdcctl ' + ' '.join(args) + ': ' + result.stderr + result.stdout)
         return result.stdout
 
-    secret = ROOT / 'secrets/lab/root.password'
+    secret = args.password_file or inventory.parent / 'secrets/root.password'
     if secret.exists():
         password = ctl.read_secret(secret)
         for host in hosts:
@@ -51,6 +61,26 @@ def main():
     # Service metadata belongs to the fixture, not the SSH inventory.
     containers = dict(zip(hosts, json.loads(subprocess.check_output(
         ['docker', 'inspect', *('ccdc-lab-' + host for host in hosts)], text=True))))
+    service_checks = {
+        'hatchery': 'test "$(readlink /proc/1/exe)" = /bin/busybox; '
+                    'for name in sshd nginx crond syslog ccdc-app ccdc-relay-ssh ccdc-relay-http ccdc-relay-app; '
+                    'do rc-service "$name" status; done',
+        'tarpit': 'test "$(cat /proc/1/comm)" = systemd; '
+                  'for name in ssh nginx cron rsyslog dbus systemd-journald ccdc-app '
+                  'ccdc-relay@ssh ccdc-relay@http ccdc-relay@app; '
+                  'do systemctl is-active "$name"; done',
+    }
+    for host in hosts:
+        subprocess.run(['docker', 'exec', 'ccdc-lab-' + host, 'sh', '-ec', service_checks[host]],
+                       capture_output=True, text=True, timeout=30, check=True)
+    passed('native PID 1 and managed SSH, nginx, cron, logging, app and relay services')
+
+    for host, domain in (('hatchery', 'dl-cdn.alpinelinux.org'), ('tarpit', 'deb.debian.org')):
+        subprocess.run(['docker', 'exec', 'ccdc-lab-' + host, 'python3', '-c',
+                        'import socket, sys; assert socket.getaddrinfo(sys.argv[1], 443, type=socket.SOCK_STREAM)',
+                        domain], capture_output=True, text=True, timeout=15, check=True)
+    passed('external DNS resolution for both distribution package repositories')
+
     for host in hosts:
         for service in ('http', 'app'):
             port = int(containers[host]['Config']['Labels']['ccdc.lab.' + service + '_port'])
@@ -86,9 +116,12 @@ def main():
         state = json.loads((ROOT / 'reports' / host / 'lse/report.json').read_text())
         if state.get('errors') or state.get('incomplete_ids'):
             raise RuntimeError(host + ': LSE coverage incomplete')
-        if not {'fst160', 'ret010', 'sud000'} <= {f['id'] for f in state['findings']}:
+        ids = {f['id'] for f in state['findings']}
+        if not {'fst160', 'ret010'} <= ids:
             raise RuntimeError(host + ': failed to detect known LSE conditions')
-    passed('LSE detects writable critical file, recurring task, and sudo access')
+        if 'sud000' in ids:
+            raise RuntimeError(host + ': expected oski sudo was reported as a vulnerability')
+    passed('LSE detects writable critical file and recurring task, without alerting on expected oski sudo')
 
     output = command('monitor', '--once', expected=1)
     for kind in ('SSH', 'FIREWALL', 'INTEGRITY', 'LSE'):

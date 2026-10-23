@@ -11,7 +11,6 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import shutil
 import subprocess
 import sys
@@ -50,6 +49,58 @@ def effective(output):
     return result
 
 
+def directive(line):
+    # Keep in sync with apply-ssh; strdelim allows Ma"tch", too.
+    match = re.match(r'^\s*(?:([^"\s=#]*)"([^"]*)"|([^"\s=#]+))[\s=]*(.*)$', line)
+    if not match:
+        return "", ""
+    return (match[3] or (match[1] + match[2])).lower(), match[4]
+
+
+def arguments(text):
+    """OpenSSH argv_split semantics, not shell escaping/comment semantics.
+
+    Keep in sync with apply-ssh: targets receive each script standalone.
+    """
+    result, index = [], 0
+    text = text.rstrip("\r\n")
+    while index < len(text):
+        if text[index] in " \t":
+            index += 1
+            continue
+        if text[index] == "#":
+            break
+        token, quote = [], None
+        while index < len(text):
+            char = text[index]
+            if char == "\\" and index + 1 < len(text) and (
+                    text[index + 1] in "\\\"'" or (quote is None and text[index + 1] == " ")):
+                index += 1
+                token.append(text[index])
+            elif quote is None and char in " \t":
+                break
+            elif quote is None and char in "\"'":
+                quote = char
+            elif char == quote:
+                quote = None
+            else:
+                token.append(char)
+            index += 1
+        if quote is not None:
+            raise ValueError("Unclosed quote in SSH directive")
+        result.append("".join(token))
+    return result
+
+
+def include_files(pattern):
+    # Python glob does not implement glob(3)'s backslash escapes. Fail closed.
+    if "\\" in pattern:
+        raise RuntimeError("Unsupported escaped SSH Include pattern: " + pattern)
+    if not os.path.isabs(pattern):
+        pattern = os.path.join("/etc/ssh", pattern)
+    return sorted(glob.glob(pattern))
+
+
 def sources(config):
     hashes, caveats, stack = {}, [], []
 
@@ -60,28 +111,33 @@ def sources(config):
         raw = Path(path).read_bytes()
         hashes[path] = hashlib.sha256(raw).hexdigest()
         stack.append(path)
+        match_rules = []
         for line in raw.decode("utf-8", errors="replace").splitlines():
-            match = re.match(r"^\s*([^\s=#]+)[\s=]+(.*)$", line)
-            if not match:
+            key, text = directive(line)
+            if not key:
                 continue
-            key, text = match.groups()
-            values = shlex.split(text, comments=True)
-            if key.lower() == "match":
+            values = arguments(text)
+            if key == "match":
                 conditional = True
                 caveats.append("Match in %s: %s" % (path, text))
-            if key.lower() == "include":
+            if conditional:
+                # Keep conditional semantics even when no connection context was supplied.
+                name = "kbdinteractiveauthentication" if key == "challengeresponseauthentication" else key
+                match_rules.append({"directive": name, "arguments": values})
+            if key == "include":
                 if conditional:
                     caveats.append("Conditional Include in " + path + "; sources are potential, not necessarily active")
                 for pattern in values:
-                    if not os.path.isabs(pattern):
-                        pattern = os.path.join("/etc/ssh", pattern)
-                    for included in sorted(glob.glob(pattern)):
-                        conditional = visit(included, conditional)
+                    for included in include_files(pattern):
+                        rules = visit(included, conditional)
+                        if rules:
+                            # sshd restores the caller's Match scope after each file.
+                            match_rules.append({"directive": "include", "rules": rules})
         stack.pop()
-        return conditional
+        return match_rules
 
-    visit(config)
-    return hashes, sorted(set(caveats))
+    match_rules = visit(config)
+    return hashes, sorted(set(caveats)), match_rules
 
 
 def socket_listeners():
@@ -103,7 +159,7 @@ def main():
                         help="sshd -C user=oski,host=...,addr=...,laddr=...,lport=...")
     args = parser.parse_args()
     sshd = daemon()
-    hashes, caveats = sources(args.config)
+    hashes, caveats, match_rules = sources(args.config)
     command = [sshd, "-T", "-f", args.config]
     if args.context:
         command += ["-C", args.context]
@@ -112,7 +168,8 @@ def main():
     dropins = {path: hashlib.sha256(Path(path).read_bytes()).hexdigest()
                for path in sorted(glob.glob('/etc/ssh/sshd_config.d/*')) if os.path.isfile(path)}
     print(json.dumps({"effective": effective(run(command)), "sources": hashes, "dropins": dropins,
-                      "context": args.context, "socket_listeners": socket_listeners(), "caveats": sorted(set(caveats)),
+                      "context": args.context, "socket_listeners": socket_listeners(),
+                      "match_rules": match_rules, "caveats": sorted(set(caveats)),
                       "sshd": sshd}, sort_keys=True))
 
 

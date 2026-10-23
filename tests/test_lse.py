@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 from test_controller import ROOT, load
 
 lse = load('discover-lse')
+SUPPLEMENTAL_SCAN = lse.supplemental_scan
 
 
 def block(test_id, summary, body, marker='!', status='yes!'):
@@ -33,6 +34,7 @@ FIXTURE = (
     + block('sys020', 'Passwd hashes', 'locked:!:1:1::/:/bin/sh\nempty::2000:2000::/:/bin/sh')
     + block('sys030', 'Readable shadow', '/etc/shadow\n---\nroot:$6$SECRET:20000:0:99999:7:::')
     + block('sys040', 'Other superusers', 'backdoor', '*')
+    + block('ret050', 'Writable cron paths', '/opt/jobs/config', '*')
     + block('sof020', 'PostgreSQL template0 as postgres', 'version')
     + block('sof020', 'PostgreSQL template1 as postgres', 'version')
     + block('sof020', 'PostgreSQL template0 as psql', 'version')
@@ -45,12 +47,87 @@ FIXTURE = (
 )
 
 
+def passive_fixtures(directory):
+    """Keep real wrapper/playbook transports, but never scan the development host."""
+    directory = Path(directory)
+    (directory / 'lse_extras.py').write_text(
+        "def scan(raw, capability_status=None):\n    return {'findings': [], 'raw': '', 'errors': []}\n")
+    (directory / 'kernel_risks.py').write_text(
+        "def inspect_kernel(deep=False):\n    return {'findings': [], 'raw': '', 'errors': []}\n")
+    for filename in ('lse_host_risks.py', 'package_risks.py'):
+        (directory / filename).write_text(
+            "def scan(deep=False):\n    return {'findings': [], 'raw': '', 'errors': []}\n")
+    wrapper = directory / 'discover-lse'
+    shutil.copyfile(ROOT / 'scripts/discover-lse', wrapper)
+    return wrapper
+
+
 class LSETests(unittest.TestCase):
+    def setUp(self):
+        patcher = patch.object(lse, 'supplemental_scan', return_value=[])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_supplemental_findings_raw_and_scoped_coverage_share_contract(self):
+        extra = {'findings': [{'id': 'extra-loader', 'severity': 'warning', 'summary': 'loader path writable'}],
+                 'raw': 'passive metadata', 'errors': [], 'incomplete_ids': ['kernel:CVE-2026-31431']}
+        failure = {'findings': [], 'raw': '', 'errors': ['kernel helper failed']}
+        with patch.object(lse, 'scan_lse', return_value=lse.parse(FIXTURE)), \
+                patch.object(lse, 'supplemental_scan', return_value=[extra, failure]) as supplements:
+            result = lse.scan('/fixture/lse.sh', deep=True)
+        supplements.assert_called_once_with(FIXTURE, True, None)
+        self.assertIn('extra-loader', {f['id'] for f in result['findings']})
+        self.assertIn('fst030', {f['id'] for f in result['findings']})
+        self.assertIn('passive metadata', result['raw'])
+        self.assertIn(FIXTURE, result['raw'])
+        self.assertEqual(result['incomplete_ids'], ['kernel:CVE-2026-31431'])
+        self.assertEqual(result['errors'], ['kernel helper failed'])
+
+    def test_every_supplemental_helper_is_local_and_failure_is_isolated(self):
+        calls = []
+        state = {'findings': [], 'raw': '', 'errors': []}
+
+        def helper(path):
+            name = Path(path).name
+            self.assertEqual(Path(path).parent, ROOT / 'scripts')
+            if name == 'kernel_risks.py':
+                raise ValueError('fixture failure')
+            def scan(*args):
+                calls.append((name, args))
+                return dict(state)
+            return {'scan': scan}
+
+        with patch.object(lse.runpy, 'run_path', side_effect=helper):
+            states = SUPPLEMENTAL_SCAN('fixture raw', True, 7)
+        self.assertEqual(len(states), 4)
+        self.assertEqual(calls, [('lse_extras.py', ('fixture raw', 7)),
+                                 ('lse_host_risks.py', (True,)), ('package_risks.py', (True,))])
+        self.assertEqual(states[1]['errors'], ['kernel_risks.py: fixture failure'])
+        self.assertEqual(states[2:], [state, state])
+
+    def test_native_capability_exit_receipt_does_not_repeat_enumeration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fake = Path(directory) / 'native-getcap'
+            calls = Path(directory) / 'calls'
+            fake.write_text('#!/bin/sh\nprintf "call\\n" >> ' + str(calls) + '\nexit 7\n')
+            fake.chmod(0o700)
+            script = Path(directory) / 'fixture-lse.sh'
+            script.write_text('#!/bin/sh\ngetcap -r /\nprintf "[!] sec010 Capabilities nope\\n"\n')
+            with patch.object(lse, 'coverage', return_value=[]), \
+                    patch.object(lse.shutil, 'which', return_value=str(fake)):
+                result = lse.scan_lse(script)
+            self.assertEqual(result['_capability_status'], 7)
+            self.assertEqual(calls.read_text().splitlines(), ['call'])
+            self.assertIn('sec010', result['raw'])
+
     def test_affirmative_actionable_only_and_multiple_independent_contexts(self):
         result = lse.parse(FIXTURE)
         by_id = {finding['id']: finding for finding in result['findings']}
         self.assertEqual(set(result), {'findings', 'raw', 'errors'})
-        self.assertEqual(set(by_id), {'fst030', 'fst160', 'fst210', 'sys020', 'sys030', 'sof020', 'sof000'})
+        self.assertEqual(set(by_id), {'fst030', 'fst160', 'fst210', 'sys020', 'sys030', 'sys040', 'ret050', 'sof020', 'sof000'})
+        self.assertEqual(by_id['sys040']['severity'], 'critical')
+        self.assertEqual(by_id['ret050']['severity'], 'warning')
+        self.assertEqual(by_id['ret050']['context'][0]['evidence'], ['/opt/jobs/config'])
         self.assertEqual(len(by_id['sof020']['context']), 4)
         self.assertEqual(by_id['fst030']['context'][0]['evidence'], ['/opt/suid'])
         self.assertEqual(by_id['sys030']['context'][0]['evidence'], ['/etc/shadow'])
@@ -104,8 +181,11 @@ class LSETests(unittest.TestCase):
         self.assertIn('lse_version="4.14nw"', source)
         for test_id in lse.selection(True).split(','):
             self.assertIn('lse_test "%s"' % test_id, source)
-        self.assertNotIn('sys040', lse.SELECTION.split(','))
-        self.assertNotIn('sof170', lse.SELECTION.split(','))
+        self.assertIn('sys040', lse.SELECTION.split(','))
+        self.assertEqual(sum(level == 0 for level, _, _ in lse.TESTS.values()), 30)
+        self.assertEqual(len(lse.SELECTION.split(',')), 34)
+        for deep_only in ('sof170', 'srv020', 'srv030', 'srv040', 'srv050', 'srv520'):
+            self.assertNotIn(deep_only, lse.SELECTION.split(','))
         self.assertIn('sys040', lse.selection(True).split(','))
         for test_id in ('fst000', 'fst010', 'usr070', 'sec010', 'ret050'):
             self.assertIn(test_id, lse.SELECTION.split(','))
@@ -127,30 +207,58 @@ class LSETests(unittest.TestCase):
     def test_cli_execution_default_deep_and_warnings(self):
         with tempfile.TemporaryDirectory() as directory:
             script = Path(directory) / 'fixture with spaces.sh'
-            script.write_text('#!/bin/sh\ncase "$4" in 0) expected="' + lse.SELECTION + '";; 1) expected="' + lse.selection(True) + '";; esac\n'
-                              '[ "$1 $2 $3 $5 $6 $7 $8" = "-c -i -l -p 0 -s $expected" ] || exit 9\n'
+            script.write_text('#!/bin/sh\ncase "$8" in "' + lse.SELECTION + '"|"' + lse.selection(True) + '") ;; *) exit 9;; esac\n'
+                              '[ "$1 $2 $3 $4 $5 $6 $7" = "-c -i -l 1 -p 0 -s" ] || exit 9\n'
                               'read answer && exit 8\n'
-                              'printf "%s\\n" "level=$4" >&2\n'
+                              'printf "%s\\n" "level=$4" "selection=$8" >&2\n'
                               "cat <<'OUTPUT'\n" + FIXTURE + 'OUTPUT\nexit 3\n')
+            wrapper = passive_fixtures(directory)
             for deep in (False, True):
-                args = [sys.executable, str(ROOT / 'scripts/discover-lse'), '--script', str(script)]
+                args = [sys.executable, str(wrapper), '--script', str(script)]
                 result = subprocess.run(args + (['--deep'] if deep else []), capture_output=True, text=True, timeout=10)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stderr, '')
                 state = json.loads(result.stdout)
-                self.assertIn('level=%d' % deep, state['errors'])
+                self.assertIn('level=1', state['errors'])
+                self.assertIn('selection=' + lse.selection(deep), state['errors'])
                 self.assertIn('LSE exited with status 3; findings may be incomplete', state['errors'])
                 self.assertEqual(state['findings'], lse.parse(FIXTURE, deep)['findings'])
                 self.assertIn(FIXTURE, state['raw'])
-                self.assertIn('level=%d' % deep, state['raw'])
+                self.assertIn('level=1', state['raw'])
 
     def test_missing_script_returns_json_error(self):
-        result = subprocess.run([sys.executable, str(ROOT / 'scripts/discover-lse'), '--script', '/nonexistent/ccdc/lse.sh'],
-                                capture_output=True, text=True, timeout=10)
+        with tempfile.TemporaryDirectory() as directory:
+            wrapper = passive_fixtures(directory)
+            result = subprocess.run([sys.executable, str(wrapper), '--script', '/nonexistent/ccdc/lse.sh'],
+                                    capture_output=True, text=True, timeout=10)
         state = json.loads(result.stdout)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(state['findings'], [])
         self.assertTrue(state['errors'])
+
+    def test_expected_oski_sudo_is_raw_evidence_not_an_alert(self):
+        raw = FIXTURE + block('sud000', 'Sudo without password', 'uid=0(root) gid=0(root)')
+        process = MagicMock()
+        process.__enter__.return_value = process
+        process.returncode = 0
+        process.communicate.return_value = (raw, '')
+        # Policy follows the effective account, not the spoofable USER variable
+        # or the upstream banner. Unknown accounts fail closed.
+        for account in ('oski', 'other', None):
+            with self.subTest(account=account), \
+                    patch.dict(lse.os.environ, {'USER': 'oski'}), \
+                    patch.object(lse, 'coverage', return_value=[]), \
+                    patch.object(lse.subprocess, 'Popen', return_value=process), \
+                    patch('pwd.getpwuid', side_effect=KeyError if account is None else None,
+                          return_value=MagicMock(pw_name=account)):
+                state = lse.scan('/pinned/lse.sh')
+            by_id = {finding['id']: finding for finding in state['findings']}
+            self.assertEqual('sud000' in by_id, account != 'oski')
+            if account != 'oski':
+                self.assertEqual(by_id['sud000']['severity'], 'critical')
+            self.assertIn('fst160', by_id)
+            self.assertIn('sys040', by_id)
+            self.assertEqual(state['raw'], raw)
 
     def test_unprivileged_login_path_can_still_find_admin_utilities(self):
         process = MagicMock()
@@ -208,6 +316,7 @@ class LSETests(unittest.TestCase):
                 dest = root / name
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / name, dest)
+            passive_fixtures(root / 'scripts')
             seen = root / 'seen-deployment-directory'
             (root / 'vendor/lse.sh').write_text('#!/bin/sh\nprintf "%s" "${0%/*}" > "' + str(seen) + '"\n'
                                                + "cat <<'OUTPUT'\n" + FIXTURE + 'OUTPUT\n')
