@@ -42,7 +42,6 @@
             - {src: scripts/lse_extras.py, dest: lse_extras.py}
             - {src: scripts/kernel_risks.py, dest: kernel_risks.py}
             - {src: scripts/lse_host_risks.py, dest: lse_host_risks.py}
-            - {src: scripts/package_risks.py, dest: package_risks.py}
           changed_when: false
 
         - name: Run selected checks without passwords, color, or process monitoring

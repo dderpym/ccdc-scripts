@@ -54,9 +54,8 @@ def passive_fixtures(directory):
         "def scan(raw, capability_status=None):\n    return {'findings': [], 'raw': '', 'errors': []}\n")
     (directory / 'kernel_risks.py').write_text(
         "def inspect_kernel(deep=False):\n    return {'findings': [], 'raw': '', 'errors': []}\n")
-    for filename in ('lse_host_risks.py', 'package_risks.py'):
-        (directory / filename).write_text(
-            "def scan(deep=False):\n    return {'findings': [], 'raw': '', 'errors': []}\n")
+    (directory / 'lse_host_risks.py').write_text(
+        "def scan(deep=False):\n    return {'findings': [], 'raw': '', 'errors': []}\n")
     wrapper = directory / 'discover-lse'
     shutil.copyfile(ROOT / 'scripts/discover-lse', wrapper)
     return wrapper
@@ -99,11 +98,11 @@ class LSETests(unittest.TestCase):
 
         with patch.object(lse.runpy, 'run_path', side_effect=helper):
             states = SUPPLEMENTAL_SCAN('fixture raw', True, 7)
-        self.assertEqual(len(states), 4)
+        self.assertEqual(len(states), 3)
         self.assertEqual(calls, [('lse_extras.py', ('fixture raw', 7)),
-                                 ('lse_host_risks.py', (True,)), ('package_risks.py', (True,))])
+                                 ('lse_host_risks.py', (True,))])
         self.assertEqual(states[1]['errors'], ['kernel_risks.py: fixture failure'])
-        self.assertEqual(states[2:], [state, state])
+        self.assertEqual(states[2:], [state])
 
     def test_native_capability_exit_receipt_does_not_repeat_enumeration(self):
         with tempfile.TemporaryDirectory() as directory:

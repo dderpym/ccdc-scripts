@@ -162,7 +162,10 @@ def _trusted_systemctl():
             pass
 
 
-def _unescape(value):
+SYSTEMD_PATH = ('/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin')
+
+
+def _unescape(value, search=False):
     # Native systemd path escaping, not shell quoting or shell tokenization.
     if len(value) > 4096:
         raise ValueError('Systemd path length limit reached')
@@ -177,6 +180,12 @@ def _unescape(value):
             data.extend(value[0].encode('utf-8', 'surrogateescape'))
             value = value[1:]
     path = os.fsdecode(bytes(data))
+    if search and path and '/' not in path and '\0' not in path:
+        # systemd resolves a bare Exec name through its built-in search path.
+        found = [d + '/' + path for d in SYSTEMD_PATH if os.path.lexists(d + '/' + path)]
+        if not found:
+            raise ValueError('Bare systemd executable not found in search path')
+        return found[0]
     if not path.startswith('/') or '\0' in path:
         raise ValueError('Nonabsolute/invalid systemd path')
     return path
@@ -188,7 +197,7 @@ def _exec_paths(value):
         match = re.match(r'\s*\{\s*path=(.*?) ; argv\[\]=[^{}]*;[^{}]*\}\s*', value)
         if not match:
             raise ValueError('Unknown native Exec property syntax')
-        paths.append(_unescape(match[1]))
+        paths.append(_unescape(match[1], search=True))
         value = value[match.end():]
     return paths
 
@@ -238,9 +247,10 @@ def inspect_services(*, properties=None, runner=_run, manager='/run/systemd/syst
             props = {}
             for line in text.splitlines():
                 key, sep, value = line.partition('=')
-                if not sep or key not in PROPERTIES or key in props:
+                if not sep or key not in PROPERTIES or (key in props and key not in EXEC):
                     raise ValueError('Unknown/duplicate show property syntax')
-                props[key] = value
+                # Exec* properties legitimately repeat (e.g. two ExecReload= commands).
+                props[key] = props[key] + ' ' + value if key in props else value
             if props.get('User', '') not in ('', 'root', '0') or props.get('DynamicUser') == 'yes':
                 continue
             if props.get('DynamicUser') != 'no':
@@ -292,6 +302,8 @@ def inspect_root_processes(*, proc='/proc', max_entries=4096):
                         continue
                     if int(match[2]) != 0:
                         continue
+                    if re.search(r'^State:\s+Z', status, re.M):
+                        continue  # Zombies have no executable link; nothing to assess.
                     link = entry.path + '/exe'
                     with _elevated():
                         path = os.readlink(link)

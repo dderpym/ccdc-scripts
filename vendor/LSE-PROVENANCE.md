@@ -70,8 +70,8 @@ results private.
 
 ## Passive supplemental checks
 
-Original Python helpers `scripts/lse_extras.py`, `scripts/lse_host_risks.py`,
-`scripts/kernel_risks.py` and `scripts/package_risks.py` add a curated subset
+Original Python helpers `scripts/lse_extras.py`, `scripts/lse_host_risks.py`
+and `scripts/kernel_risks.py` add a curated subset
 of LinPEAS coverage gaps to the same result. LSE itself is
 still unmodified; its parser/allowlist contract below remains unchanged. See
 [LINPEAS-GAPS.md](LINPEAS-GAPS.md) for the pinned comparison, implemented checks,

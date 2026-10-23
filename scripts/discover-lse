@@ -304,8 +304,7 @@ def supplemental_scan(raw, deep=False, capability_status=None):
     for filename, entry, args in (
             ('lse_extras.py', 'scan', (raw, capability_status)),
             ('kernel_risks.py', 'inspect_kernel', (deep,)),
-            ('lse_host_risks.py', 'scan', (deep,)),
-            ('package_risks.py', 'scan', (deep,))):
+            ('lse_host_risks.py', 'scan', (deep,))):
         try:
             helper = runpy.run_path(str(Path(__file__).with_name(filename)))[entry]
             states.append(helper(*args))

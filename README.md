@@ -841,9 +841,9 @@ container's distro identity. Unknown vendor backports/prerequisites produce
 scoped coverage warnings; `--deep` additionally shows explicitly unverified
 upstream-version candidates. A patch installation is not evidence the running
 kernel changed. Custom patches, module autoload policy and livepatch aren't
-verified. Package triage covers needrestart, PackageKit, PwnKit and sudo using
-reviewed Debian/Ubuntu package boundaries; installed fixes do not prove active
-daemons restarted. See the comparison document for exact supported builds and limits.
+verified. Package CVE matching is intentionally not done here: use the update
+tooling (`ccdcctl update`) or the distribution's own security tools. See the
+comparison document for exact supported builds and limits.
 
 Findings are **not baselined or accepted as normal** merely because they were
 present when the competition started. There is no LSE baseline command.
