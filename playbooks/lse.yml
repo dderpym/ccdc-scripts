@@ -4,8 +4,10 @@
 # ccdc_lse_result is the command result; JSON is in .stdout. The final command
 # republishes it AFTER cleanup because ccdc_results saves the latest host task.
 # --extra-vars '{"lse_deep": true}' expands the allowlist; both modes request
-# level-1 evidence. Never become root for permission checks: authorized oski
-# sudo access is expected, not a new exploit.
+# level-1 evidence. The scan runs under sudo for visibility (root processes,
+# other accounts' metadata) but discover-lse drops to the login account, keeping
+# root only as the saved uid for read-only metadata, so permission verdicts are
+# still those of the unprivileged account. Authorized oski sudo access is expected.
 - name: Discover actionable local privilege risks with pinned LSE
   hosts: all
   gather_facts: false
@@ -49,6 +51,7 @@
               {{ [ansible_facts.discovered_interpreter_python | default(ansible_python_interpreter | default('/usr/bin/python3')),
                   ccdc_lse_tmp.path ~ '/discover-lse', '--script', ccdc_lse_tmp.path ~ '/lse.sh']
                  + (['--deep'] if lse_deep | default(false) | bool else []) }}
+          become: true
           register: ccdc_lse_result
           changed_when: false
 

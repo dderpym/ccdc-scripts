@@ -193,6 +193,39 @@ def coverage(directory, env=None):
     return gaps
 
 
+def drop_privileges(name=None):
+    """Under sudo, become the login account but keep root as the saved uid.
+
+    Permission checks must reflect what the account can do. Helpers re-elevate only
+    for read-only visibility, and exec'd children (LSE, getcap, ...) lose root.
+    """
+    if os.geteuid() != 0:
+        return
+    name = name or os.environ.get("SUDO_USER")
+    try:
+        account = pwd.getpwnam(name) if name else None
+    except KeyError:
+        account = None
+    if account is None or account.pw_uid == 0:
+        raise SystemExit("Running as root requires an unprivileged target account (--user or SUDO_USER)")
+    os.setgroups(os.getgrouplist(account.pw_name, account.pw_gid))
+    os.setresgid(account.pw_gid, account.pw_gid, 0)
+    os.setresuid(account.pw_uid, account.pw_uid, 0)
+    os.environ.update(HOME=account.pw_dir, USER=account.pw_name, LOGNAME=account.pw_name)
+
+
+def exec_scratch():
+    """Private scratch directory on a filesystem that allows execution (/tmp is often noexec)."""
+    for base in (None, "/var/tmp", "/dev/shm", str(Path.home())):
+        try:
+            if os.statvfs(base or tempfile.gettempdir()).f_flag & os.ST_NOEXEC:
+                continue
+            return tempfile.TemporaryDirectory(prefix="ccdc-lse-bin-", dir=base)
+        except (OSError, RuntimeError):
+            continue
+    return None
+
+
 def scan_lse(script, deep=False):
     command = ["/bin/sh", str(Path(script).resolve()), "-c", "-i", "-l", "1",
                "-p", "0", "-s", selection(deep)]
@@ -211,13 +244,14 @@ def scan_lse(script, deep=False):
         # modifying the pinned script. The private shim forwards stdout unchanged.
         cap_status = Path(directory) / 'getcap.status'
         getcap = shutil.which('getcap', path=env['PATH'])
-        if getcap:
-            recorder = Path(directory) / 'getcap'
+        shims = exec_scratch() if getcap else None
+        if shims:
+            recorder = Path(shims.name) / 'getcap'
             recorder.write_text('#!/bin/sh\n' + shlex.quote(getcap) + ' "$@"\n'
                                 'status=$?\nprintf "%s" "$status" > ' + shlex.quote(str(cap_status))
                                 + '\nexit "$status"\n')
             recorder.chmod(0o700)
-            env['PATH'] = directory + os.pathsep + env['PATH']
+            env['PATH'] = shims.name + os.pathsep + env['PATH']
         try:
             with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, universal_newlines=True, errors="replace",
@@ -259,6 +293,9 @@ def scan_lse(script, deep=False):
                 return result
         except OSError as exc:
             return {"findings": [], "raw": "", "errors": ["Cannot execute local LSE: " + str(exc)]}
+        finally:
+            if shims:
+                shims.cleanup()
 
 
 def supplemental_scan(raw, deep=False, capability_status=None):
@@ -298,7 +335,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--script", required=True, help="path to local vendor/lse.sh")
     parser.add_argument("--deep", action="store_true", help="include actionable level-1 checks")
+    parser.add_argument("--user", help="unprivileged account to assess when started as root (default SUDO_USER)")
     args = parser.parse_args()
+    drop_privileges(args.user)
     try:
         result = scan(args.script, args.deep)
     except OSError as exc:

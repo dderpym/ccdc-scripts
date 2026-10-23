@@ -5,6 +5,7 @@ execution. Permission candidates are not exploitation proofs (including SUID-fil
 replacement, which does not preserve privilege). Only scan(deep=True) enumerates
 agent directories. Fixture arguments avoid contacting the host service manager.
 """
+import contextlib
 import errno
 import os
 from pathlib import Path
@@ -47,16 +48,38 @@ def _result(name, contexts=(), gaps=(), raw=''):
     return result
 
 
+@contextlib.contextmanager
+def _elevated():
+    """Briefly regain the saved root uid for read-only visibility (stat/readlink).
+
+    discover-lse runs under sudo but drops to the login account with root kept as the
+    saved uid. Access *decisions* (os.access) stay unprivileged; only metadata that
+    the account cannot see, such as /proc/PID/exe or paths under 0700 homes, is read here.
+    """
+    ids, gids = os.getresuid(), os.getresgid()
+    if ids[2] != 0 or 0 in ids[:2]:
+        yield
+        return
+    os.setresuid(0, 0, 0)
+    os.setresgid(0, 0, 0)  # ptrace-style /proc access compares gids too
+    try:
+        yield
+    finally:
+        os.setresgid(*gids)
+        os.setresuid(*ids)
+
+
 def _root(name):
     if os.geteuid() == 0:
         return _result(name, gaps=['Root cannot assess unprivileged permissions'])
 
 
-def _metadata(path, gaps, follow=True):
+def _metadata(path, gaps, follow=True, denied_ok=False):
     try:
-        return os.stat(path) if follow else os.lstat(path)
+        with _elevated():
+            return os.stat(path) if follow else os.lstat(path)
     except OSError as exc:
-        if exc.errno not in (errno.ENOENT, errno.ENOTDIR):
+        if exc.errno not in (errno.ENOENT, errno.ENOTDIR) + ((errno.EACCES,) if denied_ok else ()):
             gaps.append('Cannot inspect path metadata: ' + os.fspath(path))
 
 
@@ -222,14 +245,15 @@ def inspect_services(*, properties=None, runner=_run, manager='/run/systemd/syst
                 continue
             if props.get('DynamicUser') != 'no':
                 raise ValueError('DynamicUser unavailable/unknown')
-            if any(key not in props for key in PROPERTIES if key != 'User'):
+            # systemd omits empty Exec* properties from `show`, so only the rest are required.
+            if any(key not in props for key in PROPERTIES if key != 'User' and key not in EXEC):
                 raise ValueError('Effective properties missing')
             if props['RootDirectory'] not in ('', '/') or props['RootImage']:
                 gaps.append(unit + ': root directory/image host paths untranslatable')
                 continue
             for key in EXEC:
                 try:
-                    for path in _exec_paths(props[key]):
+                    for path in _exec_paths(props.get(key, '')):
                         _path_risks(path, 'root service executable', contexts, gaps)
                 except ValueError:
                     gaps.append(unit + ': ' + key + ' syntax/path unknown')
@@ -269,8 +293,9 @@ def inspect_root_processes(*, proc='/proc', max_entries=4096):
                     if int(match[2]) != 0:
                         continue
                     link = entry.path + '/exe'
-                    path = os.readlink(link)
-                    target, host = os.stat(link), os.stat(path)
+                    with _elevated():
+                        path = os.readlink(link)
+                        target, host = os.stat(link), os.stat(path)
                     if (target.st_dev, target.st_ino) != (host.st_dev, host.st_ino):
                         gaps.append('Root executable host path untranslatable')
                     elif path not in seen:
@@ -313,16 +338,19 @@ def _accounts(accounts, max_accounts, gaps):
 def _entries(directory, budget, gaps):
     if not _real_directory(directory, gaps):
         return
+    found = []
     try:
-        with os.scandir(directory) as entries:
+        # Listing is elevated (metadata only) but eager: never yield while holding root.
+        with _elevated(), os.scandir(directory) as entries:
             for entry in entries:
                 if budget[0] <= 0:
                     gaps.append('Directory entry limit reached')
                     break
                 budget[0] -= 1
-                yield entry
+                found.append(entry)
     except OSError:
         gaps.append('Directory metadata inaccessible: ' + directory)
+    yield from found
 
 
 def inspect_credentials(*, paths=HOST_SECRETS, accounts=None, environ=None,
@@ -337,7 +365,8 @@ def inspect_credentials(*, paths=HOST_SECRETS, accounts=None, environ=None,
         if not os.path.isabs(path) or '\0' in path or len(path) > 4096:
             gaps.append('Credential path invalid/unresolvable/length-limited')
             return
-        metadata = _metadata(path, gaps)
+        # EACCES means a parent is not searchable by us, so the credential is unreadable too.
+        metadata = _metadata(path, gaps, denied_ok=True)
         if metadata and stat.S_ISREG(metadata.st_mode) and metadata.st_uid != os.geteuid() and _access(path, os.R_OK):
             contexts.append((os.fspath(path), 'Readable other-account credential (owner UID %d)' % metadata.st_uid))
 

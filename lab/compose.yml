@@ -10,7 +10,7 @@ services:
     container_name: ccdc-lab-hatchery
     dns: [1.1.1.1, 8.8.8.8]  # Do not inherit host VPN-only DNS resolvers.
     dns_search: ["."]  # Do not inherit host VPN search domains either.
-    cap_add: [NET_ADMIN]  # Container firewall namespace only; never --privileged.
+    cap_add: [NET_ADMIN, SYS_PTRACE]  # Container firewall namespace + /proc/PID/exe visibility for root scans; never --privileged.
     cpus: 1
     mem_limit: 384m
     pids_limit: 256
@@ -49,7 +49,7 @@ services:
     dns: [1.1.1.1, 8.8.8.8]
     dns_search: ["."]
     # systemd needs a writable private cgroup tree, not the host's tree.
-    cap_add: [NET_ADMIN, SYS_ADMIN]
+    cap_add: [NET_ADMIN, SYS_ADMIN, SYS_PTRACE]  # SYS_PTRACE: root scans read /proc/PID/exe as on a real host
     cgroup: private
     tmpfs: [/run, /run/lock, /tmp]
     cpus: 1

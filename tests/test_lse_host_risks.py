@@ -41,8 +41,8 @@ class HostFixtures(unittest.TestCase):
         self.owners = {}
         original = host._metadata
 
-        def metadata(path, gaps, follow=True):
-            result = original(path, gaps, follow)
+        def metadata(path, gaps, follow=True, **kwargs):
+            result = original(path, gaps, follow, **kwargs)
             return SimpleNamespace(st_mode=result.st_mode, st_uid=self.owners.get(str(path), 0)) if result else None
         self.enterContext(patch.object(host, '_metadata', side_effect=metadata))
 

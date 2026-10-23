@@ -16,7 +16,7 @@ checks package-repository and peer-name resolution before declaring the lab read
 Network namespaces do not isolate Docker's default DNS configuration or host
 forwarding/VPN policy; DNS is pinned explicitly here. No manual route/policy changes, runtime host
 networking, host cgroup mounts, or `--privileged` containers are used.
-`NET_ADMIN` applies to each container's own firewall namespace. Debian also
+`NET_ADMIN` applies to each container's own firewall namespace. `SYS_PTRACE` lets root scans read `/proc/PID/exe` of other root processes, as on a real host (Docker drops it by default). Debian also
 needs `SYS_ADMIN` to remount its **private cgroup v2 namespace** writable for
 systemd. This is a broad capability: these intentionally vulnerable servers
 are not a security boundary against hostile root users; use a dedicated lab

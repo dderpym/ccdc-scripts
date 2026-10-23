@@ -808,8 +808,11 @@ UID-zero accounts (`sys040`) and writable cron paths (`ret050`). Four supporting
 checks also run. Operation is noninteractive, without color or process-watching delay. Only affirmative
 security tests are summarized; informational enumeration stays out of the live
 terminal. Stable test IDs and normalized context identify findings where possible.
-LSE runs as the configured login account (normally `oski`), **without become**:
-root readability/writability is not evidence of an unprivileged escalation.
+LSE runs under sudo for visibility (other accounts' metadata, root process
+executables), but `discover-lse` immediately drops to the login account (normally
+`oski`) and keeps root only as the saved uid for read-only metadata reads. Permission
+verdicts therefore stay those of the unprivileged account: root readability/writability
+is not evidence of an unprivileged escalation. Run by hand as root, pass `--user`.
 The team's intentionally passwordless sudo remains in raw evidence but does not
 produce a `sud000` alert when the effective scanning account is `oski`. Other
 accounts still receive the critical finding; no saved baseline is involved.
