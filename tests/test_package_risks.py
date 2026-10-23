@@ -210,6 +210,7 @@ class PackageRisksTests(unittest.TestCase):
 
     def test_unreadable_fifo_and_oversized_config(self):
         self.installed('needrestart', '3.5-5ubuntu2.1')
+        self.comparisons['3.5-5ubuntu2.1', '3.5-5ubuntu2.2'] = 0
         path = self.root / 'etc/needrestart/needrestart.conf'
         real_read = risks.read_regular
         with patch.object(risks, 'read_regular', side_effect=lambda p: (_ for _ in ()).throw(PermissionError('fixture')) if p == path else real_read(p)):
@@ -242,6 +243,7 @@ class PackageRisksTests(unittest.TestCase):
 
     def test_unknown_activation_metadata_scoped(self):
         self.installed('packagekit', '1.2.5-2ubuntu3')
+        self.comparisons['1.2.5-2ubuntu3', '1.2.5-2ubuntu3.1'] = 0
         (self.root / 'usr/share/dbus-1/system-services/org.freedesktop.PackageKit.service').unlink()
         self.assertEqual(self.scan()['incomplete_ids'], ['package:CVE-2026-41651'])
         self.assertFalse(self.cves(self.scan()))
