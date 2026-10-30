@@ -758,8 +758,20 @@ are still prompted, or skipped without a terminal); `--auto-apply=all` also
 applies ownership changes. Fixes are absolute targets (distro-expected values,
 group/other write and secret exposure removed), applied by `host/apply_fixes.py`
 through the file descriptor, never through symlinks. Package-content changes
-are not fixable and stay as findings; re-run the scan to verify. LSE accepts the
-flag but has no fixes yet.
+are not fixable and stay as findings; re-run the scan to verify.
+
+`lse` offers the same prompts and `--auto-apply` flag for its basic permission
+tests. For fst030/fst160/fst170/fst180/sys030 it takes the paths named in the
+evidence, re-reads their metadata on the target and proposes: clear group/other
+write (sys030: other access), and for fst030/fst160/fst170 make a non-root owner
+root (an ownership change, so `--auto-apply=all`). Symlinks, sticky directories
+and missing paths are skipped; PATH directories keep their owner.
+
+`lse` also reports `ns-unprivileged-userns` (review) when
+`kernel.unprivileged_userns_clone` or `user.max_user_namespaces` is nonzero. Its
+fix (tier `all`) writes `0` to the live sysctls and persists them in
+`/etc/sysctl.d/99-ccdc-userns.conf`. Only those two sysctls, and only the value
+`0`, are accepted. This breaks rootless containers and browser/Flatpak sandboxes.
 
 Normal verification uses Alpine `apk audit --system --check-permissions` (with
 installed-option detection), plus a bounded native `--backup` audit of `/etc`

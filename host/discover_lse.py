@@ -17,6 +17,7 @@ import pwd
 import re
 import shlex
 import signal
+import stat
 import shutil
 import subprocess
 import tempfile
@@ -81,6 +82,43 @@ ROOT_PERMISSION_TESTS = {
     "ret010", "ret050", "ret060", "ret510", "srv000", "srv500",
     "sof000", "sof010", "sof130", "sof160", "ctn020", "ctn210",
 }
+
+
+# Permission tests whose affirmative path evidence has a mechanical fix:
+# bits to clear, and whether a non-root owner of a system path becomes root.
+PERMISSION_FIXES = {
+    "fst030": (0o022, True), "fst160": (0o022, True), "fst170": (0o022, True),
+    "fst180": (0o022, False),  # PATH entries may legitimately be the user's own
+    "sys030": (0o007, False),
+}
+EVIDENCE_PATH = re.compile(r"^[bcdlps-][rwxStTs-]{9}[.+@]?\s+\S+\s+\S+\s+(/.+)$")
+MAX_FIXES = 50
+
+
+def permission_fixes(test_id, contexts, lstat=os.lstat):
+    """Absolute-target fixes for regular files/directories named in the evidence."""
+    clear, chown_root = PERMISSION_FIXES[test_id]
+    fixes, seen = [], set()
+    for context in contexts:
+        for line in context["evidence"]:
+            match = EVIDENCE_PATH.match(line)
+            path = match[1] if match else line if line.startswith("/") else None
+            if path is None or path in seen or len(fixes) >= MAX_FIXES:
+                continue
+            seen.add(path)
+            try:
+                info = lstat(path)
+            except OSError:
+                continue
+            kind = stat.S_IFMT(info.st_mode)
+            if kind not in (stat.S_IFREG, stat.S_IFDIR) or (kind == stat.S_IFDIR and info.st_mode & stat.S_ISVTX):
+                continue
+            was = {"mode": stat.S_IMODE(info.st_mode), "uid": info.st_uid, "gid": info.st_gid}
+            target = dict(was, mode=was["mode"] & ~clear, uid=0 if chown_root else was["uid"])
+            if target != was:
+                fixes.append(dict(path=path, **target, was=was,
+                                  tier="simple" if target["uid"] == was["uid"] else "all"))
+    return fixes
 
 
 def clean(text):
@@ -168,7 +206,11 @@ def parse(text, deep=False):
     for test_id, contexts in sorted(grouped.items()):
         _, severity, summary = TESTS[test_id]
         contexts.sort(key=lambda item: json.dumps(item, sort_keys=True))
-        findings.append({"id": test_id, "severity": severity, "summary": summary, "context": contexts})
+        row = {"id": test_id, "severity": severity, "summary": summary, "context": contexts}
+        fixes = permission_fixes(test_id, contexts) if test_id in PERMISSION_FIXES else []
+        if fixes:
+            row["fixes"] = fixes
+        findings.append(row)
     errors = ["LSE ran as root; permission checks cannot assess an unprivileged account"] if root else []
     return {"findings": findings, "raw": raw, "errors": errors}
 

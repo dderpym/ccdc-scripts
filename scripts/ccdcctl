@@ -702,25 +702,37 @@ def scan(kind, hosts, deep=False):
     return valid, errors
 
 
+SYSCTL_FIXES = {"kernel.unprivileged_userns_clone", "user.max_user_namespaces"}
+
+
 def fix_plan(state):
-    """Valid, de-duplicated fixes carried by scanner findings, in finding order."""
+    """Valid, de-duplicated (tier, request, description) fixes carried by findings."""
     seen, fixes = set(), []
     for finding in state["findings"]:
-        fix = finding.get("fix")
-        if not isinstance(fix, dict) or fix.get("tier") not in ("simple", "all"):
-            continue
-        try:
-            keys = ("mode", "uid", "gid")
-            clean = {"path": fix["path"], **{key: fix[key] for key in keys}}
-            was = {key: fix["was"][key] for key in keys}
-        except (KeyError, TypeError):
-            continue
-        if (not isinstance(clean["path"], str) or not clean["path"].startswith("/")
-                or not all(type(v) is int and v >= 0 for v in (*clean.values(), *was.values())[1:])):
-            continue
-        if (clean["path"], clean["mode"], clean["uid"], clean["gid"]) not in seen:
-            seen.add((clean["path"], clean["mode"], clean["uid"], clean["gid"]))
-            fixes.append((fix["tier"], clean, was))
+        candidates = [*finding.get("fixes", []), *([finding["fix"]] if "fix" in finding else [])]
+        for fix in (f for f in candidates if isinstance(f, dict) and f.get("tier") in ("simple", "all")):
+            try:
+                if fix.get("kind") == "sysctl":
+                    settings = fix["settings"]
+                    if not settings or any(k not in SYSCTL_FIXES or v != "0" for k, v in settings.items()):
+                        continue
+                    request = {"kind": "sysctl", "settings": dict(settings)}
+                    description = ("sysctl " + ", ".join(f"{k} {fix['was'].get(k, '?')} -> 0" for k in sorted(settings))
+                                   + " (persisted; breaks rootless containers and browser sandboxes)")
+                else:
+                    keys = ("mode", "uid", "gid")
+                    request = {"path": fix["path"], **{key: fix[key] for key in keys}}
+                    was = {key: fix["was"][key] for key in keys}
+                    if (not isinstance(request["path"], str) or not request["path"].startswith("/")
+                            or not all(type(v) is int and v >= 0 for v in (*request.values(), *was.values())[1:])):
+                        continue
+                    description = describe_fix(request, was)
+            except (KeyError, AttributeError, TypeError):
+                continue
+            key = json.dumps(request, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                fixes.append((fix["tier"], request, description))
     return fixes
 
 
@@ -741,13 +753,12 @@ def offer_fixes(host, state, auto=None):
         return
     print(f"\n{len(fixes)} fixable finding(s) on {host}:")
     approved, everything = [], False
-    for tier, clean, was in fixes:
-        line = describe_fix(clean, was)
+    for tier, clean, line in fixes:
         if everything or auto == "all" or (auto == "simple" and tier == "simple"):
             print("  applying  " + line)
             approved.append(clean)
         elif not interactive:
-            print("  skipped (ownership change needs --auto-apply=all)  " + line)
+            print("  skipped (needs --auto-apply=all)  " + line)
         else:
             answer = ask(f"  {line}\n  Apply? [y/N/a=yes to all remaining/q=stop]", ["y", "n", "a", "q"], "n")
             if answer == "q":

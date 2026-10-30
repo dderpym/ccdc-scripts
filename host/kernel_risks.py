@@ -131,6 +131,23 @@ def upstream_status(test_id, vendor, build):
     return "fixed" if fixed_patch is not None and build[2] >= fixed_patch else "affected"
 
 
+NAMESPACE_SYSCTLS = {"/proc/sys/kernel/unprivileged_userns_clone": "kernel.unprivileged_userns_clone",
+                     "/proc/sys/user/max_user_namespaces": "user.max_user_namespaces"}
+
+
+def userns_finding(policy):
+    """Unprivileged user namespaces are the usual route to CAP_NET_ADMIN; offer to switch them off."""
+    was = {NAMESPACE_SYSCTLS[name]: value for name, value in policy.items()
+           if name in NAMESPACE_SYSCTLS and value not in ("0", "unknown")}
+    if not was:
+        return None
+    return {"id": "ns-unprivileged-userns", "severity": "review",
+            "summary": "Unprivileged user namespaces are enabled",
+            "context": {"sysctls": policy,
+                        "certainty": "setting observed; disabling breaks rootless containers and browser/Flatpak sandboxes"},
+            "fixes": [{"kind": "sysctl", "settings": dict.fromkeys(was, "0"), "was": was, "tier": "all"}]}
+
+
 def inspect_kernel(deep=False, root=Path("/"), release=None):
     """Normal: identified builds; deep also shows explicitly unverified version matches."""
     release = os.uname().release if release is None else release
@@ -248,6 +265,9 @@ def inspect_kernel(deep=False, root=Path("/"), release=None):
         findings.append({"id": "scanner-extra-kernel", "severity": "warning",
                          "summary": "Kernel CVE coverage incomplete; running vendor build or prerequisites could not be established",
                          "context": {"checks": sorted(incomplete), "details": sorted(set(missing))}})
+    userns_fix = userns_finding(namespace_policy)
+    if userns_fix:
+        findings.append(userns_fix)
     result = {"findings": sorted(findings, key=lambda row: row["id"]),
               "raw": "\n".join(diagnostics + sorted(set(missing))), "errors": []}
     if incomplete:

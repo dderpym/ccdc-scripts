@@ -484,3 +484,32 @@ class ApplyFixTests(unittest.TestCase):
                     self.fix(self.root / 'f', 0o10000), self.fix(self.root / 'f', True)):
             with self.assertRaises(ValueError):
                 self.apply.apply(bad)
+
+
+class ApplySysctlTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.apply = load('apply-fixes')
+        for name in ('kernel/unprivileged_userns_clone', 'user/max_user_namespaces'):
+            (self.root / 'proc' / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / 'proc' / name).write_text('1\n')
+        self.dropin = str(self.root / 'sysctl.d/99.conf')
+
+    def run_fix(self, settings):
+        self.apply.apply_sysctl({'settings': settings}, self.dropin, str(self.root / 'proc'))
+
+    def test_sets_live_value_and_persists_merged_dropin(self):
+        self.run_fix({'user.max_user_namespaces': '0'})
+        self.run_fix({'kernel.unprivileged_userns_clone': '0'})
+        self.assertEqual((self.root / 'proc/user/max_user_namespaces').read_text(), '0\n')
+        lines = Path(self.dropin).read_text().splitlines()
+        self.assertIn('kernel.unprivileged_userns_clone = 0', lines)
+        self.assertIn('user.max_user_namespaces = 0', lines)
+
+    def test_only_allow_listed_names_and_zero_are_accepted(self):
+        for bad in ({}, {'kernel.randomize_va_space': '0'}, {'user.max_user_namespaces': '1'}):
+            with self.assertRaises(ValueError):
+                self.run_fix(bad)
+        self.assertFalse(Path(self.dropin).exists())

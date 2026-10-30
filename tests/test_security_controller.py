@@ -304,3 +304,15 @@ class FixOfferTests(SecurityControllerTests):
         self.assertFalse(self.offer(state, auto='all').called)
         state['findings'][0]['fix'] = {'tier': 'all', 'path': '/x'}
         self.assertFalse(self.offer(state, auto='all').called)
+
+
+class SysctlFixPlanTests(unittest.TestCase):
+    def test_sysctl_and_multi_fix_findings_are_planned_and_validated(self):
+        good = {'kind': 'sysctl', 'tier': 'all', 'settings': {'user.max_user_namespaces': '0'},
+                'was': {'user.max_user_namespaces': '15000'}}
+        perm = {'path': '/a', 'mode': 0o644, 'uid': 0, 'gid': 0, 'tier': 'simple',
+                'was': {'mode': 0o666, 'uid': 0, 'gid': 0}}
+        bad = dict(good, settings={'kernel.randomize_va_space': '0'})
+        plan = ctl.fix_plan({'findings': [{'fixes': [good, perm, perm, bad, 'junk']}]})
+        self.assertEqual([p[1].get('kind', 'perm') for p in plan], ['sysctl', 'perm'])
+        self.assertIn('15000 -> 0', plan[0][2])

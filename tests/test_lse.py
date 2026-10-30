@@ -308,3 +308,48 @@ class LSETests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PermissionFixTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.lse = load('discover-lse')
+
+    def fixes(self, test_id, *lines):
+        return self.lse.permission_fixes(test_id, [{'evidence': list(lines)}])
+
+    def test_path_and_listing_evidence_strip_group_other_write(self):
+        suid, conf = self.root / 'suid', self.root / 'conf'
+        suid.write_text('x')
+        conf.write_text('x')
+        suid.chmod(0o4777)
+        conf.chmod(0o666)
+        fixes = self.fixes('fst030', str(suid)) + self.fixes('fst160', f'-rw-rw-rw- {os.getuid()} {os.getgid()} {conf}')
+        self.assertEqual([f['mode'] for f in fixes], [0o4755, 0o644])
+        self.assertEqual({f['tier'] for f in fixes}, {'simple' if os.getuid() == 0 else 'all'})
+
+    def test_path_dirs_keep_owner_and_shadow_only_loses_other_access(self):
+        path = self.root / 'bin'
+        path.mkdir()
+        path.chmod(0o777)
+        fix, = self.fixes('fst180', f'drwxrwxrwx {os.getuid()} {os.getgid()} {path}')
+        self.assertEqual((fix['mode'], fix['uid'], fix['tier']), (0o755, os.getuid(), 'simple'))
+        shadow = self.root / 'shadow'
+        shadow.write_text('x')
+        shadow.chmod(0o644)
+        fix, = self.fixes('sys030', str(shadow))
+        self.assertEqual(fix['mode'], 0o640)
+
+    def test_symlinks_sticky_dirs_missing_and_clean_paths_get_no_fix(self):
+        target, sticky, clean = self.root / 't', self.root / 's', self.root / 'c'
+        target.write_text('x')
+        target.chmod(0o666)
+        (self.root / 'link').symlink_to(target)
+        sticky.mkdir()
+        sticky.chmod(0o1777)
+        clean.write_text('x')
+        clean.chmod(0o600)
+        evidence = [str(self.root / 'link'), str(sticky), str(clean), str(self.root / 'missing'), 'relative']
+        self.assertEqual(self.fixes('fst180', *evidence), [])
