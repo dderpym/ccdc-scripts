@@ -17,6 +17,9 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from controller import remote  # noqa: E402
+
 EXTRA = shlex.split(os.environ.get("ANSIBLE_ARGS", ""))
 VERBOSE = False
 
@@ -70,16 +73,10 @@ def select(target="all"):
 
 def collect(kind, hosts, args=()):
     """One Ansible batch; retain successful hosts even if another is unreachable."""
-    module_args = shlex.join([str(ROOT / "scripts" / f"discover-{kind}"), *args])
     with tempfile.TemporaryDirectory(prefix="ccdc-results-") as directory:
-        if kind == "lse":
-            result = run(["ansible-playbook", "playbooks/lse.yml", "--limit", ":".join(hosts),
-                          *EXTRA, "--extra-vars", json.dumps({"lse_deep": "--deep" in args})],
-                         result_dir=directory, result_task="Collect LSE security state")
-        else:
-            result = run(["ansible", "all", "--limit", ":".join(hosts), "--become",
-                          "-m", "ansible.builtin.script", "-a", module_args,
-                          *EXTRA], result_dir=directory)
+        result = run(["ansible-playbook", "playbooks/remote.yml", "--limit", ":".join(hosts), *EXTRA,
+                      "--extra-vars", remote.request("discover_" + kind, args)],
+                     result_dir=directory, result_task=remote.TASK)
         states, errors = {}, {}
         for host in hosts:
             try:
@@ -115,6 +112,14 @@ def run_with_vars(args, variables, capture=True, result_dir=None):
 def playbook(name, host="all", variables=None):
     args = ["ansible-playbook", f"playbooks/{name}.yml", "--limit", host, *EXTRA]
     result = run(args, capture=False) if variables is None else run_with_vars(args, variables, capture=False)
+    return result.returncode == 0
+
+
+def act(host, entry, args=(), connection=True, payload=None):
+    """Run one mutating host script with live progress; True when it succeeded."""
+    result = run(["ansible-playbook", "playbooks/remote.yml", "--limit", host, *EXTRA,
+                  "--extra-vars", remote.request(entry, args, connection=connection, payload=payload)],
+                 capture=False)
     return result.returncode == 0
 
 
@@ -393,7 +398,7 @@ def configure_ssh(hosts):
         if not verify_admin_access(host):
             summary.append((host, "unchanged", "unchanged", "FAILED"))
             continue
-        success = playbook("ssh", host, {"password_auth": enabled})
+        success = act(host, "apply_ssh", ["yes" if enabled else "no"])
         states, errors = collect("ssh", [host])
         if not errors:
             show_state("ssh", states[host], "Observed SSH after apply")
@@ -471,7 +476,7 @@ def policy_text(policies):
 
 def configure_firewall(hosts):
     print("Preparing missing networking tools with Ansible; no firewall policy is applied yet.")
-    if not playbook("firewall", ":".join(hosts), {"firewall_action": "prepare"}):
+    if not playbook("network-tools", ":".join(hosts)):
         return True
     print("Default: ALLOW tcp/22, loopback, established/related and essential IPv6 ICMP; BLOCK other unsolicited inbound.")
     print("nft replaces ALL tables atomically (unsafe NAT/forward/output is refused); iptables overrides INPUT.")
@@ -571,8 +576,8 @@ def configure_firewall(hosts):
             continue
         path = ROOT / "reports/rollback" / host / "firewall.json"
         save(path, snapshots[host])
-        success = playbook("firewall", host, {"firewall_action": "apply",
-                                            "firewall_tcp_ports": policy["tcp"], "firewall_udp_ports": policy["udp"]})
+        success = act(host, "discover_firewall",
+                      ["--apply", json.dumps({"tcp": policy["tcp"], "udp": policy["udp"]})])
         observed, failure = collect("firewall", [host])
         if failure:
             problems(failure)
@@ -581,6 +586,14 @@ def configure_firewall(hosts):
             show_state("firewall", observed[host], "Observed firewall after apply")
         if success:
             success = verify_admin_access(host)
+        if success:
+            # The state just applied and verified becomes the monitor's baseline.
+            try:
+                save(ROOT / "baselines" / host / "firewall.json", observed[host])
+                print(f"{host}: accepted firewall baseline")
+            except (OSError, ValueError) as exc:
+                print(f"{host}: applied, but baseline not saved: {exc}")
+                success = False
         results.append((host, "OK" if success else "FAILED - inspect/rollback before proceeding"))
     print("\nFIREWALL SUMMARY")
     for host, result in results:
@@ -597,8 +610,7 @@ def rollback(hosts):
             print(f"{host}: FAILED - no controller rollback snapshot")
             continue
         print(f"{host}: restoring {path.relative_to(ROOT)}")
-        results.append((host, playbook("firewall", host, {"firewall_action": "restore",
-                                                       "firewall_restore_file": str(path)})))
+        results.append((host, act(host, "discover_firewall", ["--restore", "-"], payload=path)))
     print("\nROLLBACK SUMMARY")
     for host, success in results:
         print(f"{host:20} {'OK' if success else 'FAILED'}")

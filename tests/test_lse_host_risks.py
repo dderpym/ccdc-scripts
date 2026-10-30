@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
-SPEC = importlib.util.spec_from_file_location('lse_host_risks', Path(__file__).resolve().parents[1] / 'scripts/lse_host_risks.py')
+SPEC = importlib.util.spec_from_file_location('lse_host_risks', Path(__file__).resolve().parents[1] / 'host/lse_host_risks.py')
 host = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(host)
 
@@ -380,7 +380,8 @@ class HostFixtures(unittest.TestCase):
 
     def test_original_access_uses_effective_ids(self):
         # The imported function retains lse_extras globals; os is the same stdlib module.
-        original = host.runpy.run_path(str(host._HERE / 'lse_extras.py'))['_access']
+        from host import lse_extras
+        original = lse_extras._access
         with patch.object(os, 'access', return_value=True) as access:
             self.assertTrue(original('/fixture', os.R_OK))
         access.assert_called_once_with('/fixture', os.R_OK, effective_ids=True)

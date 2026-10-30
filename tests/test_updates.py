@@ -18,8 +18,11 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 
 
+HOST_FILES = {'manage-updates': 'manage_updates.py', 'update-services.py': 'update_services.py'}
+
+
 def load(name, filename):
-    loader = importlib.machinery.SourceFileLoader(name, str(ROOT / 'scripts' / filename))
+    loader = importlib.machinery.SourceFileLoader(name, str(ROOT / ('host' if filename in HOST_FILES else 'scripts') / HOST_FILES.get(filename, filename)))
     spec = importlib.util.spec_from_loader(name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
@@ -71,7 +74,7 @@ class InteractiveUpdateTests(unittest.TestCase):
                 self.restarted.add(host)
                 return {'name': fields['service'], 'status': 'restarted'}
             return {'backup_archive': '/var/backups/ccdc-updates/x/backup.tar.gz', 'changes': EXACT['changes']}
-        self.remote = patch.object(update, 'remote', side_effect=remote).start()
+        self.remote = patch.object(update, 'call_host', side_effect=remote).start()
         for stream in ('stdout', 'stderr'):
             redirect = getattr(contextlib, 'redirect_' + stream)(io.StringIO())
             redirect.__enter__()
@@ -262,65 +265,20 @@ class InteractiveUpdateTests(unittest.TestCase):
     def test_transport_has_no_config_keys_and_saves_native_failure_privately(self):
         real = load('interactive_transport', 'update-controller.py')
         def run(args, result_dir=None, result_task=None):
-            path = Path(args[args.index('--extra-vars') + 1][1:])
+            remote_request = json.loads(args[args.index('--extra-vars') + 1])['ccdc_remote']
+            self.assertEqual(remote_request['entry'], 'manage_updates')
+            path = Path(remote_request['payload'])
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-            request = json.loads(path.read_text())['update_request']
-            self.assertEqual(request, {'action': 'plan'})
-            self.assertEqual(result_task, 'Run guarded update action')
+            self.assertEqual(json.loads(path.read_text()), {'action': 'plan'})
+            self.assertEqual(result_task, 'Run host script')
             response = {'stdout': json.dumps({'error': 'native failure', 'native_output': 'private detail'}), 'rc': 1}
             (Path(result_dir) / 'a').write_text(json.dumps(response))
             return subprocess.CompletedProcess(args, 2, '', '')
         with patch.object(ctl, 'run', side_effect=run), self.assertRaisesRegex(RuntimeError, '^native failure$'):
-            real.remote(ctl, 'a', 'plan')
+            real.call_host(ctl, 'a', 'plan')
         path = self.root / 'reports/a/updates/remote-failure.json'
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
         self.assertIn('private detail', path.read_text())
-
-
-@unittest.skipUnless(shutil.which('ansible-playbook'), 'Ansible unavailable')
-class UpdatePlaybookTests(unittest.TestCase):
-    def test_real_local_ansible_staging_result_selection_and_cleanup(self):
-        for action in ('plan', 'services', 'apply'):
-            with self.subTest(action=action), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                (root / 'scripts').mkdir()
-                (root / 'playbooks').mkdir()
-                (root / 'results').mkdir()
-                play = (ROOT / 'playbooks/update.yml').read_text().replace('owner: root', f'owner: {os.geteuid()}').replace('group: root', f'group: {os.getegid()}')
-                (root / 'playbooks/update.yml').write_text(play)
-                (root / 'inventory.json').write_text(json.dumps({'all': {'hosts': {'a': {
-                    'ansible_connection': 'local', 'ansible_python_interpreter': sys.executable}}}}))
-                (root / 'ansible.cfg').write_text('[defaults]\ninventory = inventory.json\n'
-                    f'callback_plugins = {ROOT}/callback_plugins\ncallbacks_enabled = ccdc_results\n')
-                # No actual updater/package manager runs in this local fixture.
-                for filename in ('update-services.py', 'discover-listeners'):
-                    (root / 'scripts' / filename).write_text('pass\n')
-                (root / 'scripts/manage-updates').write_text(
-                    'import json, pathlib, sys\nrequest = json.load(sys.stdin)\n'
-                    'pathlib.Path(request["record_path"]).write_text(sys.argv[0])\n'
-                    'print(json.dumps({"schema": 2, "changes": [], "backup_archive": '
-                    '"/var/backups/ccdc-updates/" + str(request.get("token")) + "/missing.tar.gz"}))\n')
-                request = {'action': action, 'record_path': str(root / 'staged_path')}
-                if action == 'apply':
-                    request['token'] = 'a' * 32
-                env = dict(os.environ, ANSIBLE_CONFIG=str(root / 'ansible.cfg'),
-                           CCDC_RESULT_DIR=str(root / 'results'), CCDC_RESULT_TASK='Run guarded update action',
-                           ANSIBLE_NOCOLOR='1')
-                env.pop('ANSIBLE_INVENTORY', None)
-                result = subprocess.run(['ansible-playbook', 'playbooks/update.yml', '--limit', 'a',
-                    '--extra-vars', json.dumps({'ansible_become': False, 'update_request': request,
-                                               'update_backup_destination': str(root / 'backups')})],
-                    cwd=root, env=env, text=True, capture_output=True, timeout=60)
-                response = json.loads((root / 'results/a').read_text())
-                self.assertTrue((root / 'staged_path').exists(), result.stdout + result.stderr)
-                self.assertFalse(Path((root / 'staged_path').read_text()).parent.exists())
-                if action == 'apply':
-                    self.assertNotEqual(result.returncode, 0)
-                    self.assertIn('msg', response)
-                    self.assertNotIn('stdout', response)
-                else:
-                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                    self.assertEqual(json.loads(response['stdout'])['changes'], [])
 
 
 if __name__ == '__main__':

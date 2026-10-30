@@ -1,0 +1,53 @@
+---
+# The only way controller code runs on targets (see controller/remote.py).
+# ccdc_remote: bundle, entry, args, become, connection, payload (all set by the controller).
+# The callback saves the result of the task named "Run host script".
+- name: Run a bundled host script
+  hosts: all
+  gather_facts: false
+  become: false
+  vars:
+    remote: "{{ ccdc_remote }}"
+  tasks:
+    - name: Run and clean up
+      block:
+        - name: Read this login's SSH connection before sudo hides it
+          ansible.builtin.shell: 'printf "%s" "$SSH_CONNECTION"'
+          register: remote_connection
+          changed_when: false
+          check_mode: false
+          when: remote.connection | bool
+
+        - name: Allocate a private file for the request payload
+          ansible.builtin.tempfile:
+            state: file
+            prefix: ccdc-payload-
+          register: remote_payload
+          changed_when: false
+          when: remote.payload | length > 0
+
+        - name: Upload the request payload
+          ansible.builtin.copy:
+            src: "{{ remote.payload }}"
+            dest: "{{ remote_payload.path }}"
+            mode: '0600'
+          changed_when: false
+          when: remote.payload | length > 0
+
+        - name: Run host script
+          ansible.builtin.script:
+            cmd: "{{ ([remote.bundle, remote.entry] + remote.args) | map('quote') | join(' ') }}"
+          become: "{{ remote.become | bool }}"
+          environment: >-
+            {{ ({'SSH_CONNECTION': remote_connection.stdout} if remote.connection | bool else {})
+               | combine({'CCDC_PAYLOAD': remote_payload.path} if remote.payload | length > 0 else {}) }}
+          register: ccdc_remote_result
+          changed_when: false
+          check_mode: false
+      always:
+        - name: Remove the request payload
+          ansible.builtin.file:
+            path: "{{ remote_payload.path }}"
+            state: absent
+          changed_when: false
+          when: remote_payload.path is defined

@@ -251,11 +251,12 @@ class SecurityControllerTests(unittest.TestCase):
         self.assertIn('11 additional finding events', output)
         self.assertEqual(output.count('NEW:'), 40)
 
-    def test_lse_transport_uses_pinned_playbook_and_normal_mode(self):
+    def test_lse_transport_uses_the_shared_runner_and_normal_mode(self):
         def run(args, result_dir=None, result_task=None):
-            self.assertEqual(result_task, 'Collect LSE security state')
-            self.assertEqual(args[:2], ['ansible-playbook', 'playbooks/lse.yml'])
-            self.assertFalse(json.loads(args[-1])['lse_deep'])
+            self.assertEqual(result_task, 'Run host script')
+            self.assertEqual(args[:2], ['ansible-playbook', 'playbooks/remote.yml'])
+            request = json.loads(args[args.index('--extra-vars') + 1])['ccdc_remote']
+            self.assertEqual((request['entry'], request['args'], request['become']), ('discover_lse', [], True))
             (Path(result_dir) / 'a').write_text(json.dumps({'stdout': json.dumps(STATE), 'rc': 0}))
             return subprocess.CompletedProcess(args, 0, '', '')
         with patch.object(ctl, 'run', side_effect=run):

@@ -13,8 +13,18 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 
 
+HOST_MODULES = {'discover-ssh', 'apply-ssh', 'discover-firewall', 'discover-listeners', 'discover-integrity',
+                'discover-lse', 'manage-updates', 'update-services.py', 'lse_extras.py', 'kernel_risks.py',
+                'lse_host_risks.py'}
+
+
 def load(name):
-    loader = importlib.machinery.SourceFileLoader(name.replace('-', '_'), str(ROOT / 'scripts' / name))
+    """Load a controller script from scripts/, or a host module from host/ (given by its old file name)."""
+    if name in HOST_MODULES:
+        path = ROOT / 'host' / (name.removesuffix('.py').replace('-', '_') + '.py')
+    else:
+        path = ROOT / 'scripts' / name
+    loader = importlib.machinery.SourceFileLoader(name.replace('-', '_'), str(path))
     spec = importlib.util.spec_from_loader(loader.name, loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
@@ -61,7 +71,7 @@ class ControllerTests(unittest.TestCase):
             ctl.inventory()
 
     def test_batch_keeps_success_when_host_unreachable(self):
-        def fake_run(args, result_dir=None):
+        def fake_run(args, result_dir=None, result_task=None):
             directory = Path(result_dir)
             (directory / 'a').write_text(json.dumps({'stdout': json.dumps(SSH), 'rc': 0}))
             (directory / 'b').write_text(json.dumps({'unreachable': True, 'msg': 'authentication failed'}))
@@ -74,7 +84,7 @@ class ControllerTests(unittest.TestCase):
     def test_remote_script_failure_reports_json_error_not_ssh_close_notice(self):
         error = 'unsupported xtables compat expression, use iptables-nft with this ruleset'
         for stream in ('stdout', 'stderr'):
-            def fake_run(args, result_dir=None):
+            def fake_run(args, result_dir=None, result_task=None):
                 response = {'rc': 1, 'failed': True, 'msg': 'non-zero return code',
                             'stdout': '', 'stderr': 'Shared connection to 127.0.0.1 closed.\r\n'}
                 response[stream] = json.dumps({'error': error}) + '\r\n'
@@ -86,7 +96,7 @@ class ControllerTests(unittest.TestCase):
                 self.assertEqual(errors, {'a': error})
 
     def test_remote_script_failure_retains_non_json_diagnostics(self):
-        def fake_run(args, result_dir=None):
+        def fake_run(args, result_dir=None, result_task=None):
             response = {'rc': 1, 'stdout': 'sudo: permission denied\r\n',
                         'stderr': 'Shared connection to 127.0.0.1 closed.\r\n'}
             (Path(result_dir) / 'a').write_text(json.dumps(response))
@@ -193,11 +203,11 @@ class ControllerTests(unittest.TestCase):
         def collect(kind, hosts, args=()):
             calls.append(('discover', hosts[0]))
             return {hosts[0]: SSH}, {}
-        def play(name, host, variables):
+        def act(host, entry, args=(), **options):
             calls.append(('apply', host))
-            self.assertFalse(variables['password_auth'])
+            self.assertEqual((entry, list(args)), ('apply_ssh', ['no']))
             return True
-        with patch.object(ctl, 'collect', side_effect=collect), patch.object(ctl, 'playbook', side_effect=play), \
+        with patch.object(ctl, 'collect', side_effect=collect), patch.object(ctl, 'act', side_effect=act), \
                 patch.object(ctl, 'ask', side_effect=['a', 'y', 'reuse', 'y']):
             self.assertFalse(ctl.configure_ssh(['a', 'b']))
         self.assertEqual(calls, [('discover', 'a'), ('apply', 'a'), ('discover', 'a'),
@@ -215,18 +225,21 @@ class ControllerTests(unittest.TestCase):
             if '[y] apply all' in prompt:
                 events.append(('aggregate-confirmed',))
             return answer
-        def apply(name, host, variables):
-            if variables.get('firewall_action') == 'prepare':
-                self.assertFalse(events)
-                events.append(('prepare', host))
-                return True
+        def prepare(name, host):
+            self.assertEqual(name, 'network-tools')
+            self.assertFalse(events)
+            events.append(('prepare', host))
+            return True
+        def apply(host, entry, args=(), **options):
+            self.assertEqual(entry, 'discover_firewall')
             self.assertIn(('aggregate-confirmed',), events)
             self.assertTrue((self.root / 'reports/rollback' / host / 'firewall.json').is_file())
-            self.assertEqual(variables['firewall_tcp_ports'], [22, 3000])
+            self.assertEqual(args[0], '--apply')
+            self.assertEqual(json.loads(args[1]), {'tcp': [22, 3000], 'udp': []})
             events.append(('apply', host))
             return True
         with patch.object(ctl, 'collect', side_effect=collect), patch.object(ctl, 'ask', side_effect=ask), \
-                patch.object(ctl, 'playbook', side_effect=apply):
+                patch.object(ctl, 'playbook', side_effect=prepare), patch.object(ctl, 'act', side_effect=apply):
             self.assertFalse(ctl.configure_firewall(['a', 'b']))
         self.assertEqual(events[0], ('prepare', 'a:b'))
         self.assertEqual([event for event in events if event[0] == 'apply'], [('apply', 'a'), ('apply', 'b')])
@@ -238,12 +251,12 @@ class ControllerTests(unittest.TestCase):
         with patch.object(ctl, 'collect', side_effect=collect), patch.object(ctl, 'ask', side_effect=['y', 'n']), \
                 patch.object(ctl, 'playbook') as play:
             self.assertFalse(ctl.configure_firewall(['a']))
-        play.assert_called_once_with('firewall', 'a', {'firewall_action': 'prepare'})
+        play.assert_called_once_with('network-tools', 'a')
 
     def test_firewall_preparation_failure_stops_before_discovery(self):
         with patch.object(ctl, 'playbook', return_value=False) as play, patch.object(ctl, 'collect') as collect:
             self.assertTrue(ctl.configure_firewall(['a']))
-        play.assert_called_once_with('firewall', 'a', {'firewall_action': 'prepare'})
+        play.assert_called_once_with('network-tools', 'a')
         collect.assert_not_called()
 
     def test_firewall_refuses_to_close_nonstandard_ssh_port(self):
@@ -253,7 +266,7 @@ class ControllerTests(unittest.TestCase):
         with patch.object(ctl, 'collect', side_effect=collect), patch.object(ctl, 'ask', side_effect=['y', 'y']), \
                 patch.object(ctl, 'playbook') as play:
             self.assertTrue(ctl.configure_firewall(['a']))
-        play.assert_called_once_with('firewall', 'a', {'firewall_action': 'prepare'})
+        play.assert_called_once_with('network-tools', 'a')
 
     def test_listener_reports_cover_every_host_and_failure(self):
         with patch.object(ctl, 'collect', return_value=({'a': [LISTENER]}, {'b': 'unreachable'})):
