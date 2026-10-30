@@ -8,7 +8,7 @@ import runpy
 import sys
 
 ENTRIES = (
-    "apply_ssh", "discover_firewall", "discover_integrity", "discover_listeners",
+    "apply_fixes", "apply_ssh", "discover_firewall", "discover_integrity", "discover_listeners",
     "discover_lse", "discover_ssh", "manage_updates",
 )
 

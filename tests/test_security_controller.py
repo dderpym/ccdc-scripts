@@ -184,7 +184,7 @@ class SecurityControllerTests(unittest.TestCase):
                         patch.object(ctl, 'security_status', return_value=False) as status:
                     self.assertFalse(ctl.main())
                     select.assert_called_once_with(host)
-                    status.assert_called_once_with(kind, [host], deep)
+                    status.assert_called_once_with(kind, [host], deep, None)
 
     def test_intervals_use_inventory_and_independent_defaults(self):
         result = ctl.polling_intervals(list(ctl.POLL_INTERVALS), ['a', 'b'], {'a': {'lse_poll_interval': 240}})
@@ -270,3 +270,37 @@ class SecurityControllerTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FixOfferTests(SecurityControllerTests):
+    def state(self, tier='simple', uid=0):
+        fix = {'path': '/etc/x', 'mode': 0o644, 'uid': uid, 'gid': 0, 'tier': tier,
+               'was': {'mode': 0o666, 'uid': 5 if uid == 0 and tier == 'all' else 0, 'gid': 0}}
+        return {'findings': [dict(FINDING, fix=fix)], 'raw': '', 'errors': []}
+
+    def offer(self, state, auto=None, tty=False, answers=()):
+        with patch.object(ctl.sys.stdin, 'isatty', return_value=tty), \
+                patch.object(ctl, 'ask', side_effect=list(answers)), \
+                patch.object(ctl, 'act', return_value=True) as act:
+            ctl.offer_fixes('a', state, auto)
+        return act
+
+    def test_non_interactive_without_flag_never_mutates(self):
+        self.assertFalse(self.offer(self.state()).called)
+
+    def test_prompt_applies_only_on_yes(self):
+        self.assertFalse(self.offer(self.state(), tty=True, answers=['n']).called)
+        act = self.offer(self.state(), tty=True, answers=['y'])
+        self.assertEqual(act.call_args.args[:2], ('a', 'apply_fixes'))
+
+    def test_auto_apply_simple_skips_ownership_changes_without_a_tty(self):
+        self.assertTrue(self.offer(self.state('simple'), auto='simple').called)
+        self.assertFalse(self.offer(self.state('all'), auto='simple').called)
+        self.assertTrue(self.offer(self.state('all'), auto='all').called)
+
+    def test_malformed_fixes_are_ignored(self):
+        state = self.state()
+        state['findings'][0]['fix']['path'] = 'relative'
+        self.assertFalse(self.offer(state, auto='all').called)
+        state['findings'][0]['fix'] = {'tier': 'all', 'path': '/x'}
+        self.assertFalse(self.offer(state, auto='all').called)

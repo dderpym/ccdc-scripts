@@ -13,7 +13,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 
 
-HOST_MODULES = {'discover-ssh', 'apply-ssh', 'discover-firewall', 'discover-listeners', 'discover-integrity',
+HOST_MODULES = {'apply-fixes', 'discover-ssh', 'apply-ssh', 'discover-firewall', 'discover-listeners', 'discover-integrity',
                 'discover-lse', 'manage-updates', 'update-services.py', 'lse_extras.py', 'kernel_risks.py',
                 'lse_host_risks.py'}
 

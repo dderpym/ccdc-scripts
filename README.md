@@ -750,6 +750,17 @@ check. Its source of truth is the operating system/package database, **not an
 initial competition baseline**. Anything differing from known package/system
 state remains visible until fixed. There is no integrity baseline command.
 
+Permission and ownership findings on regular files/directories carry a fix. On a
+terminal the scan offers each one (`y`/`n`/`a` all remaining/`q` stop); nothing
+changes without a `y`, and non-interactive runs never change anything.
+`--auto-apply=simple` applies mode-only fixes without asking (ownership changes
+are still prompted, or skipped without a terminal); `--auto-apply=all` also
+applies ownership changes. Fixes are absolute targets (distro-expected values,
+group/other write and secret exposure removed), applied by `host/apply_fixes.py`
+through the file descriptor, never through symlinks. Package-content changes
+are not fixable and stay as findings; re-run the scan to verify. LSE accepts the
+flag but has no fixes yet.
+
 Normal verification uses Alpine `apk audit --system --check-permissions` (with
 installed-option detection), plus a bounded native `--backup` audit of `/etc`
 because `--system` skips protected configuration contents. Added-file codes from

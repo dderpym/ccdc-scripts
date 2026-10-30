@@ -702,7 +702,69 @@ def scan(kind, hosts, deep=False):
     return valid, errors
 
 
-def security_status(kind, hosts, deep=False):
+def fix_plan(state):
+    """Valid, de-duplicated fixes carried by scanner findings, in finding order."""
+    seen, fixes = set(), []
+    for finding in state["findings"]:
+        fix = finding.get("fix")
+        if not isinstance(fix, dict) or fix.get("tier") not in ("simple", "all"):
+            continue
+        try:
+            keys = ("mode", "uid", "gid")
+            clean = {"path": fix["path"], **{key: fix[key] for key in keys}}
+            was = {key: fix["was"][key] for key in keys}
+        except (KeyError, TypeError):
+            continue
+        if (not isinstance(clean["path"], str) or not clean["path"].startswith("/")
+                or not all(type(v) is int and v >= 0 for v in (*clean.values(), *was.values())[1:])):
+            continue
+        if (clean["path"], clean["mode"], clean["uid"], clean["gid"]) not in seen:
+            seen.add((clean["path"], clean["mode"], clean["uid"], clean["gid"]))
+            fixes.append((fix["tier"], clean, was))
+    return fixes
+
+
+def describe_fix(clean, was):
+    parts = []
+    if clean["mode"] != was["mode"]:
+        parts.append(f"mode {was['mode']:04o} -> {clean['mode']:04o}")
+    if (clean["uid"], clean["gid"]) != (was["uid"], was["gid"]):
+        parts.append(f"owner {was['uid']}:{was['gid']} -> {clean['uid']}:{clean['gid']}")
+    return terminal(clean["path"]) + ": " + ", ".join(parts)
+
+
+def offer_fixes(host, state, auto=None):
+    """Prompt per fix (TTY only), or apply without asking per --auto-apply simple|all."""
+    fixes = fix_plan(state)
+    interactive = sys.stdin.isatty()
+    if not fixes or not (interactive or auto):
+        return
+    print(f"\n{len(fixes)} fixable finding(s) on {host}:")
+    approved, everything = [], False
+    for tier, clean, was in fixes:
+        line = describe_fix(clean, was)
+        if everything or auto == "all" or (auto == "simple" and tier == "simple"):
+            print("  applying  " + line)
+            approved.append(clean)
+        elif not interactive:
+            print("  skipped (ownership change needs --auto-apply=all)  " + line)
+        else:
+            answer = ask(f"  {line}\n  Apply? [y/N/a=yes to all remaining/q=stop]", ["y", "n", "a", "q"], "n")
+            if answer == "q":
+                break
+            everything = everything or answer == "a"
+            if answer in ("y", "a"):
+                approved.append(clean)
+    if not approved:
+        return
+    with tempfile.NamedTemporaryFile(mode="w", prefix="ccdc-fixes-", suffix=".json") as out:
+        json.dump(approved, out)
+        out.flush()
+        success = act(host, "apply_fixes", connection=False, payload=out.name)
+    print(("Applied " if success else "Some fixes FAILED on ") + f"{host}; re-run the scan to verify.")
+
+
+def security_status(kind, hosts, deep=False, auto=None):
     states, errors = scan(kind, hosts, deep)
     active = bool(errors)
     for host in hosts:
@@ -740,6 +802,7 @@ def security_status(kind, hosts, deep=False):
         if state.get("errors"):
             print("Scan incomplete; absence of findings does not prove clean state.")
         active = active or bool(findings or state.get("errors"))
+        offer_fixes(host, state, auto)
     return active
 
 
@@ -907,10 +970,13 @@ def argument_parser():
     cmd.add_argument("target", nargs="?", default="all")
     cmd.add_argument("--yes", action="store_true", help="install saved reviewed packages without confirmation; never approves service restarts")
     for command in SCANNERS:
-        cmd = sub.add_parser(command, help="read-only current security findings; no baseline")
+        cmd = sub.add_parser(command, help="current security findings, no baseline; offers fixes for fixable findings on a terminal")
         cmd.add_argument("action_or_target", nargs="?", default="status", metavar="[status|HOST]")
         cmd.add_argument("target", nargs="?", help="inventory hostname (after status)")
         cmd.add_argument("--deep", action="store_true", help="manual deeper scan; never used by monitor")
+        cmd.add_argument("--auto-apply", choices=["simple", "all"],
+                         help="apply fixes without prompting: simple = permission-mode only, all = also ownership; "
+                              "without it, fixes are offered interactively on a terminal")
     cmd = sub.add_parser("monitor")
     cmd.add_argument("kind", nargs="?", choices=list(POLL_INTERVALS))
     cmd.add_argument("--host", default="all")
@@ -1031,7 +1097,7 @@ def main():
             parser.error("use MODULE [status] [HOST]")
         target = (args.target or "all") if args.action_or_target == "status" else args.action_or_target
         hosts, _ = select(target)
-        return security_status(args.command, hosts, args.deep)
+        return security_status(args.command, hosts, args.deep, args.auto_apply)
     hosts, variables = select(args.target)
     if args.command == "update":
         updates = runpy.run_path(str(ROOT / "scripts/update-controller.py"))["updates"]

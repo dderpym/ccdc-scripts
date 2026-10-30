@@ -297,18 +297,36 @@ def file_metadata(path):
             'symlink': os.readlink(path) if stat.S_ISLNK(info.st_mode) else None}
 
 
+def plan_fix(row, expected, changes, checks):
+    """Absolute target mode/owner that resolves the fixable part of a finding.
+
+    'simple' fixes change only the mode; ownership changes are tier 'all'.
+    """
+    if row['type'] not in (stat.S_IFREG, stat.S_IFDIR) or {'type', 'symlink'} & set(changes):
+        return None
+    target = {key: row[key] for key in ('mode', 'uid', 'gid')}
+    for key in changes:
+        if key in target:
+            target[key] = expected[key]
+    if any('writable' in check for check in checks):
+        target['mode'] &= ~0o022
+    if 'secret accessible to other users' in checks:
+        target['mode'] &= ~0o007
+    if any(check.startswith('not root-owned') for check in checks):
+        target['uid'] = 0
+    if all(target[key] == row[key] for key in target):
+        return None
+    return dict(path=row['path'], **target, was={key: row[key] for key in target},
+                tier='simple' if (target['uid'], target['gid']) == (row['uid'], row['gid']) else 'all')
+
+
 def security_checks(result, row, expected=None, secret=False):
     path = row['path']
+    changes = []
     if expected:
         row['expected'] = expected
         changes = [key for key in ('uid', 'gid', 'mode', 'type', 'symlink')
                    if key in expected and expected[key] is not None and row[key] != expected[key]]
-        if changes:
-            def display(values):
-                return {key: format(values[key], '04o') if key == 'mode' else values[key] for key in changes}
-            finding(result, 'metadata', path, 'critical',
-                    'Critical path differs from distro metadata: ' + ', '.join(changes), checks=changes,
-                    expected=display(expected), observed=display(row))
     # Explicit conservative security policy, NOT exact "default" permissions.
     # Group IDs vary (shadow, wheel, root); no blanket gid==0 expectation.
     # Symlink 0777 is normal; evaluate ownership and then its referent instead.
@@ -327,9 +345,17 @@ def security_checks(result, row, expected=None, secret=False):
                 checks.append('unexpected critical path type')
         if secret and row['type'] != stat.S_IFDIR and row['mode'] & 0o007:
             checks.append('secret accessible to other users')
+    fix = plan_fix(row, expected, changes, checks)
+    extra = {'fix': fix} if fix else {}
+    if changes:
+        def display(values):
+            return {key: format(values[key], '04o') if key == 'mode' else values[key] for key in changes}
+        finding(result, 'metadata', path, 'critical',
+                'Critical path differs from distro metadata: ' + ', '.join(changes), checks=changes,
+                expected=display(expected), observed=display(row), **extra)
     row['policy'] = 'root-owned; no group/other writes; regular file/directory or secure symlink; secrets not accessible to others'
     if checks:
-        finding(result, 'policy', path, 'critical', 'Critical-path security policy: ' + ', '.join(checks), checks=checks)
+        finding(result, 'policy', path, 'critical', 'Critical-path security policy: ' + ', '.join(checks), checks=checks, **extra)
 
 
 def critical_paths(result):

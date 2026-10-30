@@ -423,3 +423,64 @@ class CommandTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FixPlanTests(unittest.TestCase):
+    def fix(self, row, expected=None, secret=False):
+        result = integrity.document()
+        integrity.security_checks(result, row, expected, secret=secret)
+        return [f.get('fix') for f in result['findings']]
+
+    def row(self, **fields):
+        return dict({'path': '/etc/x', 'uid': 0, 'gid': 0, 'mode': 0o644,
+                     'type': stat.S_IFREG, 'symlink': None}, **fields)
+
+    def test_group_other_write_and_secret_exposure_are_simple_mode_fixes(self):
+        fix, = self.fix(self.row(mode=0o666), secret=True)
+        self.assertEqual((fix['mode'], fix['uid'], fix['gid'], fix['tier']), (0o640, 0, 0, 'simple'))
+        self.assertEqual(fix['was']['mode'], 0o666)
+
+    def test_foreign_owner_without_distro_data_is_an_all_tier_fix(self):
+        fix, = self.fix(self.row(uid=1000))
+        self.assertEqual((fix['uid'], fix['tier']), (0, 'all'))
+
+    def test_distro_expectation_and_policy_yield_one_identical_fix(self):
+        fixes = self.fix(self.row(mode=0o666, uid=5), {'uid': 0, 'gid': 0, 'mode': 0o644})
+        self.assertEqual(len(fixes), 2)
+        self.assertEqual(fixes[0], fixes[1])
+        self.assertEqual((fixes[0]['mode'], fixes[0]['uid']), (0o644, 0))
+
+    def test_type_changes_symlinks_and_special_files_get_no_fix(self):
+        self.assertEqual(self.fix(self.row(mode=0o666), {'type': stat.S_IFLNK}), [None, None])
+        self.assertEqual(self.fix(self.row(type=stat.S_IFLNK, uid=9)), [None])
+        self.assertEqual(self.fix(self.row(type=stat.S_IFIFO, mode=0o666)), [None])
+
+
+class ApplyFixTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.apply = load('apply-fixes')
+
+    def fix(self, path, mode):
+        return {'path': str(path), 'mode': mode, 'uid': os.getuid(), 'gid': os.getgid()}
+
+    def test_sets_mode_on_files_and_directories(self):
+        (self.root / 'f').write_text('x')
+        (self.root / 'd').mkdir()
+        for name, mode in (('f', 0o600), ('d', 0o700)):
+            self.apply.apply(self.fix(self.root / name, mode))
+            self.assertEqual(stat.S_IMODE((self.root / name).stat().st_mode), mode)
+
+    def test_refuses_symlinks_special_files_and_bad_requests(self):
+        (self.root / 'f').write_text('x')
+        (self.root / 'link').symlink_to(self.root / 'f')
+        os.mkfifo(self.root / 'fifo')
+        for path in ('link', 'fifo'):
+            with self.assertRaises((OSError, ValueError)):
+                self.apply.apply(self.fix(self.root / path, 0o600))
+        for bad in (dict(self.fix(self.root / 'f', 0o600), path='f'),
+                    self.fix(self.root / 'f', 0o10000), self.fix(self.root / 'f', True)):
+            with self.assertRaises(ValueError):
+                self.apply.apply(bad)
