@@ -3,7 +3,7 @@
 
 No args: deterministic effective state; --snapshot: separate restorable JSON.
 --apply '{"tcp":[22],"udp":[]}': enforce and verify, restoring on failure.
---restore FILE: restore the controller's snapshot, never stop a manager.
+--restore FILE: restore the controller's snapshot (FILE - reads stdin), never stop a manager.
 
 State keys: backend (nftables/iptables/none/mixed/ambiguous), rules (complete
 normalized rules plus active manager names), default_inbound (accept/drop/null),
@@ -789,6 +789,19 @@ def self_test():
     print("self-test passed")
 
 
+def require_connection_port(ports):
+    """The login that runs us must stay reachable: its server-side port has to be approved.
+
+    The runner exports SSH_CONNECTION (client addr/port, server addr/port) for SSH
+    logins and omits it for local connections; a present-but-unusable value refuses.
+    """
+    if "SSH_CONNECTION" not in os.environ:
+        return
+    parts = os.environ["SSH_CONNECTION"].split()
+    if len(parts) != 4 or not parts[3].isdigit() or int(parts[3]) not in ports["tcp"]:
+        raise Refusal("Approve the actual server-side SSH connection port before firewall application")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     modes = parser.add_mutually_exclusive_group()
@@ -806,10 +819,15 @@ def main():
         # Ensure manager status output is parseable independently of host locale.
         os.environ["LC_ALL"] = "C"
         if args.apply is not None:
-            result = apply(validate_ports(json.loads(args.apply)))
+            ports = validate_ports(json.loads(args.apply))
+            require_connection_port(ports)
+            result = apply(ports)
         elif args.restore:
-            with open(args.restore) as handle:
-                result = restore(json.load(handle))
+            if args.restore == "-":
+                result = restore(json.load(sys.stdin))
+            else:
+                with open(args.restore) as handle:
+                    result = restore(json.load(handle))
         else:
             info = collect()
             result = snapshot(info) if args.snapshot else state(info)

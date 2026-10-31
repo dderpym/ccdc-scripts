@@ -13,7 +13,7 @@ import unittest
 from test_controller import load
 
 firewall = load('discover-firewall')
-SCRIPT = str(Path(__file__).resolve().parents[1] / 'scripts/discover-firewall')
+SCRIPT = str(Path(__file__).resolve().parents[1] / 'host/discover_firewall.py')
 
 
 def integration(script, parent_netns):

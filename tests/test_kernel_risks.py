@@ -353,3 +353,20 @@ class KernelRiskTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class UsernsFindingTests(unittest.TestCase):
+    P = '/proc/sys/kernel/unprivileged_userns_clone'
+    M = '/proc/sys/user/max_user_namespaces'
+
+    def test_enabled_sysctls_produce_a_sysctl_fix(self):
+        row = kernel.userns_finding({self.P: '1', self.M: '15000'})
+        fix, = row['fixes']
+        self.assertEqual(fix['settings'], {'kernel.unprivileged_userns_clone': '0', 'user.max_user_namespaces': '0'})
+        self.assertEqual(fix['was']['user.max_user_namespaces'], '15000')
+
+    def test_only_enabled_knobs_are_listed_and_disabled_or_unknown_is_clean(self):
+        row = kernel.userns_finding({self.P: '0', self.M: '15000'})
+        self.assertEqual(set(row['fixes'][0]['settings']), {'user.max_user_namespaces'})
+        self.assertIsNone(kernel.userns_finding({self.P: '0', self.M: '0'}))
+        self.assertIsNone(kernel.userns_finding({self.P: 'unknown', self.M: 'unknown'}))

@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location(
-    "lse_extras", Path(__file__).resolve().parents[1] / "scripts/lse_extras.py")
+    "lse_extras", Path(__file__).resolve().parents[1] / "host/lse_extras.py")
 extras = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(extras)
 

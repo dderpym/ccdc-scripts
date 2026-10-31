@@ -1,24 +1,28 @@
 #!/usr/bin/env python3
 """Run the vendored LSE on this host; stdout is one JSON object, even on failure.
 
---script is a local pinned lse.sh, never a URL. --deep expands the allowlist.
+The pinned lse.sh ships inside the bundle; --script overrides it with a local file, never a URL. --deep expands the allowlist.
 Passive supplemental permission/kernel checks share the same finding contract.
 Findings are review candidates relative to the invoking user's permissions.
 The repository's expected oski passwordless sudo stays in raw evidence only.
 raw retains complete scanner output; only normalized findings reach the terminal.
 """
 import argparse
+import contextlib
+import importlib.resources
 import json
 import os
 from pathlib import Path
 import pwd
 import re
-import runpy
 import shlex
 import signal
+import stat
 import shutil
 import subprocess
 import tempfile
+
+from host import kernel_risks, lse_extras, lse_host_risks
 
 # Only these tests become findings. Dependencies run but are never inventory.
 # Values: minimum scan profile (0=normal, 1=deep), severity, stable summary.
@@ -78,6 +82,43 @@ ROOT_PERMISSION_TESTS = {
     "ret010", "ret050", "ret060", "ret510", "srv000", "srv500",
     "sof000", "sof010", "sof130", "sof160", "ctn020", "ctn210",
 }
+
+
+# Permission tests whose affirmative path evidence has a mechanical fix:
+# bits to clear, and whether a non-root owner of a system path becomes root.
+PERMISSION_FIXES = {
+    "fst030": (0o022, True), "fst160": (0o022, True), "fst170": (0o022, True),
+    "fst180": (0o022, False),  # PATH entries may legitimately be the user's own
+    "sys030": (0o007, False),
+}
+EVIDENCE_PATH = re.compile(r"^[bcdlps-][rwxStTs-]{9}[.+@]?\s+\S+\s+\S+\s+(/.+)$")
+MAX_FIXES = 50
+
+
+def permission_fixes(test_id, contexts, lstat=os.lstat):
+    """Absolute-target fixes for regular files/directories named in the evidence."""
+    clear, chown_root = PERMISSION_FIXES[test_id]
+    fixes, seen = [], set()
+    for context in contexts:
+        for line in context["evidence"]:
+            match = EVIDENCE_PATH.match(line)
+            path = match[1] if match else line if line.startswith("/") else None
+            if path is None or path in seen or len(fixes) >= MAX_FIXES:
+                continue
+            seen.add(path)
+            try:
+                info = lstat(path)
+            except OSError:
+                continue
+            kind = stat.S_IFMT(info.st_mode)
+            if kind not in (stat.S_IFREG, stat.S_IFDIR) or (kind == stat.S_IFDIR and info.st_mode & stat.S_ISVTX):
+                continue
+            was = {"mode": stat.S_IMODE(info.st_mode), "uid": info.st_uid, "gid": info.st_gid}
+            target = dict(was, mode=was["mode"] & ~clear, uid=0 if chown_root else was["uid"])
+            if target != was:
+                fixes.append(dict(path=path, **target, was=was,
+                                  tier="simple" if target["uid"] == was["uid"] else "all"))
+    return fixes
 
 
 def clean(text):
@@ -165,7 +206,11 @@ def parse(text, deep=False):
     for test_id, contexts in sorted(grouped.items()):
         _, severity, summary = TESTS[test_id]
         contexts.sort(key=lambda item: json.dumps(item, sort_keys=True))
-        findings.append({"id": test_id, "severity": severity, "summary": summary, "context": contexts})
+        row = {"id": test_id, "severity": severity, "summary": summary, "context": contexts}
+        fixes = permission_fixes(test_id, contexts) if test_id in PERMISSION_FIXES else []
+        if fixes:
+            row["fixes"] = fixes
+        findings.append(row)
     errors = ["LSE ran as root; permission checks cannot assess an unprivileged account"] if root else []
     return {"findings": findings, "raw": raw, "errors": errors}
 
@@ -299,17 +344,16 @@ def scan_lse(script, deep=False):
 
 
 def supplemental_scan(raw, deep=False, capability_status=None):
-    """Helpers travel with this wrapper; never import scanner code from the target PATH."""
+    """Helpers ship in the same bundle; never import scanner code from the target PATH."""
     states = []
-    for filename, entry, args in (
-            ('lse_extras.py', 'scan', (raw, capability_status)),
-            ('kernel_risks.py', 'inspect_kernel', (deep,)),
-            ('lse_host_risks.py', 'scan', (deep,))):
+    for name, helper, args in (
+            ('lse_extras', lse_extras.scan, (raw, capability_status)),
+            ('kernel_risks', kernel_risks.inspect_kernel, (deep,)),
+            ('lse_host_risks', lse_host_risks.scan, (deep,))):
         try:
-            helper = runpy.run_path(str(Path(__file__).with_name(filename)))[entry]
             states.append(helper(*args))
         except (OSError, ValueError, KeyError, RuntimeError) as exc:
-            states.append({'findings': [], 'raw': '', 'errors': [filename + ': ' + str(exc)]})
+            states.append({'findings': [], 'raw': '', 'errors': [name + ': ' + str(exc)]})
     return states
 
 
@@ -330,15 +374,25 @@ def scan(script, deep=False):
     return result
 
 
+@contextlib.contextmanager
+def bundled_script():
+    """The pinned lse.sh as a private file; /bin/sh runs it, so no exec bit is needed."""
+    with tempfile.TemporaryDirectory(prefix="ccdc-lse-pin-") as directory:
+        path = Path(directory) / "lse.sh"
+        path.write_bytes(importlib.resources.files("host").joinpath("data/lse.sh").read_bytes())
+        yield path
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--script", required=True, help="path to local vendor/lse.sh")
+    parser.add_argument("--script", help="path to a local lse.sh (default: the pinned copy in the bundle)")
     parser.add_argument("--deep", action="store_true", help="include actionable level-1 checks")
     parser.add_argument("--user", help="unprivileged account to assess when started as root (default SUDO_USER)")
     args = parser.parse_args()
     drop_privileges(args.user)
     try:
-        result = scan(args.script, args.deep)
+        with (contextlib.nullcontext(args.script) if args.script else bundled_script()) as script:
+            result = scan(script, args.deep)
     except OSError as exc:
         result = {"findings": [], "raw": "", "errors": [str(exc)]}
     print(json.dumps(result, sort_keys=True))

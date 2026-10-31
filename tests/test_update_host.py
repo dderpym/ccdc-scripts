@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
-loader = importlib.machinery.SourceFileLoader('manage_updates', str(ROOT / 'scripts/manage-updates'))
+loader = importlib.machinery.SourceFileLoader('manage_updates', str(ROOT / 'host/manage_updates.py'))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 updates = importlib.util.module_from_spec(spec)
 loader.exec_module(updates)
@@ -488,8 +488,8 @@ class UpdateHostTests(unittest.TestCase):
         before = [{'name': 'nginx', 'running': True}]
         for init in ('systemd', 'openrc'):
             with patch.object(updates, 'platform', return_value=('apt', self.plan['platform'], init)), \
-                    patch.object(updates.runpy, 'run_path', return_value={
-                        'inspect_services': inspect, 'restart_service': restart}) as load, \
+                    patch.object(updates.update_services, 'inspect_services', inspect), \
+                    patch.object(updates.update_services, 'restart_service', restart), \
                     patch.object(updates, 'installed') as installed:
                 self.assertEqual(updates.execute({'action': 'services'}), {'services': []})
                 inspect.assert_called_with(init, before=None)
@@ -498,7 +498,6 @@ class UpdateHostTests(unittest.TestCase):
                 result = updates.execute({'action': 'restart', 'service': 'nginx', 'before': before})
                 self.assertEqual(result, {'restarted': 'nginx'})
                 restart.assert_called_with(init, 'nginx', before=before)
-                load.assert_called_with(str(ROOT / 'scripts/update-services.py'))
                 installed.assert_not_called()
 
     def test_apt_simulation(self):

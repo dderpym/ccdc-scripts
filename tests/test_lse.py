@@ -48,17 +48,18 @@ FIXTURE = (
 
 
 def passive_fixtures(directory):
-    """Keep real wrapper/playbook transports, but never scan the development host."""
-    directory = Path(directory)
-    (directory / 'lse_extras.py').write_text(
+    """A private host/ package whose passive helpers are stubs: real wrapper, no host scan."""
+    package = Path(directory) / 'host'
+    package.mkdir(parents=True, exist_ok=True)
+    (package / '__init__.py').write_text('')
+    (package / 'lse_extras.py').write_text(
         "def scan(raw, capability_status=None):\n    return {'findings': [], 'raw': '', 'errors': []}\n")
-    (directory / 'kernel_risks.py').write_text(
+    (package / 'kernel_risks.py').write_text(
         "def inspect_kernel(deep=False):\n    return {'findings': [], 'raw': '', 'errors': []}\n")
-    (directory / 'lse_host_risks.py').write_text(
+    (package / 'lse_host_risks.py').write_text(
         "def scan(deep=False):\n    return {'findings': [], 'raw': '', 'errors': []}\n")
-    wrapper = directory / 'discover-lse'
-    shutil.copyfile(ROOT / 'scripts/discover-lse', wrapper)
-    return wrapper
+    shutil.copyfile(ROOT / 'host/discover_lse.py', package / 'discover_lse.py')
+    return [sys.executable, '-m', 'host.discover_lse']
 
 
 class LSETests(unittest.TestCase):
@@ -86,22 +87,20 @@ class LSETests(unittest.TestCase):
         calls = []
         state = {'findings': [], 'raw': '', 'errors': []}
 
-        def helper(path):
-            name = Path(path).name
-            self.assertEqual(Path(path).parent, ROOT / 'scripts')
-            if name == 'kernel_risks.py':
-                raise ValueError('fixture failure')
+        def helper(name):
             def scan(*args):
                 calls.append((name, args))
                 return dict(state)
-            return {'scan': scan}
+            return scan
 
-        with patch.object(lse.runpy, 'run_path', side_effect=helper):
+        with patch.object(lse.lse_extras, 'scan', helper('lse_extras')), \
+                patch.object(lse.kernel_risks, 'inspect_kernel', side_effect=ValueError('fixture failure')), \
+                patch.object(lse.lse_host_risks, 'scan', helper('lse_host_risks')):
             states = SUPPLEMENTAL_SCAN('fixture raw', True, 7)
         self.assertEqual(len(states), 3)
-        self.assertEqual(calls, [('lse_extras.py', ('fixture raw', 7)),
-                                 ('lse_host_risks.py', (True,))])
-        self.assertEqual(states[1]['errors'], ['kernel_risks.py: fixture failure'])
+        self.assertEqual(calls, [('lse_extras', ('fixture raw', 7)),
+                                 ('lse_host_risks', (True,))])
+        self.assertEqual(states[1]['errors'], ['kernel_risks: fixture failure'])
         self.assertEqual(states[2:], [state])
 
     def test_native_capability_exit_receipt_does_not_repeat_enumeration(self):
@@ -211,10 +210,11 @@ class LSETests(unittest.TestCase):
                               'read answer && exit 8\n'
                               'printf "%s\\n" "level=$4" "selection=$8" >&2\n'
                               "cat <<'OUTPUT'\n" + FIXTURE + 'OUTPUT\nexit 3\n')
-            wrapper = passive_fixtures(directory)
+            command = passive_fixtures(directory)
             for deep in (False, True):
-                args = [sys.executable, str(wrapper), '--script', str(script)]
-                result = subprocess.run(args + (['--deep'] if deep else []), capture_output=True, text=True, timeout=10)
+                args = command + ['--script', str(script)]
+                result = subprocess.run(args + (['--deep'] if deep else []), capture_output=True, text=True,
+                                        timeout=10, cwd=directory)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stderr, '')
                 state = json.loads(result.stdout)
@@ -227,9 +227,9 @@ class LSETests(unittest.TestCase):
 
     def test_missing_script_returns_json_error(self):
         with tempfile.TemporaryDirectory() as directory:
-            wrapper = passive_fixtures(directory)
-            result = subprocess.run([sys.executable, str(wrapper), '--script', '/nonexistent/ccdc/lse.sh'],
-                                    capture_output=True, text=True, timeout=10)
+            command = passive_fixtures(directory)
+            result = subprocess.run(command + ['--script', '/nonexistent/ccdc/lse.sh'],
+                                    capture_output=True, text=True, timeout=10, cwd=directory)
         state = json.loads(result.stdout)
         self.assertEqual(result.returncode, 0)
         self.assertEqual(state['findings'], [])
@@ -305,57 +305,51 @@ class LSETests(unittest.TestCase):
         self.assertFalse(Path(popen.call_args.kwargs['env']['TMPDIR']).exists())
         self.assertTrue(popen.call_args.kwargs['start_new_session'])
 
-    @unittest.skipUnless(shutil.which('ansible-playbook'), 'Ansible is optional for offline parser tests')
-    def test_playbook_callback_preserves_stdout_after_cleanup(self):
-        # Copy the deployment layout with a fixture vendor script: exercise the
-        # REAL playbook/modules/callback, without scanning the development host.
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for name in ('playbooks/lse.yml', 'scripts/discover-lse', 'vendor/LSE-LICENSE', 'callback_plugins/ccdc_results.py'):
-                dest = root / name
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copyfile(ROOT / name, dest)
-            passive_fixtures(root / 'scripts')
-            seen = root / 'seen-deployment-directory'
-            (root / 'vendor/lse.sh').write_text('#!/bin/sh\nprintf "%s" "${0%/*}" > "' + str(seen) + '"\n'
-                                               + "cat <<'OUTPUT'\n" + FIXTURE + 'OUTPUT\n')
-            results = root / 'results'
-            results.mkdir(mode=0o700)
-            config = root / 'ansible.cfg'
-            config.write_text('[defaults]\ncallback_plugins = ' + str(root / 'callback_plugins') + '\ncallbacks_enabled = ccdc_results\n')
-            env = dict(os.environ, ANSIBLE_CONFIG=str(config), CCDC_RESULT_DIR=str(results), ANSIBLE_NOCOLOR='1')
-            env.pop('CCDC_RESULT_TASK', None)
-            command = ['ansible-playbook', str(root / 'playbooks/lse.yml'), '-i', 'fixture,', '-c', 'local',
-                       '-e', json.dumps({'ansible_python_interpreter': sys.executable, 'ansible_become': False, 'lse_deep': True})]
-            run = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
-            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-            response = json.loads((results / 'fixture').read_text())
-            self.assertEqual(response['rc'], 0)
-            self.assertEqual(json.loads(response['stdout']), lse.parse(FIXTURE, deep=True))
-            self.assertEqual((results / 'fixture').stat().st_mode & 0o777, 0o600)
-            # The final command argv uses no removed scan path. Cleanup was run.
-            self.assertIn('Remove the host scratch directory', run.stdout)
-            self.assertEqual(response['cmd'][0], sys.executable)
-            self.assertFalse(Path(seen.read_text()).exists())
-            env['CCDC_RESULT_TASK'] = 'Collect LSE security state'
-            (results / 'fixture').unlink()
-            run = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
-            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-            response = json.loads((results / 'fixture').read_text())
-            self.assertEqual(json.loads(response['stdout']), lse.parse(FIXTURE, deep=True))
-            self.assertFalse(Path(seen.read_text()).exists())
-            # A transfer failure must also clean up and publish an errors JSON,
-            # rather than letting a successful cleanup hide the original failure.
-            (root / 'scripts/discover-lse').unlink()
-            run = subprocess.run(command, env=env, capture_output=True, text=True, timeout=60)
-            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
-            response = json.loads((results / 'fixture').read_text())
-            state = json.loads(response['stdout'])
-            self.assertEqual(state['findings'], [])
-            self.assertEqual(state['raw'], '')
-            self.assertTrue(state['errors'])
-            self.assertIn('Remove the host scratch directory', run.stdout)
-
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PermissionFixTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.root = Path(self.directory.name)
+        self.lse = load('discover-lse')
+
+    def fixes(self, test_id, *lines):
+        return self.lse.permission_fixes(test_id, [{'evidence': list(lines)}])
+
+    def test_path_and_listing_evidence_strip_group_other_write(self):
+        suid, conf = self.root / 'suid', self.root / 'conf'
+        suid.write_text('x')
+        conf.write_text('x')
+        suid.chmod(0o4777)
+        conf.chmod(0o666)
+        fixes = self.fixes('fst030', str(suid)) + self.fixes('fst160', f'-rw-rw-rw- {os.getuid()} {os.getgid()} {conf}')
+        self.assertEqual([f['mode'] for f in fixes], [0o4755, 0o644])
+        self.assertEqual({f['tier'] for f in fixes}, {'simple' if os.getuid() == 0 else 'all'})
+
+    def test_path_dirs_keep_owner_and_shadow_only_loses_other_access(self):
+        path = self.root / 'bin'
+        path.mkdir()
+        path.chmod(0o777)
+        fix, = self.fixes('fst180', f'drwxrwxrwx {os.getuid()} {os.getgid()} {path}')
+        self.assertEqual((fix['mode'], fix['uid'], fix['tier']), (0o755, os.getuid(), 'simple'))
+        shadow = self.root / 'shadow'
+        shadow.write_text('x')
+        shadow.chmod(0o644)
+        fix, = self.fixes('sys030', str(shadow))
+        self.assertEqual(fix['mode'], 0o640)
+
+    def test_symlinks_sticky_dirs_missing_and_clean_paths_get_no_fix(self):
+        target, sticky, clean = self.root / 't', self.root / 's', self.root / 'c'
+        target.write_text('x')
+        target.chmod(0o666)
+        (self.root / 'link').symlink_to(target)
+        sticky.mkdir()
+        sticky.chmod(0o1777)
+        clean.write_text('x')
+        clean.chmod(0o600)
+        evidence = [str(self.root / 'link'), str(sticky), str(clean), str(self.root / 'missing'), 'relative']
+        self.assertEqual(self.fixes('fst180', *evidence), [])

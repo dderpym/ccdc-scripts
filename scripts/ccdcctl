@@ -17,6 +17,9 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+from controller import remote  # noqa: E402
+
 EXTRA = shlex.split(os.environ.get("ANSIBLE_ARGS", ""))
 VERBOSE = False
 
@@ -70,16 +73,10 @@ def select(target="all"):
 
 def collect(kind, hosts, args=()):
     """One Ansible batch; retain successful hosts even if another is unreachable."""
-    module_args = shlex.join([str(ROOT / "scripts" / f"discover-{kind}"), *args])
     with tempfile.TemporaryDirectory(prefix="ccdc-results-") as directory:
-        if kind == "lse":
-            result = run(["ansible-playbook", "playbooks/lse.yml", "--limit", ":".join(hosts),
-                          *EXTRA, "--extra-vars", json.dumps({"lse_deep": "--deep" in args})],
-                         result_dir=directory, result_task="Collect LSE security state")
-        else:
-            result = run(["ansible", "all", "--limit", ":".join(hosts), "--become",
-                          "-m", "ansible.builtin.script", "-a", module_args,
-                          *EXTRA], result_dir=directory)
+        result = run(["ansible-playbook", "playbooks/remote.yml", "--limit", ":".join(hosts), *EXTRA,
+                      "--extra-vars", remote.request("discover_" + kind, args)],
+                     result_dir=directory, result_task=remote.TASK)
         states, errors = {}, {}
         for host in hosts:
             try:
@@ -115,6 +112,14 @@ def run_with_vars(args, variables, capture=True, result_dir=None):
 def playbook(name, host="all", variables=None):
     args = ["ansible-playbook", f"playbooks/{name}.yml", "--limit", host, *EXTRA]
     result = run(args, capture=False) if variables is None else run_with_vars(args, variables, capture=False)
+    return result.returncode == 0
+
+
+def act(host, entry, args=(), connection=True, payload=None):
+    """Run one mutating host script with live progress; True when it succeeded."""
+    result = run(["ansible-playbook", "playbooks/remote.yml", "--limit", host, *EXTRA,
+                  "--extra-vars", remote.request(entry, args, connection=connection, payload=payload)],
+                 capture=False)
     return result.returncode == 0
 
 
@@ -393,7 +398,7 @@ def configure_ssh(hosts):
         if not verify_admin_access(host):
             summary.append((host, "unchanged", "unchanged", "FAILED"))
             continue
-        success = playbook("ssh", host, {"password_auth": enabled})
+        success = act(host, "apply_ssh", ["yes" if enabled else "no"])
         states, errors = collect("ssh", [host])
         if not errors:
             show_state("ssh", states[host], "Observed SSH after apply")
@@ -471,7 +476,7 @@ def policy_text(policies):
 
 def configure_firewall(hosts):
     print("Preparing missing networking tools with Ansible; no firewall policy is applied yet.")
-    if not playbook("firewall", ":".join(hosts), {"firewall_action": "prepare"}):
+    if not playbook("network-tools", ":".join(hosts)):
         return True
     print("Default: ALLOW tcp/22, loopback, established/related and essential IPv6 ICMP; BLOCK other unsolicited inbound.")
     print("nft replaces ALL tables atomically (unsafe NAT/forward/output is refused); iptables overrides INPUT.")
@@ -571,8 +576,8 @@ def configure_firewall(hosts):
             continue
         path = ROOT / "reports/rollback" / host / "firewall.json"
         save(path, snapshots[host])
-        success = playbook("firewall", host, {"firewall_action": "apply",
-                                            "firewall_tcp_ports": policy["tcp"], "firewall_udp_ports": policy["udp"]})
+        success = act(host, "discover_firewall",
+                      ["--apply", json.dumps({"tcp": policy["tcp"], "udp": policy["udp"]})])
         observed, failure = collect("firewall", [host])
         if failure:
             problems(failure)
@@ -581,6 +586,14 @@ def configure_firewall(hosts):
             show_state("firewall", observed[host], "Observed firewall after apply")
         if success:
             success = verify_admin_access(host)
+        if success:
+            # The state just applied and verified becomes the monitor's baseline.
+            try:
+                save(ROOT / "baselines" / host / "firewall.json", observed[host])
+                print(f"{host}: accepted firewall baseline")
+            except (OSError, ValueError) as exc:
+                print(f"{host}: applied, but baseline not saved: {exc}")
+                success = False
         results.append((host, "OK" if success else "FAILED - inspect/rollback before proceeding"))
     print("\nFIREWALL SUMMARY")
     for host, result in results:
@@ -597,8 +610,7 @@ def rollback(hosts):
             print(f"{host}: FAILED - no controller rollback snapshot")
             continue
         print(f"{host}: restoring {path.relative_to(ROOT)}")
-        results.append((host, playbook("firewall", host, {"firewall_action": "restore",
-                                                       "firewall_restore_file": str(path)})))
+        results.append((host, act(host, "discover_firewall", ["--restore", "-"], payload=path)))
     print("\nROLLBACK SUMMARY")
     for host, success in results:
         print(f"{host:20} {'OK' if success else 'FAILED'}")
@@ -690,7 +702,80 @@ def scan(kind, hosts, deep=False):
     return valid, errors
 
 
-def security_status(kind, hosts, deep=False):
+SYSCTL_FIXES = {"kernel.unprivileged_userns_clone", "user.max_user_namespaces"}
+
+
+def fix_plan(state):
+    """Valid, de-duplicated (tier, request, description) fixes carried by findings."""
+    seen, fixes = set(), []
+    for finding in state["findings"]:
+        candidates = [*finding.get("fixes", []), *([finding["fix"]] if "fix" in finding else [])]
+        for fix in (f for f in candidates if isinstance(f, dict) and f.get("tier") in ("simple", "all")):
+            try:
+                if fix.get("kind") == "sysctl":
+                    settings = fix["settings"]
+                    if not settings or any(k not in SYSCTL_FIXES or v != "0" for k, v in settings.items()):
+                        continue
+                    request = {"kind": "sysctl", "settings": dict(settings)}
+                    description = ("sysctl " + ", ".join(f"{k} {fix['was'].get(k, '?')} -> 0" for k in sorted(settings))
+                                   + " (persisted; breaks rootless containers and browser sandboxes)")
+                else:
+                    keys = ("mode", "uid", "gid")
+                    request = {"path": fix["path"], **{key: fix[key] for key in keys}}
+                    was = {key: fix["was"][key] for key in keys}
+                    if (not isinstance(request["path"], str) or not request["path"].startswith("/")
+                            or not all(type(v) is int and v >= 0 for v in (*request.values(), *was.values())[1:])):
+                        continue
+                    description = describe_fix(request, was)
+            except (KeyError, AttributeError, TypeError):
+                continue
+            key = json.dumps(request, sort_keys=True)
+            if key not in seen:
+                seen.add(key)
+                fixes.append((fix["tier"], request, description))
+    return fixes
+
+
+def describe_fix(clean, was):
+    parts = []
+    if clean["mode"] != was["mode"]:
+        parts.append(f"mode {was['mode']:04o} -> {clean['mode']:04o}")
+    if (clean["uid"], clean["gid"]) != (was["uid"], was["gid"]):
+        parts.append(f"owner {was['uid']}:{was['gid']} -> {clean['uid']}:{clean['gid']}")
+    return terminal(clean["path"]) + ": " + ", ".join(parts)
+
+
+def offer_fixes(host, state, auto=None):
+    """Prompt per fix (TTY only), or apply without asking per --auto-apply simple|all."""
+    fixes = fix_plan(state)
+    interactive = sys.stdin.isatty()
+    if not fixes or not (interactive or auto):
+        return
+    print(f"\n{len(fixes)} fixable finding(s) on {host}:")
+    approved, everything = [], False
+    for tier, clean, line in fixes:
+        if everything or auto == "all" or (auto == "simple" and tier == "simple"):
+            print("  applying  " + line)
+            approved.append(clean)
+        elif not interactive:
+            print("  skipped (needs --auto-apply=all)  " + line)
+        else:
+            answer = ask(f"  {line}\n  Apply? [y/N/a=yes to all remaining/q=stop]", ["y", "n", "a", "q"], "n")
+            if answer == "q":
+                break
+            everything = everything or answer == "a"
+            if answer in ("y", "a"):
+                approved.append(clean)
+    if not approved:
+        return
+    with tempfile.NamedTemporaryFile(mode="w", prefix="ccdc-fixes-", suffix=".json") as out:
+        json.dump(approved, out)
+        out.flush()
+        success = act(host, "apply_fixes", connection=False, payload=out.name)
+    print(("Applied " if success else "Some fixes FAILED on ") + f"{host}; re-run the scan to verify.")
+
+
+def security_status(kind, hosts, deep=False, auto=None):
     states, errors = scan(kind, hosts, deep)
     active = bool(errors)
     for host in hosts:
@@ -728,6 +813,7 @@ def security_status(kind, hosts, deep=False):
         if state.get("errors"):
             print("Scan incomplete; absence of findings does not prove clean state.")
         active = active or bool(findings or state.get("errors"))
+        offer_fixes(host, state, auto)
     return active
 
 
@@ -895,10 +981,13 @@ def argument_parser():
     cmd.add_argument("target", nargs="?", default="all")
     cmd.add_argument("--yes", action="store_true", help="install saved reviewed packages without confirmation; never approves service restarts")
     for command in SCANNERS:
-        cmd = sub.add_parser(command, help="read-only current security findings; no baseline")
+        cmd = sub.add_parser(command, help="current security findings, no baseline; offers fixes for fixable findings on a terminal")
         cmd.add_argument("action_or_target", nargs="?", default="status", metavar="[status|HOST]")
         cmd.add_argument("target", nargs="?", help="inventory hostname (after status)")
         cmd.add_argument("--deep", action="store_true", help="manual deeper scan; never used by monitor")
+        cmd.add_argument("--auto-apply", choices=["simple", "all"],
+                         help="apply fixes without prompting: simple = permission-mode only, all = also ownership; "
+                              "without it, fixes are offered interactively on a terminal")
     cmd = sub.add_parser("monitor")
     cmd.add_argument("kind", nargs="?", choices=list(POLL_INTERVALS))
     cmd.add_argument("--host", default="all")
@@ -1019,7 +1108,7 @@ def main():
             parser.error("use MODULE [status] [HOST]")
         target = (args.target or "all") if args.action_or_target == "status" else args.action_or_target
         hosts, _ = select(target)
-        return security_status(args.command, hosts, args.deep)
+        return security_status(args.command, hosts, args.deep, args.auto_apply)
     hosts, variables = select(args.target)
     if args.command == "update":
         updates = runpy.run_path(str(ROOT / "scripts/update-controller.py"))["updates"]

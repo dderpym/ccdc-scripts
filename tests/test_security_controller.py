@@ -184,7 +184,7 @@ class SecurityControllerTests(unittest.TestCase):
                         patch.object(ctl, 'security_status', return_value=False) as status:
                     self.assertFalse(ctl.main())
                     select.assert_called_once_with(host)
-                    status.assert_called_once_with(kind, [host], deep)
+                    status.assert_called_once_with(kind, [host], deep, None)
 
     def test_intervals_use_inventory_and_independent_defaults(self):
         result = ctl.polling_intervals(list(ctl.POLL_INTERVALS), ['a', 'b'], {'a': {'lse_poll_interval': 240}})
@@ -251,11 +251,12 @@ class SecurityControllerTests(unittest.TestCase):
         self.assertIn('11 additional finding events', output)
         self.assertEqual(output.count('NEW:'), 40)
 
-    def test_lse_transport_uses_pinned_playbook_and_normal_mode(self):
+    def test_lse_transport_uses_the_shared_runner_and_normal_mode(self):
         def run(args, result_dir=None, result_task=None):
-            self.assertEqual(result_task, 'Collect LSE security state')
-            self.assertEqual(args[:2], ['ansible-playbook', 'playbooks/lse.yml'])
-            self.assertFalse(json.loads(args[-1])['lse_deep'])
+            self.assertEqual(result_task, 'Run host script')
+            self.assertEqual(args[:2], ['ansible-playbook', 'playbooks/remote.yml'])
+            request = json.loads(args[args.index('--extra-vars') + 1])['ccdc_remote']
+            self.assertEqual((request['entry'], request['args'], request['become']), ('discover_lse', [], True))
             (Path(result_dir) / 'a').write_text(json.dumps({'stdout': json.dumps(STATE), 'rc': 0}))
             return subprocess.CompletedProcess(args, 0, '', '')
         with patch.object(ctl, 'run', side_effect=run):
@@ -269,3 +270,49 @@ class SecurityControllerTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class FixOfferTests(SecurityControllerTests):
+    def state(self, tier='simple', uid=0):
+        fix = {'path': '/etc/x', 'mode': 0o644, 'uid': uid, 'gid': 0, 'tier': tier,
+               'was': {'mode': 0o666, 'uid': 5 if uid == 0 and tier == 'all' else 0, 'gid': 0}}
+        return {'findings': [dict(FINDING, fix=fix)], 'raw': '', 'errors': []}
+
+    def offer(self, state, auto=None, tty=False, answers=()):
+        with patch.object(ctl.sys.stdin, 'isatty', return_value=tty), \
+                patch.object(ctl, 'ask', side_effect=list(answers)), \
+                patch.object(ctl, 'act', return_value=True) as act:
+            ctl.offer_fixes('a', state, auto)
+        return act
+
+    def test_non_interactive_without_flag_never_mutates(self):
+        self.assertFalse(self.offer(self.state()).called)
+
+    def test_prompt_applies_only_on_yes(self):
+        self.assertFalse(self.offer(self.state(), tty=True, answers=['n']).called)
+        act = self.offer(self.state(), tty=True, answers=['y'])
+        self.assertEqual(act.call_args.args[:2], ('a', 'apply_fixes'))
+
+    def test_auto_apply_simple_skips_ownership_changes_without_a_tty(self):
+        self.assertTrue(self.offer(self.state('simple'), auto='simple').called)
+        self.assertFalse(self.offer(self.state('all'), auto='simple').called)
+        self.assertTrue(self.offer(self.state('all'), auto='all').called)
+
+    def test_malformed_fixes_are_ignored(self):
+        state = self.state()
+        state['findings'][0]['fix']['path'] = 'relative'
+        self.assertFalse(self.offer(state, auto='all').called)
+        state['findings'][0]['fix'] = {'tier': 'all', 'path': '/x'}
+        self.assertFalse(self.offer(state, auto='all').called)
+
+
+class SysctlFixPlanTests(unittest.TestCase):
+    def test_sysctl_and_multi_fix_findings_are_planned_and_validated(self):
+        good = {'kind': 'sysctl', 'tier': 'all', 'settings': {'user.max_user_namespaces': '0'},
+                'was': {'user.max_user_namespaces': '15000'}}
+        perm = {'path': '/a', 'mode': 0o644, 'uid': 0, 'gid': 0, 'tier': 'simple',
+                'was': {'mode': 0o666, 'uid': 0, 'gid': 0}}
+        bad = dict(good, settings={'kernel.randomize_va_space': '0'})
+        plan = ctl.fix_plan({'findings': [{'fixes': [good, perm, perm, bad, 'junk']}]})
+        self.assertEqual([p[1].get('kind', 'perm') for p in plan], ['sysctl', 'perm'])
+        self.assertIn('15000 -> 0', plan[0][2])

@@ -11,15 +11,13 @@ import os
 from pathlib import Path
 import pwd
 import re
-import runpy
 import selectors
 import stat
 import subprocess
 import time
 
-_HERE = Path(__file__).resolve().parent
-read_regular = runpy.run_path(str(_HERE / 'kernel_risks.py'))['read_regular']
-_access = runpy.run_path(str(_HERE / 'lse_extras.py'))['_access']
+from host.kernel_risks import read_regular
+from host.lse_extras import _access
 EXEC = ('ExecStart', 'ExecStartPre', 'ExecStartPost', 'ExecReload', 'ExecStop', 'ExecStopPost')
 PROPERTIES = ('User', 'DynamicUser', 'RootDirectory', 'RootImage', *EXEC,
               'FragmentPath', 'DropInPaths', 'WorkingDirectory')

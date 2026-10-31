@@ -12,7 +12,6 @@ import json
 import os
 from pathlib import Path
 import re
-import runpy
 import shlex
 import shutil
 import stat
@@ -20,6 +19,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+
+from host import update_services
 
 BACKUP_ROOT = Path('/var/backups/ccdc-updates')
 LOCK = '/run/ccdc-updates.lock'
@@ -829,11 +830,10 @@ def execute(document):
         return select_plan(document['snapshot'], document['packages'], manager, release, init)
     if action == 'apply':
         return apply(document['expected'], document['token'], manager, release, init)
-    helper = runpy.run_path(str(Path(__file__).with_name('update-services.py')))
     try:
         if action == 'services':
-            return helper['inspect_services'](init, before=document.get('before'))
-        return helper['restart_service'](init, document['service'], before=document.get('before'))
+            return update_services.inspect_services(init, before=document.get('before'))
+        return update_services.restart_service(init, document['service'], before=document.get('before'))
     except (OSError, RuntimeError, ValueError) as exc:
         raise Refusal('Service action failed: ' + action, service_error=str(exc)) from exc
 

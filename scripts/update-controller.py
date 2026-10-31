@@ -20,20 +20,20 @@ def endpoint(ctl, variables):
     return hashlib.sha256(json.dumps([values, ctl.EXTRA], sort_keys=True).encode()).hexdigest()
 
 
-def remote(ctl, host, action, **fields):
+def call_host(ctl, host, action, **fields):
+    """Send one request to host/manage_updates.py through the shared remote runner."""
     document = {"action": action, **fields}
     token = fields.get("token")
     destination = ctl.ROOT / "reports" / host / "updates" / "backups" / token if token else None
     if destination:
         destination.mkdir(parents=True, exist_ok=True, mode=0o700)
     with tempfile.TemporaryDirectory(prefix="ccdc-update-results-") as directory:
-        args = ["ansible-playbook", "playbooks/update.yml", "--limit", host, *ctl.EXTRA]
-        with tempfile.NamedTemporaryFile(mode="w", prefix="ccdc-update-vars-", suffix=".json") as out:
-            json.dump({"update_request": document,
-                       "update_backup_destination": str(destination) if destination else ""}, out)
+        with tempfile.NamedTemporaryFile(mode="w", prefix="ccdc-update-request-", suffix=".json") as out:
+            json.dump(document, out)
             out.flush()
-            result = ctl.run([*args, "--extra-vars", "@" + out.name], result_dir=directory,
-                             result_task="Run guarded update action")
+            result = ctl.run(["ansible-playbook", "playbooks/remote.yml", "--limit", host, *ctl.EXTRA,
+                              "--extra-vars", ctl.remote.request("manage_updates", payload=out.name)],
+                             result_dir=directory, result_task=ctl.remote.TASK)
         if getattr(ctl, "VERBOSE", False):
             print(ctl.terminal(result.stdout + result.stderr))
         try:
@@ -45,13 +45,30 @@ def remote(ctl, host, action, **fields):
                     error = json.loads(response.get("stdout", "")).get("error")
                 except ValueError:
                     error = None
-                raise RuntimeError(error or response.get("msg") or "update task/backup transfer failed; inspect remote-failure.json")
+                raise RuntimeError(error or response.get("msg") or "update task failed; inspect remote-failure.json")
             state = json.loads(response["stdout"])
             if not isinstance(state, dict) or state.get("error"):
                 raise ValueError("invalid remote update result")
-            return state
         except (OSError, KeyError, ValueError) as exc:
             raise RuntimeError("No usable update result: " + str(exc)) from exc
+    if action == "apply":
+        fetch_backup(ctl, host, token, state, destination)
+    return state
+
+
+def fetch_backup(ctl, host, token, state, destination):
+    """Copy the root-only configuration archive to the controller after a successful apply."""
+    archive = state.get("backup_archive")
+    if not isinstance(archive, str) or not re.fullmatch(
+            "/var/backups/ccdc-updates/" + re.escape(token) + "/[^/]+", archive):
+        raise RuntimeError("update returned an unexpected recovery archive path")
+    arguments = json.dumps({"src": archive, "dest": str(destination / "configs.tar.gz"), "flat": True})
+    result = ctl.run(["ansible", "all", "--limit", host, "--become", "-m", "ansible.builtin.fetch",
+                      "-a", arguments, *ctl.EXTRA])
+    if result.returncode:
+        ctl.save(ctl.ROOT / "reports" / host / "updates" / "remote-failure.json",
+                 {"action": "fetch", "token": token, "output": result.stdout + result.stderr})
+        raise RuntimeError("backup transfer failed; inspect remote-failure.json")
 
 
 def check_access(ctl, host):
@@ -128,7 +145,7 @@ def review(ctl, host, catalog):
             if choice == "a" or ctl.ask(f"{item['name']}: [y] include, [n] hold", ["y", "n"], "y") == "y":
                 selected.append(item["name"])
         try:
-            exact = remote(ctl, host, "select", snapshot=catalog, packages=selected)
+            exact = call_host(ctl, host, "select", snapshot=catalog, packages=selected)
             candidates(exact)
             if exact.get("selected") != sorted(selected) or not isinstance(exact.get("changes"), list):
                 raise ValueError("resolver did not preserve reviewed selection")
@@ -151,7 +168,7 @@ def review(ctl, host, catalog):
 
 
 def offer_restarts(ctl, host, before, report, directory):
-    inspection = remote(ctl, host, "services", before=before)
+    inspection = call_host(ctl, host, "services", before=before)
     show_services(ctl, inspection)
     report["services_after"] = inspection
     pending = [s for s in inspection["services"] if s["reasons"]]
@@ -171,14 +188,14 @@ def offer_restarts(ctl, host, before, report, directory):
         if choice == "q":
             return False
         if choice == "r":
-            result = remote(ctl, host, "restart", service=name, before=before)
+            result = call_host(ctl, host, "restart", service=name, before=before)
             if result.get("status") not in ("restarted", "already-current"):
                 raise RuntimeError(f"{name}: restart did not complete successfully")
             report["restarts"].append(result)
             report["deferred_restarts"].remove(name)
             ctl.save(directory / "result.json", report)
             check_access(ctl, host)
-    final = remote(ctl, host, "services", before=before)
+    final = call_host(ctl, host, "services", before=before)
     report["services_final"] = final
     show_services(ctl, final)
     previous = {s["name"] for s in before["services"] if s["active"]}
@@ -231,11 +248,11 @@ def updates(controller, action, hosts, variables, yes=False):
         ctl.save(directory / "result.json", report)
         try:
             check_access(ctl, host)
-            services = remote(ctl, host, "services")
+            services = call_host(ctl, host, "services")
             show_services(ctl, services)
             report["services_before"] = services
             if action == "plan":
-                catalog = remote(ctl, host, "plan")
+                catalog = call_host(ctl, host, "plan")
                 exact = review(ctl, host, catalog)
                 if exact is None:
                     report["status"] = "skipped"
@@ -252,7 +269,7 @@ def updates(controller, action, hosts, variables, yes=False):
                     raise RuntimeError("plan expired during rollout; run update plan again")
                 ctl.save(directory / "plan.json", dict(plan, ready=False))
                 report["recovery"] = f"/var/backups/ccdc-updates/{token}"
-                report["transaction"] = remote(ctl, host, "apply", expected=plan["remote"], token=token)
+                report["transaction"] = call_host(ctl, host, "apply", expected=plan["remote"], token=token)
                 ctl.save(directory / "result.json", report)
                 check_access(ctl, host)
                 if not offer_restarts(ctl, host, services, report, directory):

@@ -1,0 +1,10 @@
+---
+# Installs missing networking CLI tools only; never starts a firewall manager.
+- name: Provision firewall prerequisites, one host at a time
+  hosts: all
+  serial: 1
+  any_errors_fatal: true
+  gather_facts: false
+  become: true
+  roles:
+    - network_tools

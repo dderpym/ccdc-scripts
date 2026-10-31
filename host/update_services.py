@@ -6,13 +6,10 @@ is not proof of package ownership or update causation. No reboot, shell, or prob
 import os
 from pathlib import Path
 import re
-import runpy
 import subprocess
 
 
-_helpers = runpy.run_path(str(Path(__file__).with_name("discover-listeners")))
-process_info = _helpers["process_info"]
-service_hints = _helpers["service_hints"]
+from host.discover_listeners import process_info, service_hints
 PROC = Path("/proc")
 RUN = Path("/run")
 TIMEOUT = 30
