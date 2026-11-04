@@ -4,7 +4,6 @@
   fix_pam remove-line FILE LINE [--payload PATH]  delete rules equal to LINE (stripped) from a /etc/pam.d file,
                                                   and the payload file
   fix_pam remove-file PATH                        quarantine a stray file under /etc/pam.d or a security dir
-  fix_pam reinstall MANAGER                       reinstall the PAM packages (apt|dnf|yum|zypper)
 
 SAFETY: keep a second root SSH session open while repairing PAM and test a fresh login after.
 Backups go to /root/ir/pam-<timestamp>/ (0700).
@@ -18,12 +17,6 @@ import time
 
 PAM_DIR = "/etc/pam.d"
 EVIDENCE = "/root/ir"
-REINSTALL = {
-    "apt": ["apt-get", "install", "--reinstall", "-y", "libpam-modules", "libpam-modules-bin", "libpam-runtime"],
-    "dnf": ["dnf", "reinstall", "-y", "pam"],
-    "yum": ["yum", "reinstall", "-y", "pam"],
-    "zypper": ["zypper", "--non-interactive", "install", "--force", "pam"],
-}
 
 
 def evidence_dir(base=EVIDENCE, now=time.time):
@@ -71,14 +64,6 @@ def remove_file(path, base=EVIDENCE):
     return {"removed": True, "evidence": directory}
 
 
-def reinstall(manager, run=subprocess.run):
-    if manager not in REINSTALL:
-        raise ValueError("unsupported package manager: " + manager)
-    env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
-    run(REINSTALL[manager], env=env, check=True, stdout=sys.stderr)
-    return {"reinstalled": REINSTALL[manager][-1]}
-
-
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     try:
@@ -88,8 +73,6 @@ def main(argv=None):
             result = remove_line(argv[1], argv[2], payload)
         elif action == "remove-file":
             result = remove_file(argv[1])
-        elif action == "reinstall":
-            result = reinstall(argv[1])
         else:
             raise ValueError("unknown action " + action)
     except (OSError, ValueError, IndexError, subprocess.CalledProcessError) as exc:

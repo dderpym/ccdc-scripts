@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""install MANAGER PACKAGE...: install only what is missing; JSON {"installed": [...], "already": [...]}.
+"""install MANAGER [--reinstall] PACKAGE...: install what is missing; JSON {"installed": [...], "already": [...]}.
 
-Never assumes an earlier run: each call asks the package database first.
+With --reinstall, packages that are already installed are reinstalled too (restoring
+their files) and listed under "reinstalled". Never assumes an earlier run: each call
+asks the package database first.
 """
 import json
 import os
@@ -21,6 +23,18 @@ MANAGERS = {
 }
 
 
+# manager -> argv that reinstalls packages that are already present
+REINSTALL = {
+    "apt": ["apt-get", "install", "--reinstall", "-y", "--no-install-recommends"],
+    "dnf": ["dnf", "reinstall", "-y"],
+    "yum": ["yum", "reinstall", "-y"],
+    "apk": ["apk", "fix", "--reinstall"],
+    "pacman": ["pacman", "-S", "--noconfirm"],
+    "xbps": ["xbps-install", "-f", "-y"],
+    "zypper": ["zypper", "--non-interactive", "install", "--force"],
+}
+
+
 def installed(manager, package, run=subprocess.run):
     argv = [part.replace("{}", package) for part in MANAGERS[manager][0]]
     result = run(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
@@ -30,26 +44,32 @@ def installed(manager, package, run=subprocess.run):
     return manager != "apt" or result.stdout.strip().endswith("install ok installed")
 
 
-def install(manager, packages, run=subprocess.run):
+def install(manager, packages, reinstall=False, run=subprocess.run):
     if manager not in MANAGERS:
         raise ValueError("unsupported package manager: " + manager)
     missing = [p for p in packages if not installed(manager, p, run)]
+    present = [p for p in packages if p not in missing]
+    env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
+    _, command, refresh = MANAGERS[manager]
     if missing:
-        _, command, refresh = MANAGERS[manager]
-        env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
         if refresh:
             run(refresh, env=env, check=False, stdout=sys.stderr)
         run([*command, *missing], env=env, check=True, stdout=sys.stderr)
-    return {"installed": missing, "already": [p for p in packages if p not in missing]}
+    if reinstall and present:
+        run([*REINSTALL[manager], *present], env=env, check=True, stdout=sys.stderr)
+    return {"installed": missing, "already": [] if reinstall else present,
+            "reinstalled": present if reinstall else []}
 
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    reinstall = "--reinstall" in argv
+    argv = [a for a in argv if a != "--reinstall"]
     if len(argv) < 2:
-        print("usage: remote.py MANAGER PACKAGE...", file=sys.stderr)
+        print("usage: remote.py MANAGER [--reinstall] PACKAGE...", file=sys.stderr)
         return 2
     try:
-        print(json.dumps(install(argv[0], argv[1:])))
+        print(json.dumps(install(argv[0], argv[1:], reinstall)))
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:
         print(json.dumps({"error": str(exc)}))
         return 1

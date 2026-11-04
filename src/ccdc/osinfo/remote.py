@@ -1,17 +1,6 @@
 #!/usr/bin/env python3
-"""Print this host's distribution as JSON: {"id", "id_like", "version", "family"}."""
+"""Print this host's distribution as JSON: {"id", "id_like", "version", "name"}."""
 import json
-
-# Families are named after the package manager that matters for them.
-FAMILIES = {
-    "debian": ("debian", "ubuntu", "raspbian", "kali", "linuxmint"),
-    "rhel": ("rhel", "centos", "rocky", "fedora", "almalinux", "ol", "amzn"),
-    "alpine": ("alpine",),
-    "arch": ("arch", "manjaro"),
-    "void": ("void",),
-    "suse": ("suse", "opensuse", "sles"),
-}
-
 
 def parse_os_release(text):
     values = {}
@@ -20,15 +9,6 @@ def parse_os_release(text):
         if sep and key.strip() and not key.startswith("#"):
             values[key.strip()] = value.strip().strip("\"'")
     return values
-
-
-def family(distro_id, id_like=""):
-    """First family matching the distro itself, then its declared parents."""
-    for candidate in [distro_id, *id_like.split()]:
-        for name, members in FAMILIES.items():
-            if any(candidate == m or candidate.startswith(m + "-") for m in members):
-                return name
-    return "unknown"
 
 
 def detect(path="/etc/os-release"):
@@ -40,7 +20,7 @@ def detect(path="/etc/os-release"):
     distro_id = values.get("ID", "").lower()
     id_like = values.get("ID_LIKE", "").lower()
     return {"id": distro_id, "id_like": id_like, "version": values.get("VERSION_ID", ""),
-            "family": family(distro_id, id_like)}
+            "name": values.get("PRETTY_NAME") or values.get("NAME", "")}
 
 
 def main():

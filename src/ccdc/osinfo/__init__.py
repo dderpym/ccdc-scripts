@@ -1,4 +1,4 @@
-"""OS detection layer: everything distro-specific starts from DetectOS."""
+"""OS detection: report which OS this is, nothing more. Deciding what to do about it is up to the caller."""
 from dataclasses import dataclass
 
 from ccdc.ansible import AnsibleScript
@@ -10,7 +10,12 @@ class OSInfo:
     id: str
     id_like: str
     version: str
-    family: str
+    name: str
+
+    @property
+    def lineage(self):
+        """This distro, then its declared parents, nearest first (ID then ID_LIKE)."""
+        return tuple(part for part in (self.id, *self.id_like.split()) if part)
 
 
 class DetectOS(AnsibleScript):
@@ -22,4 +27,4 @@ class DetectOS(AnsibleScript):
         if result["rc"] != 0:
             raise RemoteError("%s: %s" % (self.name, failure_message(result)))
         document = super().parse(result, **kwargs)
-        return OSInfo(document["id"], document["id_like"], document["version"], document["family"])
+        return OSInfo(document["id"], document["id_like"], document["version"], document["name"])

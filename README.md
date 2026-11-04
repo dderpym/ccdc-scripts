@@ -325,11 +325,13 @@ when present) instead of recording that it did.
   workflows, grouped by phase: `init/` (`Init`, `HostKeys`, `PamGate`) and `firewall/`
   (`PrepareNetworkTools`, `ApplyFirewall`, `RestoreFirewall`). SSH has no phase script:
   it is a scanner plus an autofix driven by the inventory (see [SSH policy](#ssh-policy)).
-- **OS layer** (`src/ccdc/osinfo/`): `DetectOS` returns the distro family
-  (debian, rhel, alpine, arch, void, suse). **Package layer** (`src/ccdc/packages/`):
-  `InstallApt`/`InstallDnf`/... install with one manager; `InstallPackage`
-  subclasses such as `InstallNftables` hold a family-to-package table, detect the OS
-  on every run, and delegate.
+- **OS and package layers** keep distro knowledge in exactly one place. `DetectOS`
+  (`src/ccdc/osinfo/`) only reports which OS the target is: `id`, `id_like`, version and a
+  display name, plus its `lineage` (itself, then its declared parents). The package layer
+  (`src/ccdc/packages/`) is the only code that turns a lineage into a package manager;
+  `InstallPackage` recipes such as `InstallNftables`, `InstallAuditd` and `InstallPam`
+  hold what each manager calls the package, detect the OS on every run and delegate.
+  `InstallPam(reinstall=True)` restores tampered files. Nothing else says `apt` or `dnf`.
 - **Scanners** (`src/ccdc/findings.py`) are scripts that intend no lasting effect on the
   host, so they are safe to run repeatedly. They judge the configuration **as it is
   active on the machine** (`sshd -T -C`, `sudo -l -U`, loaded PAM stacks, `systemctl
