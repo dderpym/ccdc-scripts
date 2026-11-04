@@ -78,6 +78,17 @@ all:
 Quote `"yes"`/`"no"`. Nothing is a built-in policy: unlisted options are not checked,
 and a host with no `ssh:` policy is reported as unchecked.
 
+Each host's **approved services** live there too, as `services:` entries. Do not
+write them by hand: `./ccdcctl services` discovers what each host exposes and records
+your answers (see [`services`](#services-hostall-approve-what-each-host-exposes)).
+
+```yaml
+    web01:
+      services:
+        - {port: 22, proto: tcp, name: sshd}
+        - {port: 443, proto: tcp, name: nginx}
+```
+
 Keep the team's **private key outside the repository**. Copy its matching public
 key into the one configured public-key source:
 
@@ -343,6 +354,33 @@ a `Finding` dataclass and a `BundleScanner` whose `findings(target, row)` builds
 **Adding a fix:** add `src/ccdc/fixes/<thing>.py` with an `AutoFix` that returns a
 `Script.bind(...)` (define the script, usually a `BundleScript` over a `fix_*` host
 entry, in the same module).
+
+### `services [host|all]`: approve what each host exposes
+
+`./ccdcctl services` runs `ss -tulpn` as root on each host (the listeners discovery),
+lists the non-loopback services not yet approved, and asks per service: `y` approve,
+`N` skip (default), `a` approve all remaining, `q` stop. Approved services that no
+longer listen are offered for removal. Answers are written to `inventory.yml` under the
+host as `services: [{port, proto, name}]` (comments and ordering preserved, the file is
+replaced atomically, the previous copy kept in `state/backups/`; the edit is refused
+if it would change anything but that list).
+
+Approved services then drive scanning, like the `ssh:` policy:
+
+- `UnapprovedService`: a non-loopback listener that is not in the inventory.
+- `ApprovedServiceDown`: an approved service that is not listening (critical).
+- `FirewallBlocksService` (critical), `FirewallOpensUnapproved`, `FirewallNotRestricting`:
+  the **effective** inbound firewall compared with the approved list. A firewall the tool
+  cannot summarize (managers such as ufw/firewalld, custom rules) is reported as not
+  compared, never guessed.
+- A host with no `services` declared reports `no services declared in inventory; run
+  ccdcctl services`.
+
+The firewall findings have an autofix that applies exactly the approved ports (tcp/22
+is always kept) with the same guards as `firewall configure`: it refuses unless every
+active sshd port is approved, checks a fresh key login before and after, saves a rollback
+snapshot to `state/reports/rollback/<host>/firewall.json`, lets the host verify the exact
+policy (restoring on failure) and restores the snapshot if the login is lost.
 
 ### `scan [host|all] [--fix [ask|all]] [--wait SECONDS] [--recheck SECONDS]`
 
