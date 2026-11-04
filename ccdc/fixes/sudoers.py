@@ -1,14 +1,17 @@
 from ccdc.findings import AutoFix
-from ccdc.scanners.sudoers import SudoersGrant
-from ccdc.scripts.sudoers import RemoveSudoersLine
+from ccdc.scanners.sudoers import SudoGrant
+from ccdc.scripts.sudoers import RemoveSudoersGrant
 
 
-class FixSudoersGrant(AutoFix):
+class FixSudoGrant(AutoFix):
     def can_fix(self, finding):
-        return isinstance(finding, SudoersGrant)
+        return isinstance(finding, SudoGrant)
 
     def get_fix(self, finding):
-        return RemoveSudoersLine().bind(target=finding.host, file=finding.file, text=finding.text)
+        return RemoveSudoersGrant().bind(target=finding.host, user=finding.user, rule=finding.rule,
+                                         file=finding.file, line=finding.line)
 
     def describe(self, finding):
-        return f"remove '{finding.text}' from {finding.file} (visudo-validated, original kept in /root/ir)"
+        return (f"remove the sudoers line granting '{finding.rule}' to {finding.user}"
+                + (f" at {finding.file}:{finding.line}" if finding.file else "")
+                + " (visudo-validated, original kept in /root/ir)")

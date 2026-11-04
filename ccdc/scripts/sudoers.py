@@ -1,9 +1,9 @@
 from ccdc.ansible import BundleScript
 
 
-class RemoveSudoersLine(BundleScript):
-    """Delete a line from a sudoers file, validated by visudo, original kept in /root/ir."""
+class RemoveSudoersGrant(BundleScript):
+    """Remove the sudoers line(s) behind a live `sudo -l` grant, validated by visudo, original kept in /root/ir."""
     entry = "fix_sudoers"
 
-    def arguments(self, file, text, **kwargs):
-        return [file, text]
+    def arguments(self, user, rule, file="", line=0, **kwargs):
+        return ["--locate", user, rule, "--file", file, "--line", str(line)]

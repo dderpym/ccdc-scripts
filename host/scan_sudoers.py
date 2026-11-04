@@ -1,95 +1,134 @@
 #!/usr/bin/env python3
-"""Read-only sudoers audit: JSON {"findings": [...], "errors": [...]}.
+"""Sudo as it is ACTIVE on this host: JSON {"findings": [...], "errors": [...]}.
 
-Parses /etc/sudoers and everything it includes. Independent of the account running
-the scan (no sud000-style suppression): the question is what the files grant others.
-Flags user specs for everyone (ALL / %ALL) and NOPASSWD grants to anyone but the
-account init creates. Init's own rule lives in /etc/sudoers.d/oski.
+No sudoers file is parsed here. Everything comes from live tooling:
+  * `visudo -c`            whether the loaded configuration is valid at all
+  * `sudo -n -l -U USER`   what sudo really grants each login-capable account, root and
+                           `nobody` (a canary: any grant to it came from an ALL/%ALL rule),
+                           from every source sudo consults (files, includes, group grants,
+                           sssd/LDAP, Defaults !authenticate)
+  * `sudo -n -l -l -U`     for flagged users only, the "Sudoers entry: FILE:LINE" that sudo
+                           reports for each rule (newer sudo), so a fix can find the line
+Independent of the account running the scan. Root's own rule is expected; `oski` is the
+team account init creates. A sudo that cannot be queried is an error, never "no grants".
 """
 import json
-import os
+import pwd
 import re
+import subprocess
 
 ALLOWED_USER = "oski"
-MAX_DEPTH = 8
-DIRECTIVE = re.compile(r"^[#@](include|includedir)\s+(\"?)(\S+?)\2\s*$")
-NON_GRANT = ("Defaults", "User_Alias", "Runas_Alias", "Host_Alias", "Cmnd_Alias")
-SPEC = re.compile(r"^(\S+(?:\s*,\s*\S+)*)\s+(\S.*=.*)$")
+CANARY = "nobody"
+NO_LOGIN = ("nologin", "false")
+RULE = re.compile(r"^\s*\(([^)]*)\)\s*(.*)$")
+ENTRY = re.compile(r"^\s*Sudoers entry:\s*(\S+?)(?::(\d+))?\s*$")
 
 
-def logical_lines(text):
-    """(line number, text) with backslash continuations joined."""
-    pending, start = "", 0
-    for number, line in enumerate(text.splitlines(), 1):
-        if not pending:
-            start = number
-        if line.endswith("\\"):
-            pending += line[:-1] + " "
+def candidate_users(entries):
+    """Login-capable accounts (uid >= 1000), root and the canary, in stable order."""
+    names = {"root", CANARY}
+    for entry in entries:
+        shell = entry.pw_shell.rsplit("/", 1)[-1]
+        if entry.pw_uid >= 1000 and entry.pw_uid != 65534 and entry.pw_shell and shell not in NO_LOGIN:
+            names.add(entry.pw_name)
+    return sorted(names)
+
+
+def parse(output):
+    """Rules from `sudo -l` output: [{"rule", "nopasswd", "all"}]; Defaults !authenticate applies to all."""
+    rules, in_rules, no_auth = [], False, False
+    for line in output.splitlines():
+        if "may run the following commands" in line:
+            in_rules = True
             continue
-        yield start, (pending + line).strip()
-        pending = ""
-    if pending:
-        yield start, pending.strip()
+        if not in_rules:
+            no_auth = no_auth or bool(re.search(r"(^|[\s,])!authenticate\b", line))
+            continue
+        match = RULE.match(line)
+        if not match:
+            continue
+        commands = match[2]
+        tags = re.findall(r"\b([A-Z_]+):", commands)
+        stripped = re.sub(r"\b[A-Z_]+:\s*", "", commands)
+        # Only the bare token ALL is a blanket grant; "!ALL" is a denial.
+        everything = "ALL" in [part.strip() for part in stripped.split(",")]
+        rules.append({"rule": line.strip(), "nopasswd": "NOPASSWD" in tags, "all": everything})
+    for rule in rules:
+        rule["nopasswd"] = rule["nopasswd"] or no_auth
+    return rules
 
 
-def classify(line):
-    """'world', 'nopasswd' or None for one logical line."""
-    if not line or line.startswith(NON_GRANT):
-        return None
-    match = SPEC.match(line)
-    if not match:
-        return None
-    users = {u.strip() for u in match[1].split(",")}
-    if users & {"ALL", "%ALL"}:
-        return "world"
-    if "NOPASSWD" in match[2] and users != {ALLOWED_USER}:
-        return "nopasswd"
-    return None
+def parse_sources(output):
+    """[(file, line)] per rule, in order, from `sudo -l -l`; empty when this sudo does not say."""
+    return [(m[1], int(m[2] or 0)) for m in map(ENTRY.match, output.splitlines()) if m]
 
 
-def include_targets(directive, argument, read_dir=os.listdir):
-    if directive == "include":
-        return [argument]
-    names = sorted(n for n in read_dir(argument) if "." not in n and not n.endswith("~"))
-    return [os.path.join(argument, n) for n in names]
+def flagged(user, rules):
+    if user in (ALLOWED_USER, "root"):
+        return []
+    return [rule for rule in rules if rule["all"] or rule["nopasswd"]]
 
 
-def audit(path, result, seen=None, depth=0, read=None, read_dir=os.listdir):
-    read = read or (lambda p: open(p, encoding="utf-8", errors="replace").read())
-    seen = set() if seen is None else seen
-    if path in seen:
-        return
-    seen.add(path)
-    if depth > MAX_DEPTH:
-        result["errors"].append("include depth exceeded at " + path)
-        return
+def query(argv, run):
+    return run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=30)
+
+
+def inspect(user, run=subprocess.run):
+    """(rules, error) for one account; a failed sudo -l is an error, never 'no grants'."""
     try:
-        text = read(path)
-    except OSError as exc:
-        result["errors"].append("cannot read %s: %s" % (path, exc))
-        return
-    for number, line in logical_lines(text):
-        directive = DIRECTIVE.match(line)
-        if directive:
-            try:
-                targets = include_targets(directive[1], directive[3], read_dir)
-            except OSError as exc:
-                result["errors"].append("cannot list %s: %s" % (directive[3], exc))
-                continue
-            for target in targets:
-                audit(target, result, seen, depth + 1, read, read_dir)
+        result = query(["sudo", "-n", "-l", "-U", user], run)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [], "sudo -l -U %s failed: %s" % (user, exc)
+    if re.search(r"is not allowed to run sudo", result.stdout):
+        return [], None
+    if result.returncode:
+        return [], "sudo -l -U %s exited %s: %s" % (user, result.returncode, (result.stderr or result.stdout).strip()[:200])
+    return parse(result.stdout), None
+
+
+def locate(user, rules, run=subprocess.run):
+    """Attach the sudoers file:line sudo reports for each rule, when it reports them."""
+    try:
+        sources = parse_sources(query(["sudo", "-n", "-l", "-l", "-U", user], run).stdout)
+    except (OSError, subprocess.SubprocessError):
+        sources = []
+    for index, rule in enumerate(rules):
+        rule["file"], rule["line"] = sources[index] if len(sources) == len(rules) else ("", 0)
+    return rules
+
+
+def validity(run=subprocess.run):
+    """A finding row if `visudo -c` rejects the active configuration, plus an error if it cannot run."""
+    try:
+        result = query(["visudo", "-c"], run)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return [], ["visudo -c failed to run: %s" % exc]
+    if result.returncode:
+        return [{"kind": "invalid", "detail": (result.stdout + result.stderr).strip()[:500]}], []
+    return [], []
+
+
+def scan(entries=None, run=subprocess.run):
+    result = {"findings": [], "errors": []}
+    rows, errors = validity(run)
+    result["findings"].extend(rows)
+    result["errors"].extend(errors)
+    for user in candidate_users(pwd.getpwall() if entries is None else entries):
+        rules, error = inspect(user, run)
+        if error:
+            result["errors"].append(error)
             continue
-        if line.startswith("#"):
-            continue
-        kind = classify(line)
-        if kind:
-            result["findings"].append({"kind": kind, "file": path, "line": number, "text": line})
+        hits = flagged(user, rules)
+        if hits:
+            locate(user, rules, run)
+        for rule in rules:
+            if rule in hits:
+                result["findings"].append({"kind": "world" if user == CANARY else "grant", "user": user, **rule})
+    return result
 
 
 def main():
-    result = {"findings": [], "errors": []}
-    audit("/etc/sudoers", result)
-    print(json.dumps(result, sort_keys=True))
+    print(json.dumps(scan(), sort_keys=True))
 
 
 if __name__ == "__main__":
