@@ -4,10 +4,10 @@ the daemon started, live LD_* environment and libraries, and sockets its config 
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ccdc.runner import ROOT
 from ccdc.findings import BundleScanner, Finding, ScanResult
 
-ROOT = Path(__file__).resolve().parents[2]
-TEAM_KEYS = ROOT / "files" / "oski.pub"
+TEAM_KEYS = ROOT / "secrets" / "oski.pub"
 
 
 @dataclass
