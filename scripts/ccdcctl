@@ -17,7 +17,8 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
+STATE = ROOT / "state"
+sys.path.insert(0, str(ROOT / "src"))
 from ccdc import runner  # noqa: E402
 from controller import remote  # noqa: E402
 
@@ -71,14 +72,14 @@ def run_with_vars(args, variables, capture=True, result_dir=None):
 
 
 def playbook(name, host="all", variables=None):
-    args = ["ansible-playbook", f"transport/playbooks/{name}.yml", "--limit", host, *EXTRA]
+    args = ["ansible-playbook", f"{runner.PLAYBOOKS}/{name}.yml", "--limit", host, *EXTRA]
     result = run(args, capture=False) if variables is None else run_with_vars(args, variables, capture=False)
     return result.returncode == 0
 
 
 def act(host, entry, args=(), connection=True, payload=None):
     """Run one mutating host script with live progress; True when it succeeded."""
-    result = run(["ansible-playbook", "transport/playbooks/remote.yml", "--limit", host, *EXTRA,
+    result = run(["ansible-playbook", str(runner.PLAYBOOKS / "remote.yml"), "--limit", host, *EXTRA,
                   "--extra-vars", remote.request(entry, args, connection=connection, payload=payload)],
                  capture=False)
     return result.returncode == 0
@@ -167,9 +168,9 @@ def initialize(hosts, target, password_file=None, save_bootstrap=False, use_save
         return not playbook('init', target)
     if any(flag in EXTRA for flag in ('-k', '--ask-pass', '-K', '--ask-become-pass')):
         raise RuntimeError('Saved-root bootstrap handles prompts itself; remove Ansible password-prompt flags')
-    key = run(['ssh-keygen', '-l', '-f', str(ROOT / 'files/oski.pub')])
+    key = run(['ssh-keygen', '-l', '-f', str(ROOT / 'secrets/oski.pub')])
     if key.returncode:
-        raise RuntimeError('Replace files/oski.pub with a valid team public key before bootstrap')
+        raise RuntimeError('Replace secrets/oski.pub with a valid team public key before bootstrap')
     default = read_secret(path)
     results = []
     for index, host in enumerate(hosts, 1):
@@ -402,11 +403,11 @@ def listeners(hosts, variables):
     states, errors = collect("listeners", hosts)
     structured = {"hosts": {host: {"address": variables.get(host, {}).get("ansible_host", host),
                                   "listeners": states.get(host, []), "error": errors.get(host)} for host in hosts}}
-    save(ROOT / "reports/listeners.json", structured)
+    save(STATE / "reports/listeners.json", structured)
     report = listener_text(hosts, variables, states, errors)
-    text_file(ROOT / "reports/listeners.txt", report)
+    text_file(STATE / "reports/listeners.txt", report)
     print(report)
-    print("Saved reports/listeners.txt and reports/listeners.json")
+    print("Saved state/reports/listeners.txt and state/reports/listeners.json")
     return bool(errors)
 
 
@@ -535,7 +536,7 @@ def configure_firewall(hosts):
             problems(failure)
             results.append((host, "FAILED - no rollback snapshot"))
             continue
-        path = ROOT / "reports/rollback" / host / "firewall.json"
+        path = STATE / "reports/rollback" / host / "firewall.json"
         save(path, snapshots[host])
         success = act(host, "discover_firewall",
                       ["--apply", json.dumps({"tcp": policy["tcp"], "udp": policy["udp"]})])
@@ -550,7 +551,7 @@ def configure_firewall(hosts):
         if success:
             # The state just applied and verified becomes the monitor's baseline.
             try:
-                save(ROOT / "baselines" / host / "firewall.json", observed[host])
+                save(STATE / "baselines" / host / "firewall.json", observed[host])
                 print(f"{host}: accepted firewall baseline")
             except (OSError, ValueError) as exc:
                 print(f"{host}: applied, but baseline not saved: {exc}")
@@ -565,7 +566,7 @@ def configure_firewall(hosts):
 def rollback(hosts):
     results = []
     for host in hosts:
-        path = ROOT / "reports/rollback" / host / "firewall.json"
+        path = STATE / "reports/rollback" / host / "firewall.json"
         if not path.is_file():
             results.append((host, False))
             print(f"{host}: FAILED - no controller rollback snapshot")
@@ -596,7 +597,7 @@ def baseline(kind, hosts):
     states, errors = collect(kind, hosts)
     for host, state in states.items():
         try:
-            save(ROOT / "baselines" / host / f"{kind}.json", ssh_policy(state) if kind == "ssh" else state)
+            save(STATE / "baselines" / host / f"{kind}.json", ssh_policy(state) if kind == "ssh" else state)
             print(f"{host}: accepted {kind} baseline")
         except (OSError, ValueError) as exc:
             errors[host] = str(exc)
@@ -647,19 +648,19 @@ def scan(kind, hosts, deep=False):
         try:
             scanner_state(state)
             report = {k: v for k, v in state.items() if k != "raw"}
-            save(ROOT / "reports" / host / kind / "report.json", report)
-            text_file(ROOT / "reports" / host / kind / "raw.txt", state.get("raw", ""))
+            save(STATE / "reports" / host / kind / "report.json", report)
+            text_file(STATE / "reports" / host / kind / "raw.txt", state.get("raw", ""))
             if kind == "lse":
-                text_file(ROOT / "reports" / host / "lse.txt", state.get("raw", ""))
+                text_file(STATE / "reports" / host / "lse.txt", state.get("raw", ""))
             valid[host] = state
         except (OSError, ValueError) as exc:
             errors[host] = str(exc)
     for host, error in errors.items():
         # Never leave a stale clean report when transport or validation fails.
-        save(ROOT / "reports" / host / kind / "report.json", {"findings": [], "errors": [error], "incomplete": True})
-        text_file(ROOT / "reports" / host / kind / "raw.txt", "Scanner/transport failure: " + error + "\n")
+        save(STATE / "reports" / host / kind / "report.json", {"findings": [], "errors": [error], "incomplete": True})
+        text_file(STATE / "reports" / host / kind / "raw.txt", "Scanner/transport failure: " + error + "\n")
         if kind == "lse":
-            text_file(ROOT / "reports" / host / "lse.txt", "Scanner/transport failure: " + error + "\n")
+            text_file(STATE / "reports" / host / "lse.txt", "Scanner/transport failure: " + error + "\n")
     return valid, errors
 
 
@@ -807,7 +808,7 @@ def monitor_events(previous, kind, hosts, states, errors):
                     findings[identity] = finding
             else:
                 try:
-                    expected = json.loads((ROOT / "baselines" / host / f"{kind}.json").read_text())
+                    expected = json.loads((STATE / "baselines" / host / f"{kind}.json").read_text())
                     if kind == "ssh":
                         expected, state = ssh_policy(expected), ssh_policy(state)
                     if state != expected:

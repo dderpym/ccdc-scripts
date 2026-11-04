@@ -1,7 +1,7 @@
 """The one way controller code runs on a target.
 
 The host/ package plus pinned data files are packed into a single executable
-archive. transport/playbooks/remote.yml uploads it, runs one entry, and removes it, so
+archive. ccdc/ansible/playbooks/remote.yml uploads it, runs one entry, and removes it, so
 host code can share modules (distro, packages, ...) without any install step.
 """
 import atexit
@@ -12,7 +12,7 @@ import stat
 import tempfile
 import zipfile
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parents[1]  # src/
 DATA = {"vendor/lse.sh": "host/data/lse.sh", "vendor/LSE-LICENSE": "host/data/LSE-LICENSE"}
 MAIN = "from host.launcher import main\nraise SystemExit(main())\n"
 TASK = "Run host script"
@@ -49,7 +49,7 @@ def bundle_path():
 
 
 def request(entry, args=(), become=True, connection=False, payload=None):
-    """Extra-vars for transport/playbooks/remote.yml.
+    """Extra-vars for ccdc/ansible/playbooks/remote.yml.
 
     connection: hand the script the SSH_CONNECTION of this very login (sudo drops it).
     payload: controller file delivered to the script as stdin.

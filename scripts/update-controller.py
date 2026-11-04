@@ -24,14 +24,14 @@ def call_host(ctl, host, action, **fields):
     """Send one request to host/manage_updates.py through the shared remote runner."""
     document = {"action": action, **fields}
     token = fields.get("token")
-    destination = ctl.ROOT / "reports" / host / "updates" / "backups" / token if token else None
+    destination = ctl.STATE / "reports" / host / "updates" / "backups" / token if token else None
     if destination:
         destination.mkdir(parents=True, exist_ok=True, mode=0o700)
     with tempfile.TemporaryDirectory(prefix="ccdc-update-results-") as directory:
         with tempfile.NamedTemporaryFile(mode="w", prefix="ccdc-update-request-", suffix=".json") as out:
             json.dump(document, out)
             out.flush()
-            result = ctl.run(["ansible-playbook", "transport/playbooks/remote.yml", "--limit", host, *ctl.EXTRA,
+            result = ctl.run(["ansible-playbook", str(ctl.runner.PLAYBOOKS / "remote.yml"), "--limit", host, *ctl.EXTRA,
                               "--extra-vars", ctl.remote.request("manage_updates", payload=out.name)],
                              result_dir=directory, result_task=ctl.remote.TASK)
         if getattr(ctl, "VERBOSE", False):
@@ -39,7 +39,7 @@ def call_host(ctl, host, action, **fields):
         try:
             response = json.loads((Path(directory) / host).read_text())
             if response.get("failed") or response.get("unreachable") or response.get("rc", 0) or result.returncode:
-                ctl.save(ctl.ROOT / "reports" / host / "updates" / "remote-failure.json",
+                ctl.save(ctl.STATE / "reports" / host / "updates" / "remote-failure.json",
                          {"action": action, "token": token, "response": response})
                 try:
                     error = json.loads(response.get("stdout", "")).get("error")
@@ -66,7 +66,7 @@ def fetch_backup(ctl, host, token, state, destination):
     result = ctl.run(["ansible", "all", "--limit", host, "--become", "-m", "ansible.builtin.fetch",
                       "-a", arguments, *ctl.EXTRA])
     if result.returncode:
-        ctl.save(ctl.ROOT / "reports" / host / "updates" / "remote-failure.json",
+        ctl.save(ctl.STATE / "reports" / host / "updates" / "remote-failure.json",
                  {"action": "fetch", "token": token, "output": result.stdout + result.stderr})
         raise RuntimeError("backup transfer failed; inspect remote-failure.json")
 
@@ -110,7 +110,7 @@ def show_services(ctl, state):
 def explain_selection_failure(ctl, host):
     # Show dependency relationships, not raw native output (which can contain repository credentials).
     try:
-        evidence = json.loads((ctl.ROOT / "reports" / host / "updates" / "remote-failure.json").read_text())
+        evidence = json.loads((ctl.STATE / "reports" / host / "updates" / "remote-failure.json").read_text())
         if evidence.get("action") != "select":
             return
         output = json.loads(evidence["response"]["stdout"]).get("native_output", "")
@@ -152,7 +152,7 @@ def review(ctl, host, catalog):
         except RuntimeError as exc:
             print("Selection cannot be resolved without an unsafe/unreviewed change: " + ctl.terminal(exc))
             explain_selection_failure(ctl, host)
-            print(f"Private native diagnostics: reports/{host}/updates/remote-failure.json")
+            print(f"Private native diagnostics: state/reports/{host}/updates/remote-failure.json")
             if ctl.ask("[r] revise selection, [s] skip host", ["r", "s"], "s") == "r":
                 continue
             return None
@@ -213,14 +213,14 @@ def updates(controller, action, hosts, variables, yes=False):
     plans = {}
     if action == "plan":
         for host in hosts:
-            ctl.save(ctl.ROOT / "reports" / host / "updates" / "plan.json",
+            ctl.save(ctl.STATE / "reports" / host / "updates" / "plan.json",
                      {"schema": SCHEMA, "host": host, "ready": False})
         if not sys.stdin.isatty():
             raise ValueError("update plan is an interactive walkthrough; run it in a terminal")
     else:
         # Validate every selected saved plan before the first package mutation.
         for host in hosts:
-            plan = json.loads((ctl.ROOT / "reports" / host / "updates" / "plan.json").read_text())
+            plan = json.loads((ctl.STATE / "reports" / host / "updates" / "plan.json").read_text())
             if (not isinstance(plan, dict) or plan.get("schema") != SCHEMA or plan.get("host") != host
                     or not plan.get("ready") or plan.get("endpoint") != endpoint(ctl, variables.get(host, {}))
                     or not isinstance(plan.get("remote"), dict)
@@ -241,7 +241,7 @@ def updates(controller, action, hosts, variables, yes=False):
     failed = False
     for index, host in enumerate(hosts, 1):
         ctl.heading(host, index, len(hosts))
-        directory = ctl.ROOT / "reports" / host / "updates"
+        directory = ctl.STATE / "reports" / host / "updates"
         token = secrets.token_hex(16)
         report = {"host": host, "action": action, "started": time.time(), "token": token,
                   "status": "in-progress", "application_health_verified": False}
@@ -261,7 +261,7 @@ def updates(controller, action, hosts, variables, yes=False):
                              "created": time.time(), "ready": True,
                              "endpoint": endpoint(ctl, variables.get(host, {})),
                              "remote": exact})
-                    print(f"Saved reports/{host}/updates/plan.json (expires after 24 hours).")
+                    print(f"Saved state/reports/{host}/updates/plan.json (expires after 24 hours).")
                     report["status"] = "planned"
             else:
                 plan = plans[host]

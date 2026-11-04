@@ -34,7 +34,7 @@ class BundleScript(AnsibleScript):
 
 
 class PlaybookScript(AnsibleScript):
-    """Runs transport/playbooks/<playbook>.yml against the target; keyword arguments become extra-vars."""
+    """Runs playbooks/<playbook>.yml (next to this module) against the target; keyword arguments become extra-vars."""
     playbook = None
 
     def run(self, target, **variables):
