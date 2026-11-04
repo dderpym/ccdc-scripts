@@ -1,15 +1,16 @@
-from ccdc.ansible import BundleScript
+from ccdc.ansible import AnsibleScript
 from ccdc.findings import AutoFix
 from ccdc.scanners.kworker import FakeKernelThread
 from ccdc.scanners.memfd import MemfdProcess
 
 
-class KillProcess(BundleScript):
-    """SIGSTOP then SIGKILL; the host re-checks that the PID still matches `kind`."""
-    entry = "fix_kill_process"
+class KillProcess(AnsibleScript):
+    """SIGSTOP then SIGKILL; the target re-checks that the PID still matches `kind` (memfd|kworker)."""
+    source = "remote.py"
+    support = ("procfs.py", "processes.py")
 
-    def arguments(self, pid, kind, **kwargs):
-        return [str(pid), kind]
+    def arguments(self, pid, kind, proc=None, **kwargs):
+        return [str(pid), kind, *(["--proc", proc] if proc else [])]
 
 
 class KillSuspiciousProcess(AutoFix):

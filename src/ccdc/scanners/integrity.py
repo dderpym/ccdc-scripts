@@ -1,7 +1,7 @@
 """System integrity: packaged files that differ from the distro, and critical-path policy."""
 from dataclasses import dataclass
 
-from ccdc.findings import BundleScanner, Finding, ScanResult
+from ccdc.findings import EntryScanner, Finding, ScanResult
 from ccdc.scanners.permissions import drift_from_fix
 
 
@@ -22,7 +22,7 @@ class IntegrityFinding(Finding):
         return f"{self.path}: {self.text}" if self.path else self.text
 
 
-class IntegrityScanner(BundleScanner):
+class IntegrityScanner(EntryScanner):
     entry = "discover_integrity"
 
     def scan(self, target):

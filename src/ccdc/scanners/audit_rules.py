@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from ccdc.findings import BundleScanner, Finding
+from ccdc.findings import EntryScanner, Finding
 
 
 @dataclass(frozen=True)
@@ -24,7 +24,7 @@ class AuditDisabled(Finding):
         return "kernel auditing is disabled; loaded watches record nothing"
 
 
-class AuditRulesScanner(BundleScanner):
+class AuditRulesScanner(EntryScanner):
     entry = "scan_audit_rules"
 
     def findings(self, target, row):

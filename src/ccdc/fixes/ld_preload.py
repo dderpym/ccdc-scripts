@@ -1,9 +1,9 @@
-from ccdc.ansible import BundleScript
+from ccdc.ansible import EntryScript
 from ccdc.findings import AutoFix
 from ccdc.scanners.ld_preload import LibraryInjection
 
 
-class RemoveLibraryInjection(BundleScript):
+class RemoveLibraryInjection(EntryScript):
     """Remove an injected variable (or file), restart the unit, confirm the library is unmapped."""
     entry = "fix_ld_preload"
 

@@ -285,10 +285,11 @@ kill panes to detach. These keys assume tmux's default bindings.
 
 ```
 ccdcctl, ccdcctl-completion.bash, inventory.yml, setup, Makefile   controller entry points
-src/ccdc/       framework: Script, Target, scanners, autofixes, scan
-src/ccdc/ansible/  AnsibleScript + ansible.cfg, playbooks/, roles/, callback_plugins/
+src/ccdc/       framework: Script, Target, scanners/ and fixes/ (one package per check), scan
+src/ccdc/ansible/  AnsibleScript, BundleScript, archive driver; ansible.cfg, playbooks/, roles/, callback_plugins/
+src/ccdc/remote_lib/  Python helpers shipped to targets
 src/scripts/    phase scripts: init/ firewall/
-src/host/       code that runs ON targets (shipped as one bundle)
+src/host/       legacy code that runs ON targets (global bundle; being converted into colocated packages)
 src/controller/ bundle builder, update workflow
 src/vendor/     pinned upstream LSE
 lab/            disposable test hosts (lab/check is the live smoke suite)
@@ -301,17 +302,27 @@ Everything the controller does is a **Script** (`src/ccdc/script.py`): an object
 assume an earlier run, so a script that needs `nftables` installs it first (a no-op
 when present) instead of recording that it did.
 
-- `ComposedScript(Step(script, **prefilled), other, ...)` runs scripts in order and
-  returns their results. Arguments given to `run(**kw)` are injected into steps that
-  accept them and override prefilled values. `script.bind(**kw)` is a one-step
-  composition with arguments filled in.
-- `AnsibleScript` (`src/ccdc/ansible/`) acts on a `Target` (`src/ccdc/target.py`): a host
-  (or an Ansible `--limit` pattern such as `all`) plus an `Auth`: `AgentAuth` (ssh-agent
-  team key), `SudoAuth` (key login then sudo), `PasswordAuth` (bootstrap password,
-  never shown in `repr`). `BundleScript` runs one `src/host/<entry>.py` from the bundle
-  and returns its JSON (or streams live progress when `live = True`);
-  `PlaybookScript` runs `playbooks/<name>.yml` beside it. Only `src/ccdc/runner.py`
-  spawns Ansible.
+- `HostScript` is a script that runs **locally** on the controller (guards, prompts,
+  inventory edits, turning output into findings).
+- `AnsibleScript` (`src/ccdc/ansible/`) runs on a **remote** `Target`
+  (`src/ccdc/target.py`: a host or an Ansible `--limit` pattern such as `all`, plus an
+  `Auth`: `AgentAuth`, `SudoAuth`, `PasswordAuth`, which is never shown in `repr`). It
+  owns its remote code: `source` is a file beside the class (bash, Python, anything with
+  a shebang), `support` lists helper files shipped with it (Python helpers live in
+  `src/ccdc/remote_lib/` and are imported on the target as plain modules). `arguments()`
+  builds its argv and `parse()` turns `{rc, stdout, stderr}` into the result (default: the
+  JSON on stdout). `PlaybookScript` is an `AnsibleScript` whose source is a playbook.
+- `ComposedScript(Step(script, **prefilled), other, ...)` runs any series of scripts,
+  local and remote mixed, in order and returns their results. Arguments given to
+  `run(**kw)` reach the steps that accept them and override prefilled values.
+  `script.bind(**kw)` is a one-step composition with arguments filled in.
+- `BundleScript` is a `ComposedScript` of `AnsibleScript`s that is **packed into one
+  archive** (only its steps' files), uploaded once and run in order on the host,
+  returning one result per step. A failed step is a `RemoteError` value in its slot
+  (`keep_going=False` stops at the first failure and raises); identical steps run once.
+  A lone `AnsibleScript.run` is a one-step bundle. Only `src/ccdc/runner.py` spawns Ansible.
+  (`EntryScript`/`EntryScanner` are the old way, a name resolved inside one global
+  bundle of `src/host/`; they are deprecated and are being converted.)
 - **Phase scripts** (`src/scripts/`) are what `ccdcctl` runs for the interactive
   workflows, grouped by phase: `init/` (`Init`, `HostKeys`, `PamGate`) and `firewall/`
   (`PrepareNetworkTools`, `ApplyFirewall`, `RestoreFirewall`). SSH has no phase script:
@@ -346,13 +357,13 @@ when present) instead of recording that it did.
   may set `PRIORITY = {FixClass: n}`. No central list exists to edit. Mark a shared
   base class with `abstract = True` in its own body to keep it out of the registry.
 
-**Adding a scanner:** write `src/host/scan_<thing>.py` printing
-`{"findings": [...], "errors": [...]}` (the launcher allows `scan_*`, `fix_*`,
-`install_*`, `detect_*` entries automatically); add `src/ccdc/scanners/<thing>.py` with
-a `Finding` dataclass and a `BundleScanner` whose `findings(target, row)` builds it.
-**Adding a fix:** add `src/ccdc/fixes/<thing>.py` with an `AutoFix` that returns a
-`Script.bind(...)` (define the script, usually a `BundleScript` over a `fix_*` host
-entry, in the same module).
+**Adding a scanner:** make a package `src/ccdc/scanners/<thing>/`: `__init__.py` holds
+the `Finding` dataclasses, an `AnsibleScript` (`source = "remote.sh"`, or `remote.py` with
+`support = (...)`) and a `Scanner` whose `remote_step(target)` returns that script and whose
+`findings(target, row)` builds findings; `remote.*` beside it prints
+`{"findings": [...], "errors": [...]}`. `ccdcctl scan` bundles every scanner's step into one
+run per host. **Adding a fix:** `src/ccdc/fixes/<thing>/` with an `AutoFix` that returns
+`script.bind(...)` and the `AnsibleScript` (with its `remote.*`) it runs, in the same package.
 
 ### `services [host|all]`: approve what each host exposes
 

@@ -9,7 +9,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
-from ccdc.script import Script
+from ccdc.script import HostScript
 
 SLACK = 10  # seconds beyond the largest RestartSec, for fix verification
 
@@ -61,7 +61,7 @@ def _scan(target, scanners):
     return scan_target(target, scanners)
 
 
-class RescanGuard(Script):
+class RescanGuard(HostScript):
     """run(target, first=None): scan (or take `first` as the earlier scan), sleep, scan again.
 
     delay is a floor: if the first findings carry `restart_sec` hints the wait is at

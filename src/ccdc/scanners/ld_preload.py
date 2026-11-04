@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from ccdc.findings import BundleScanner, Finding
+from ccdc.findings import EntryScanner, Finding
 
 
 @dataclass(frozen=True)
@@ -43,7 +43,7 @@ class UnownedMappedLibrary(Finding):
         return f"unowned library {self.library} mapped by {', '.join(self.processes)}"
 
 
-class LibraryInjectionScanner(BundleScanner):
+class LibraryInjectionScanner(EntryScanner):
     entry = "scan_ld_preload"
 
     def findings(self, target, row):

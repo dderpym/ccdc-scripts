@@ -1,11 +1,11 @@
 """Firewall phase: find what a host exposes, let a human approve it, record it in inventory.yml."""
-from ccdc.ansible import BundleScript
+from ccdc.ansible import EntryScript
 from ccdc.inventory_edit import INVENTORY, set_services
-from ccdc.script import Script
+from ccdc.script import HostScript
 from ccdc.services import declared, exposed
 
 
-class DiscoverServices(BundleScript):
+class DiscoverServices(EntryScript):
     """Non-loopback listeners (ss -tulpn as root, via discover_listeners) as {(proto, port): info}."""
     entry = "discover_listeners"
 
@@ -13,7 +13,7 @@ class DiscoverServices(BundleScript):
         return exposed(document)
 
 
-class ApproveServices(Script):
+class ApproveServices(HostScript):
     """run(target, ask=input, out=print, inventory=INVENTORY): review each unapproved listener.
 
     Approved services are written back to inventory.yml under the host as

@@ -1,9 +1,9 @@
 """Remediation: remove PAM hooks and restore the distribution modules."""
-from ccdc.ansible import BundleScript
+from ccdc.ansible import EntryScript
 from ccdc.findings import AutoFix
 from ccdc.osinfo import DetectOS
 from ccdc.scanners.pam import PamExecHook, PamForeignModule, PamModuleModified, PamStrayFile
-from ccdc.script import ComposedScript, Script, Step
+from ccdc.script import ComposedScript, HostScript, Step
 from scripts.init.pam_gate import PamGate
 
 
@@ -11,7 +11,7 @@ MANAGERS = {"debian": "apt", "rhel": "dnf", "suse": "zypper"}
 
 
 
-class RemovePamLine(BundleScript):
+class RemovePamLine(EntryScript):
     """Delete a rule (and optionally its payload file) from a /etc/pam.d file, with backup."""
     entry = "fix_pam"
 
@@ -19,21 +19,21 @@ class RemovePamLine(BundleScript):
         return ["remove-line", file, line, *(["--payload", payload] if payload else [])]
 
 
-class RemovePamFile(BundleScript):
+class RemovePamFile(EntryScript):
     entry = "fix_pam"
 
     def arguments(self, path, **kwargs):
         return ["remove-file", path]
 
 
-class _Reinstall(BundleScript):
+class _Reinstall(EntryScript):
     entry = "fix_pam"
 
     def arguments(self, manager, **kwargs):
         return ["reinstall", manager]
 
 
-class ReinstallPam(Script):
+class ReinstallPam(HostScript):
     """Reinstall the PAM packages with the native manager, chosen by OS detection each run."""
 
     def __init__(self, runner=None):

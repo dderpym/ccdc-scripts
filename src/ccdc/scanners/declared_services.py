@@ -1,7 +1,7 @@
 """Listening services judged against the services the inventory declares (live `ss`, not a file)."""
 from dataclasses import dataclass
 
-from ccdc.findings import BundleScanner, Finding, ScanResult
+from ccdc.findings import EntryScanner, Finding, ScanResult
 from ccdc.services import NOT_DECLARED, declared, exposed
 
 
@@ -32,7 +32,7 @@ class ApprovedServiceDown(Finding):
         return f"approved service {self.name} ({self.proto}/{self.port}) is not listening"
 
 
-class DeclaredServicesScanner(BundleScanner):
+class DeclaredServicesScanner(EntryScanner):
     """Non-loopback listeners (discover_listeners, as root) against `services:` in the inventory."""
     entry = "discover_listeners"
 

@@ -7,8 +7,8 @@ data already filled in, so callers can just .run() it.
 from dataclasses import asdict, dataclass, fields
 from typing import ClassVar
 
-from ccdc.ansible import BundleScript
-from ccdc.script import Script
+from ccdc.ansible import EntryScript
+from ccdc.script import HostScript
 from ccdc.target import Target
 
 SEVERITIES = ("critical", "warning", "info")
@@ -42,11 +42,35 @@ class ScanResult(list):
         self.errors = list(errors)
 
 
-class Scanner(Script):
-    """Claims not to affect the server, so it is safe to run as often as wanted."""
+class Scanner(HostScript):
+    """Claims not to affect the server, so it is safe to run as often as wanted.
+
+    A scanner runs locally (it is a HostScript). Its detection runs on the target as an
+    AnsibleScript: `remote_step(target)` returns it (None for a purely local scanner) and
+    `findings_from(target, result)` turns the step's parsed output
+    ({"findings": [rows], "errors": [...]}) into a ScanResult. scan_target puts the steps
+    of all scanners into one BundleScript per host; `scan` runs this scanner's step alone.
+    """
+
+    def __init__(self, runner=None):
+        self.runner = runner
+
+    def remote_step(self, target):
+        return None
+
+    def findings_from(self, target, result):
+        findings = [f for row in result.get("findings", []) for f in self.findings(target, row)]
+        return ScanResult(findings, result.get("errors", []))
+
+    def findings(self, target, row):
+        """Zero or more Findings for one row of host output."""
+        raise NotImplementedError
 
     def scan(self, target):
-        raise NotImplementedError
+        step = self.remote_step(target)
+        if step is None:
+            raise NotImplementedError
+        return self.findings_from(target, step.run(target))
 
     def run(self, target):
         return self.scan(target)
@@ -60,21 +84,15 @@ class Scanner(Script):
         pass
 
 
-class BundleScanner(Scanner, BundleScript):
-    """A scanner whose detection runs on the host as a bundle entry printing
-    {"findings": [...], "errors": [...]}. Subclasses turn each row into a Finding."""
+class EntryScanner(Scanner, EntryScript):
+    """DEPRECATED with EntryScript: detection is an entry of the global host bundle."""
 
     def __init__(self, runner=None):
-        BundleScript.__init__(self, runner)
+        EntryScript.__init__(self, runner)
 
     def scan(self, target):
         document = self.runner.entry(target, self.entry, self.arguments(), become=self.become)
-        findings = [finding for row in document.get("findings", []) for finding in self.findings(target, row)]
-        return ScanResult(findings, document.get("errors", []))
-
-    def findings(self, target, row):
-        """Zero or more Findings for one row of host output."""
-        raise NotImplementedError
+        return self.findings_from(target, document)
 
     run = Scanner.run
 

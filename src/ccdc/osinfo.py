@@ -1,7 +1,7 @@
 """OS detection layer: everything distro-specific starts from DetectOS."""
 from dataclasses import dataclass
 
-from ccdc.ansible import BundleScript
+from ccdc.ansible import EntryScript
 
 
 @dataclass(frozen=True)
@@ -12,7 +12,7 @@ class OSInfo:
     family: str
 
 
-class DetectOS(BundleScript):
+class DetectOS(EntryScript):
     entry = "detect_os"
     become = False
 

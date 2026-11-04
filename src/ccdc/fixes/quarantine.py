@@ -1,9 +1,9 @@
-from ccdc.ansible import BundleScript
+from ccdc.ansible import EntryScript
 from ccdc.findings import AutoFix
 from ccdc.scanners.unowned import TimestompedFile, UnitRunsUnownedBinary, UnownedExecutable
 
 
-class Quarantine(BundleScript):
+class Quarantine(EntryScript):
     """Evidence copy, freeze, kill and delete of binaries/units (host/fix_quarantine.py)."""
     entry = "fix_quarantine"
 

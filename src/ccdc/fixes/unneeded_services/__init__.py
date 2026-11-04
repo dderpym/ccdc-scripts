@@ -1,16 +1,17 @@
-from ccdc.ansible import BundleScript
+from ccdc.ansible import AnsibleScript
 from ccdc.findings import AutoFix
 from ccdc.scanners.unneeded_services import UnneededService
 
 
-class DisableServices(BundleScript):
-    """`systemctl disable --now` the named units; units not installed are skipped (host/fix_services.py)."""
-    entry = "fix_services"
+class DisableServices(AnsibleScript):
+    """`systemctl disable --now` the named units; units not installed are skipped (remote.sh)."""
+    source = "remote.sh"
 
     def arguments(self, units=(), **kwargs):
         return ["disable", *units]
 
-    def parse(self, document, **kwargs):
+    def parse(self, result, **kwargs):
+        document = super().parse(result, **kwargs)
         if document.get("failed"):
             raise RuntimeError("could not disable: " + ", ".join(f"{u} ({r})" for u, r in document["failed"].items()))
         return document

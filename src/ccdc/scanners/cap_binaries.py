@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from ccdc.findings import BundleScanner, Finding
+from ccdc.findings import EntryScanner, Finding
 
 
 @dataclass(frozen=True)
@@ -15,7 +15,7 @@ class UnownedCapabilityBinary(Finding):
         return f"unowned binary {self.path} has file capabilities {self.capabilities}"
 
 
-class CapBinaryScanner(BundleScanner):
+class CapBinaryScanner(EntryScanner):
     entry = "scan_cap_binaries"
 
     def findings(self, target, row):

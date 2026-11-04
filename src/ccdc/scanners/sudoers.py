@@ -1,7 +1,7 @@
 """Sudo as active on the host: what `sudo -l` grants each account, and whether the config is valid."""
 from dataclasses import dataclass
 
-from ccdc.findings import BundleScanner, Finding
+from ccdc.findings import EntryScanner, Finding
 
 
 @dataclass(frozen=True)
@@ -57,7 +57,7 @@ class SudoersInvalid(Finding):
         return "visudo -c rejects the active sudo configuration: " + self.detail.replace("\n", "; ")[:200]
 
 
-class SudoersScanner(BundleScanner):
+class SudoersScanner(EntryScanner):
     entry = "scan_sudoers"
     KINDS = {"world": SudoGrantsEveryone, "grant": UnexpectedSudoGrant}
 

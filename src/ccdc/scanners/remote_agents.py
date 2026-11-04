@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from ccdc.findings import BundleScanner, Finding
+from ccdc.findings import EntryScanner, Finding
 
 
 @dataclass(frozen=True)
@@ -17,7 +17,7 @@ class RemoteAccessAgent(Finding):
         return f"remote-access agent {self.name} ({self.kind}): {self.location}"
 
 
-class RemoteAgentScanner(BundleScanner):
+class RemoteAgentScanner(EntryScanner):
     entry = "scan_remote_agents"
 
     def findings(self, target, row):

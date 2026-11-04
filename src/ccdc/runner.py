@@ -60,15 +60,17 @@ def _failure(response, result):
             or response.get("msg") or "remote command failed")
 
 
-def collect(hosts, entry, args=(), variables=None, run=run_ansible, **request):
+def collect(hosts, entry, args=(), variables=None, run=run_ansible, archive=None, **request):
     """One Ansible batch running a bundle entry; (states, errors) keyed by host.
 
     Successful hosts are kept even when another is unreachable. `variables` are
     connection overrides (see ccdc.target.Auth); `request` goes to remote.request.
+    `archive` runs a BundleScript archive instead of a legacy entry.
     """
     with tempfile.TemporaryDirectory(prefix="ccdc-results-") as directory:
         command = ["ansible-playbook", str(PLAYBOOKS / "remote.yml"), "--limit", ":".join(hosts), *extra_args(),
-                   "--extra-vars", remote.request(entry, args, **request)]
+                   "--extra-vars", remote.archive_request(archive, **request) if archive
+                   else remote.request(entry, args, **request)]
         if variables:
             result = with_vars(command, variables, run, result_dir=directory, result_task=remote.TASK)
         else:
@@ -104,6 +106,19 @@ class AnsibleRunner:
             raise RemoteError(f"{target.host}: {errors[target.host]}")
         return states[target.host]
 
+    def archive(self, target, path, **request):
+        """Run a BundleScript archive; returns its envelope {"steps": [{name, rc, stdout, stderr}]}."""
+        states, errors = collect([target.host], None, (), target.auth.variables(), archive=path, **request)
+        if target.host in errors:
+            raise RemoteError(f"{target.host}: {errors[target.host]}")
+        return states[target.host]
+
+    def act_archive(self, target, path, **request):
+        """Live (progress UI) run of a BundleScript archive; True when Ansible succeeded."""
+        command = ["ansible-playbook", str(PLAYBOOKS / "remote.yml"), "--limit", target.host, *extra_args(),
+                   "--extra-vars", remote.archive_request(path, **request)]
+        return self._live(command, target.auth.variables()).returncode == 0
+
     def act(self, target, entry, args=(), **request):
         """Live (progress UI) run of a mutating bundle entry; True when Ansible succeeded."""
         command = ["ansible-playbook", str(PLAYBOOKS / "remote.yml"), "--limit", target.host, *extra_args(),
@@ -111,7 +126,9 @@ class AnsibleRunner:
         return self._live(command, target.auth.variables()).returncode == 0
 
     def playbook(self, target, name, variables=None):
-        command = ["ansible-playbook", str(PLAYBOOKS / f"{name}.yml"), "--limit", target.host, *extra_args()]
+        """`name` is a playbook under ansible/playbooks, or a path to a .yml file."""
+        path = name if isinstance(name, Path) else PLAYBOOKS / f"{name}.yml"
+        command = ["ansible-playbook", str(path), "--limit", target.host, *extra_args()]
         if not self._live(command, {**target.auth.variables(), **(variables or {})}).returncode:
             return True
         raise RemoteError(f"{target.host}: playbook {name} failed")

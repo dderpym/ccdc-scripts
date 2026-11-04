@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 
-from ccdc.findings import BundleScanner, Finding
+from ccdc.findings import EntryScanner, Finding
 
 
 @dataclass(frozen=True)
@@ -16,7 +16,7 @@ class PathShadowing(Finding):
         return f"{self.name} exists at {', '.join(self.paths)}; not package-owned: {', '.join(self.unowned)}"
 
 
-class PathShadowScanner(BundleScanner):
+class PathShadowScanner(EntryScanner):
     entry = "scan_path_shadow"
 
     def findings(self, target, row):

@@ -3,7 +3,7 @@ import re
 import threading
 from dataclasses import dataclass
 
-from ccdc.findings import BundleScanner, Finding, ScanResult
+from ccdc.findings import EntryScanner, Finding, ScanResult
 from ccdc.scanners.permissions import drift_from_fix
 
 LISTING = re.compile(r"^(\S{10}[.+@]?) (\S+) (\S+) (/.+)$")
@@ -92,7 +92,7 @@ def all_tests():
     return sorted(found)
 
 
-class LSEScanner(BundleScanner):
+class LSEScanner(EntryScanner):
     """Base for scanners over a subset of LSE tests.
 
     `tests` are the finding ids to run. `listing_type`, if set, is built as

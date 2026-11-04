@@ -13,6 +13,8 @@ import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[1]  # src/
+# remote_lib modules the old global bundle still ships as host.<name> (until their last EntryScript user is converted)
+LEGACY_LIB = ("procfs.py",)
 DATA = {"vendor/lse.sh": "host/data/lse.sh", "vendor/LSE-LICENSE": "host/data/LSE-LICENSE"}
 MAIN = "from host.launcher import main\nraise SystemExit(main())\n"
 TASK = "Run host script"
@@ -32,6 +34,8 @@ def build_bundle(destination, root=ROOT):
             add(archive, "__main__.py", MAIN)
             for path in sorted((root / "host").glob("*.py")):
                 add(archive, "host/" + path.name, path.read_bytes())
+            for name in LEGACY_LIB:
+                add(archive, "host/" + name, (root / "ccdc/remote_lib" / name).read_bytes())
             for source, name in sorted(DATA.items()):
                 add(archive, name, (root / source).read_bytes())
     Path(destination).chmod(stat.S_IRWXU)
@@ -56,4 +60,11 @@ def request(entry, args=(), become=True, connection=False, payload=None):
     """
     return json.dumps({"ccdc_remote": {
         "bundle": str(bundle_path()), "entry": entry, "args": [str(a) for a in args],
+        "become": become, "connection": connection, "payload": str(payload) if payload else ""}})
+
+
+def archive_request(archive, become=True, connection=False, payload=None):
+    """Extra-vars for remote.yml running a BundleScript archive (its driver ignores argv)."""
+    return json.dumps({"ccdc_remote": {
+        "bundle": str(archive), "entry": "run", "args": [],
         "become": become, "connection": connection, "payload": str(payload) if payload else ""}})

@@ -1,9 +1,9 @@
-from ccdc.ansible import BundleScript
+from ccdc.ansible import EntryScript
 from ccdc.findings import AutoFix
 from ccdc.scanners.sudoers import SudoGrant
 
 
-class RemoveSudoersGrant(BundleScript):
+class RemoveSudoersGrant(EntryScript):
     """Remove the sudoers line(s) behind a live `sudo -l` grant, validated by visudo, original kept in /root/ir."""
     entry = "fix_sudoers"
 

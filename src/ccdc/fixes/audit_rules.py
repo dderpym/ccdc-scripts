@@ -1,11 +1,11 @@
-from ccdc.ansible import BundleScript
+from ccdc.ansible import EntryScript
 from ccdc.findings import AutoFix
 from ccdc.packages import InstallAuditd
 from ccdc.scanners.audit_rules import AuditWatchMissing
 from ccdc.script import ComposedScript, Step
 
 
-class InstallAuditRules(BundleScript):
+class InstallAuditRules(EntryScript):
     entry = "install_audit_rules"
 
 

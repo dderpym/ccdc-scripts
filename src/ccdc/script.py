@@ -15,6 +15,13 @@ class Script:
         return type(self).__name__
 
 
+class HostScript(Script):
+    """A script that runs LOCALLY, on the controller: guards, prompts, inventory edits, parsing.
+
+    Scripts that run on a target are AnsibleScripts (ccdc.ansible).
+    """
+
+
 class Step:
     """One script in a sequence plus the arguments the sequence fixes for it."""
 
@@ -39,8 +46,8 @@ def accepted(function, values):
 class ComposedScript(Script):
     """Scripts run in order; run() returns each step's result in order.
 
-    A step may be a bare Script or Step(script, **prefilled). A failing step raises
-    and later steps do not run.
+    Steps may be local and remote in any mix: a step is a bare Script or
+    Step(script, **prefilled). A failing step raises and later steps do not run.
     """
 
     def __init__(self, *steps):

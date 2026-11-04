@@ -1,7 +1,7 @@
 """PAM as active on the host: effective per-service stacks, loaded modules, package integrity."""
 from dataclasses import dataclass
 
-from ccdc.findings import BundleScanner, Finding
+from ccdc.findings import EntryScanner, Finding
 
 
 def runs_for(services, file):
@@ -81,7 +81,7 @@ class PamModuleModified(Finding):
         return f"{self.path} fails package verification ({self.detail})"
 
 
-class PamScanner(BundleScanner):
+class PamScanner(EntryScanner):
     entry = "scan_pam"
 
     def findings(self, target, row):

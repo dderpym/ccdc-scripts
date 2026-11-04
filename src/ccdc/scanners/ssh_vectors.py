@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ccdc.runner import ROOT
-from ccdc.findings import BundleScanner, Finding, ScanResult
+from ccdc.findings import EntryScanner, Finding, ScanResult
 
 TEAM_KEYS = ROOT / "secrets" / "oski.pub"
 
@@ -178,7 +178,7 @@ def declared_policy(variables):
     return {k: v for k, v in merged.items() if v is not None}
 
 
-class SSHVectorScanner(BundleScanner):
+class SSHVectorScanner(EntryScanner):
     entry = "scan_ssh_vectors"
 
     def __init__(self, runner=None, allowlist=None, keys=None):

@@ -1,9 +1,9 @@
-from ccdc.ansible import BundleScript
+from ccdc.ansible import EntryScript
 from ccdc.findings import AutoFix
 from ccdc.scanners.permissions import PermissionDrift
 
 
-class SetPermissions(BundleScript):
+class SetPermissions(EntryScript):
     """Clear mode bits (octal string), set an exact mode/owner, optionally chown to root:root."""
     entry = "fix_permissions"
 

@@ -1,13 +1,13 @@
 """Init phase: never rotate passwords through a PAM stack that captures them."""
 from ccdc.scanners.pam import PamScanner
-from ccdc.script import ComposedScript, Script
+from ccdc.script import ComposedScript, HostScript
 
 
 class PamDirty(RuntimeError):
     pass
 
 
-class PamGate(Script):
+class PamGate(HostScript):
     """Refuse to continue while the ACTIVE PAM stack (as resolved on the host, plus loaded modules) is dirty.
 
     Password changes (chpasswd) run through PAM, so a pam_exec expose_authtok hook sees

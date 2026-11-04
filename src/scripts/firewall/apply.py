@@ -1,10 +1,10 @@
 """Firewall phase: apply the approved inbound policy, or restore the saved snapshot."""
 import json
 
-from ccdc.ansible import BundleScript
+from ccdc.ansible import EntryScript
 
 
-class ApplyFirewall(BundleScript):
+class ApplyFirewall(EntryScript):
     """run(target, tcp, udp): approved port lists. Returns success."""
     entry = "discover_firewall"
     live = True
@@ -14,7 +14,7 @@ class ApplyFirewall(BundleScript):
         return ["--apply", json.dumps({"tcp": tcp, "udp": udp})]
 
 
-class RestoreFirewall(BundleScript):
+class RestoreFirewall(EntryScript):
     """run(target, payload=snapshot file). Returns success."""
     entry = "discover_firewall"
     live = True

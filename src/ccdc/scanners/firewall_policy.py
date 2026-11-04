@@ -1,7 +1,7 @@
 """The EFFECTIVE inbound firewall (discover_firewall, as root) against the services the inventory declares."""
 from dataclasses import dataclass
 
-from ccdc.findings import BundleScanner, Finding, ScanResult
+from ccdc.findings import EntryScanner, Finding, ScanResult
 from ccdc.services import declared
 
 
@@ -41,7 +41,7 @@ class FirewallNotRestricting(Finding):
         return f"inbound default is accept ({self.backend}): nothing outside the inventory is blocked"
 
 
-class FirewallPolicyScanner(BundleScanner):
+class FirewallPolicyScanner(EntryScanner):
     """Exact comparison only when the policy is one we can summarize; otherwise an explicit error, never a guess."""
     entry = "discover_firewall"
 

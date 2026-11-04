@@ -1,7 +1,7 @@
 """Files in system directories that no package owns (doc 5.1)."""
 from dataclasses import dataclass, field
 
-from ccdc.findings import BundleScanner, Finding
+from ccdc.findings import EntryScanner, Finding
 
 
 @dataclass(frozen=True)
@@ -77,7 +77,7 @@ class UnitMissingBinary(Finding):
         return f"unit {self.unit} points at missing {self.binary} (leftover?)"
 
 
-class UnownedScanner(BundleScanner):
+class UnownedScanner(EntryScanner):
     entry = "scan_unowned"
 
     def findings(self, target, row):

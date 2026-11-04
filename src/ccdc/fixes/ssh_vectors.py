@@ -1,10 +1,10 @@
 """sshd_config problems are reported only: editing it can lock the team out."""
-from ccdc.ansible import BundleScript
+from ccdc.ansible import EntryScript
 from ccdc.findings import AutoFix
 from ccdc.scanners.ssh_vectors import RogueAuthorizedKey, SSHStartupScript, team_keys
 
 
-class RemoveSSHStartupFile(BundleScript):
+class RemoveSSHStartupFile(EntryScript):
     """Remove sshrc / ~/.ssh/rc after copying it to /root/ir (the host script refuses anything else)."""
     entry = "fix_ssh_vectors"
 
@@ -12,7 +12,7 @@ class RemoveSSHStartupFile(BundleScript):
         return ["remove-file", path]
 
 
-class RemoveAuthorizedKey(BundleScript):
+class RemoveAuthorizedKey(EntryScript):
     """Drop every line with this fingerprint from an authorized_keys file, keeping a backup in /root/ir."""
     entry = "fix_ssh_vectors"
 

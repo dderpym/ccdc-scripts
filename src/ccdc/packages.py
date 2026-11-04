@@ -5,12 +5,12 @@ subclasses (InstallNftables) hold a table of what each OS family calls the packa
 detect the OS on every run and delegate. Nothing is remembered between runs: the
 host script asks the package database each time.
 """
-from ccdc.ansible import BundleScript
+from ccdc.ansible import EntryScript
 from ccdc.osinfo import DetectOS
-from ccdc.script import Script
+from ccdc.script import HostScript
 
 
-class InstallWith(BundleScript):
+class InstallWith(EntryScript):
     """Install packages with one specific package manager."""
     entry = "install_packages"
     manager = None
@@ -51,7 +51,7 @@ class UnsupportedOS(RuntimeError):
     pass
 
 
-class InstallPackage(Script):
+class InstallPackage(HostScript):
     """Install `packages[family]` on whatever the target runs."""
     packages = {}
 

@@ -2,7 +2,27 @@
 from concurrent.futures import ThreadPoolExecutor
 
 from ccdc import registry
+from ccdc.ansible import BundleScript
 from ccdc.findings import SEVERITIES
+
+
+def remote_results(target, scanners):
+    """{scanner index: parsed output or exception} from ONE BundleScript run of every remote step."""
+    steps = {}
+    for index, scanner in enumerate(scanners):
+        try:
+            step = getattr(scanner, "remote_step", lambda t: None)(target)
+        except Exception as exc:
+            steps[index] = exc
+            continue
+        if step is not None:
+            steps[index] = step
+    runnable = [i for i, step in steps.items() if not isinstance(step, Exception)]
+    results = {i: step for i, step in steps.items() if isinstance(step, Exception)}
+    if runnable:
+        values = BundleScript(*[steps[i] for i in runnable]).run(target)
+        results.update(zip(runnable, values))
+    return results
 
 
 def scan_target(target, scanners):
@@ -10,9 +30,15 @@ def scan_target(target, scanners):
     for scanner in scanners:
         getattr(scanner, "begin_round", lambda t: None)(target)  # duck-typed scanners may lack rounds
     try:
-        for scanner in scanners:
+        remote = remote_results(target, scanners)
+        for index, scanner in enumerate(scanners):
             try:
-                result = scanner.run(target)
+                if index in remote:  # scanners without a remote step run locally, below
+                    if isinstance(remote[index], Exception):
+                        raise remote[index]
+                    result = scanner.findings_from(target, remote[index])
+                else:
+                    result = scanner.run(target)
             except Exception as exc:  # one broken scanner must not hide the others
                 errors.append(f"{scanner.name}: {exc}")
                 continue
