@@ -1,5 +1,6 @@
 """Offline fixtures only: never query the host manager or read secret contents."""
 import importlib.util
+import json
 import os
 from pathlib import Path
 import socket
@@ -385,6 +386,41 @@ class HostFixtures(unittest.TestCase):
         with patch.object(os, 'access', return_value=True) as access:
             self.assertTrue(original('/fixture', os.R_OK))
         access.assert_called_once_with('/fixture', os.R_OK, effective_ids=True)
+
+class FailClosedServices(HostFixtures):
+    def test_argv_with_braces_and_prefixes_parse(self):
+        program = self.file('program')
+        self.writable(program)
+        text = ('{ path=%s ; argv[]=%s --opt ${HOME} {} ; ignore_errors=yes ; pid=0 }'
+                ' { path=-%s ; argv[]=x ; ignore_errors=yes }' % (program, program, program))
+        self.assertEqual(host._exec_paths(text), [str(program), str(program)])
+        result = host.inspect_services(properties={'x.service': native(ExecStart=text)})
+        self.assertIn(str(program), evidence(result, 'extra-services'))
+        self.assertNotIn('incomplete_ids', result)
+
+    def test_unexpanded_specifier_and_garbage_are_unknown(self):
+        for text in ('{ path=/opt/%n ; argv[]=x }', 'not an exec property'):
+            with self.assertRaises(ValueError):
+                host._exec_paths(text)
+
+    def test_uninspectable_unit_is_a_finding_naming_it(self):
+        result = host.inspect_services(properties={'mystery.service': native(ExecStart='garbage')})
+        self.assertEqual(result['incomplete_ids'], ['extra-services'])
+        self.assertEqual(evidence(result, 'extra-services-unverified'), ['mystery.service: ExecStart syntax/path unknown'])
+
+    def test_no_default_cap_of_64(self):
+        program = self.file('program')
+        properties = {'u%d.service' % i: native(ExecStart=executable(program)) for i in range(100)}
+        self.assertNotIn('incomplete_ids', host.inspect_services(properties=properties))
+
+    def test_docker_sock_mount_flagged(self):
+        for name, binds in (('a' * 64, ['/var/run/docker.sock:/var/run/docker.sock']), ('b' * 64, ['/data:/data'])):
+            directory = self.base / name
+            directory.mkdir()
+            (directory / 'hostconfig.json').write_text('{"Binds": %s}' % json.dumps(binds))
+        result = host.inspect_docker_sock_mounts(containers=str(self.base))
+        self.assertEqual(evidence(result, 'extra-docker-sock-mounts'), ['container ' + 'a' * 12])
+        self.assertNotIn('incomplete_ids', result)
 
 
 if __name__ == '__main__':

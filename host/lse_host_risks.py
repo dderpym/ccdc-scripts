@@ -7,6 +7,7 @@ agent directories. Fixture arguments avoid contacting the host service manager.
 """
 import contextlib
 import errno
+import json
 import os
 from pathlib import Path
 import pwd
@@ -39,6 +40,12 @@ def _result(name, contexts=(), gaps=(), raw=''):
                              summary=name + ': permission metadata review candidates, not validated exploitation',
                              context=[dict(summary=reason, evidence=[path]) for path, reason in sorted(set(contexts))]))
     result = dict(findings=findings, raw=raw, errors=[])
+    units = sorted({gap for gap in gaps if UNIT_GAP.match(gap)})
+    if units:
+        # A unit we could not inspect is where a disguised one hides: name it.
+        findings.append(dict(id=test_id + '-unverified', severity='warning',
+                             summary=name + ': units that could not be inspected need manual review',
+                             context=[dict(summary='Not inspected', evidence=units)]))
     if gaps:
         result['incomplete_ids'] = [test_id]
         findings.append(dict(id='scanner-' + test_id, severity='warning', summary=name + ': coverage incomplete',
@@ -189,18 +196,34 @@ def _unescape(value, search=False):
     return path
 
 
+EXEC_ITEM = re.compile(r'\{\s*path=(.*?) ; argv\[\]=')
+EXEC_PREFIXES = '-@+!:'
+MAX_UNITS = 4096  # sanity bound only; hitting it is reported, not silent
+UNIT_GAP = re.compile(r'^[A-Za-z0-9_@.:\\-]+\.service: ')
+
+
 def _exec_paths(value):
+    """Executable paths from native `systemctl show` Exec* output.
+
+    Each command is `{ path=P ; argv[]=ARGV ; ignore_errors=.. ; ... }`. Only P is
+    needed and ARGV may contain braces (`${VAR}`, `{}`), so items are located by
+    their `path=` heads rather than by matching the whole brace group. systemd
+    already expanded specifiers, so a surviving `%` means the value is not final.
+    """
+    value = value.strip()
+    heads = list(EXEC_ITEM.finditer(value))
+    if value and not heads:
+        raise ValueError('Unknown native Exec property syntax')
     paths = []
-    while value.strip():
-        match = re.match(r'\s*\{\s*path=(.*?) ; argv\[\]=[^{}]*;[^{}]*\}\s*', value)
-        if not match:
-            raise ValueError('Unknown native Exec property syntax')
-        paths.append(_unescape(match[1], search=True))
-        value = value[match.end():]
+    for head in heads:
+        raw = head[1].lstrip(EXEC_PREFIXES)  # defensive: show omits prefixes, unit files carry them
+        if '%' in raw:
+            raise ValueError('Unexpanded systemd specifier')
+        paths.append(_unescape(raw, search=True))
     return paths
 
 
-def inspect_services(*, properties=None, runner=_run, manager='/run/systemd/system', max_services=64):
+def inspect_services(*, properties=None, runner=_run, manager='/run/systemd/system', max_services=MAX_UNITS):
     """properties maps unit names to native show output; no manager access in fixtures."""
     if properties is None and not os.path.isdir(manager):
         return _result('services', raw='services: not applicable (no systemd manager)')
@@ -432,10 +455,40 @@ def inspect_agent_sockets(*, accounts=None, tmp='/tmp', run='/run/user', max_acc
     return _result('agent-sockets', contexts, gaps)
 
 
+def inspect_docker_sock_mounts(*, containers='/var/lib/docker/containers'):
+    """Containers with the container runtime socket bind-mounted: root-equivalent on the host."""
+    if not os.path.isdir(containers):
+        return _result('docker-sock-mounts', raw='docker-sock-mounts: not applicable (no docker state)')
+    root = _root('docker-sock-mounts')
+    if root:
+        return root
+    contexts, gaps = [], []
+    with _elevated():
+        try:
+            names = sorted(os.listdir(containers))
+        except OSError as exc:
+            return _result('docker-sock-mounts', gaps=['Cannot list containers: ' + str(exc.strerror)])
+        for name in names[:MAX_UNITS]:
+            path = os.path.join(containers, name, 'hostconfig.json')
+            try:
+                config = json.loads(read_regular(path))
+                binds = config.get('Binds') or []
+                mounts = [m.get('Source', '') for m in config.get('Mounts') or [] if isinstance(m, dict)]
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError, AttributeError) as exc:
+                gaps.append('container %s: hostconfig unreadable (%s)' % (name[:12], type(exc).__name__))
+                continue
+            for bind in [*binds, *mounts]:
+                if isinstance(bind, str) and re.search(r'(?:^|:|/)(?:docker|containerd|podman|crio)\.sock(?:$|:)', bind):
+                    contexts.append(('container ' + name[:12], 'runtime socket mounted: ' + bind))
+    return _result('docker-sock-mounts', contexts, gaps)
+
+
 def scan(deep=False):
     result = dict(findings=[], raw='', errors=[])
     checks = [('services', inspect_services), ('root-processes', inspect_root_processes),
-              ('credentials', inspect_credentials)]
+              ('credentials', inspect_credentials), ('docker-sock-mounts', inspect_docker_sock_mounts)]
     if deep:
         checks.append(('agent-sockets', inspect_agent_sockets))
     for name, check in checks:
