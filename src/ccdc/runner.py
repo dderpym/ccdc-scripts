@@ -6,9 +6,9 @@ import shlex
 import subprocess
 import tempfile
 
-from controller import remote
 
 VERBOSE = False  # set by ccdcctl --verbose: full Ansible logs instead of the progress UI
+TASK = "Run host script"  # the task whose result the results callback saves
 ROOT = Path(__file__).resolve().parents[2]
 ANSIBLE = Path(__file__).resolve().parent / "ansible"
 PLAYBOOKS = ANSIBLE / "playbooks"
@@ -60,21 +60,26 @@ def _failure(response, result):
             or response.get("msg") or "remote command failed")
 
 
-def collect(hosts, entry, args=(), variables=None, run=run_ansible, archive=None, **request):
-    """One Ansible batch running a bundle entry; (states, errors) keyed by host.
+def archive_request(archive, become=True, connection=False, payload=None):
+    """Extra-vars for remote.yml: run one BundleScript archive (its driver takes no arguments)."""
+    return json.dumps({"ccdc_remote": {
+        "archive": str(archive), "become": become, "connection": connection,
+        "payload": str(payload) if payload else ""}})
+
+
+def collect(hosts, archive, variables=None, run=run_ansible, **request):
+    """One Ansible batch running a BundleScript archive; (states, errors) keyed by host.
 
     Successful hosts are kept even when another is unreachable. `variables` are
-    connection overrides (see ccdc.target.Auth); `request` goes to remote.request.
-    `archive` runs a BundleScript archive instead of a legacy entry.
+    connection overrides (see ccdc.target.Auth); `request` is become/connection/payload.
     """
     with tempfile.TemporaryDirectory(prefix="ccdc-results-") as directory:
         command = ["ansible-playbook", str(PLAYBOOKS / "remote.yml"), "--limit", ":".join(hosts), *extra_args(),
-                   "--extra-vars", remote.archive_request(archive, **request) if archive
-                   else remote.request(entry, args, **request)]
+                   "--extra-vars", archive_request(archive, **request)]
         if variables:
-            result = with_vars(command, variables, run, result_dir=directory, result_task=remote.TASK)
+            result = with_vars(command, variables, run, result_dir=directory, result_task=TASK)
         else:
-            result = run(command, result_dir=directory, result_task=remote.TASK)
+            result = run(command, result_dir=directory, result_task=TASK)
         states, errors = {}, {}
         for host in hosts:
             try:
@@ -107,21 +112,14 @@ def failure_message(result):
 
 
 class AnsibleRunner:
-    """Runs bundle entries and playbooks on one Target. Tests substitute a fake.
+    """Runs BundleScript archives and playbooks on one Target. Tests substitute a fake.
 
     Target.host is passed to --limit, so it may be a pattern such as 'all' or 'a:b'.
     """
 
-    def entry(self, target, entry, args=(), **request):
-        """Captured run of a bundle entry; returns its parsed JSON stdout."""
-        states, errors = collect([target.host], entry, args, target.auth.variables(), **request)
-        if target.host in errors:
-            raise RemoteError(f"{target.host}: {errors[target.host]}")
-        return states[target.host]
-
     def archive(self, target, path, **request):
         """Run a BundleScript archive; returns its envelope {"steps": [{name, rc, stdout, stderr}]}."""
-        states, errors = collect([target.host], None, (), target.auth.variables(), archive=path, **request)
+        states, errors = collect([target.host], path, target.auth.variables(), **request)
         if target.host in errors:
             raise RemoteError(f"{target.host}: {errors[target.host]}")
         return states[target.host]
@@ -129,13 +127,7 @@ class AnsibleRunner:
     def act_archive(self, target, path, **request):
         """Live (progress UI) run of a BundleScript archive; True when Ansible succeeded."""
         command = ["ansible-playbook", str(PLAYBOOKS / "remote.yml"), "--limit", target.host, *extra_args(),
-                   "--extra-vars", remote.archive_request(path, **request)]
-        return self._live(command, target.auth.variables()).returncode == 0
-
-    def act(self, target, entry, args=(), **request):
-        """Live (progress UI) run of a mutating bundle entry; True when Ansible succeeded."""
-        command = ["ansible-playbook", str(PLAYBOOKS / "remote.yml"), "--limit", target.host, *extra_args(),
-                   "--extra-vars", remote.request(entry, args, **request)]
+                   "--extra-vars", archive_request(path, **request)]
         return self._live(command, target.auth.variables()).returncode == 0
 
     def playbook(self, target, name, variables=None):

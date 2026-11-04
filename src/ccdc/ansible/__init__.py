@@ -180,21 +180,3 @@ class PlaybookScript(AnsibleScript):
     def run(self, target, **variables):
         name = self.source_path() if self.source else self.playbook
         return self.runner.playbook(target, name, variables)
-
-
-class EntryScript(AnsibleScript):
-    """DEPRECATED: runs one entry of the global host bundle (host/<entry>.py); to be replaced by AnsibleScript."""
-    entry = None
-    live = False
-
-    def parse(self, document, **kwargs):
-        return document
-
-    def run(self, target, payload=None, **kwargs):
-        """payload: controller file delivered to the entry as stdin."""
-        args = self.arguments(**kwargs)
-        if self.live:
-            return self.runner.act(target, self.entry, args, become=self.become,
-                                   connection=self.connection, payload=payload)
-        document = self.runner.entry(target, self.entry, args, become=self.become, payload=payload)
-        return self.parse(document, **kwargs)

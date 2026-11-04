@@ -7,7 +7,6 @@ data already filled in, so callers can just .run() it.
 from dataclasses import asdict, dataclass, fields
 from typing import ClassVar
 
-from ccdc.ansible import EntryScript
 from ccdc.script import HostScript
 from ccdc.target import Target
 
@@ -74,19 +73,6 @@ class Scanner(HostScript):
 
     def run(self, target):
         return self.scan(target)
-
-
-class EntryScanner(Scanner, EntryScript):
-    """DEPRECATED with EntryScript: detection is an entry of the global host bundle."""
-
-    def __init__(self, runner=None):
-        EntryScript.__init__(self, runner)
-
-    def scan(self, target):
-        document = self.runner.entry(target, self.entry, self.arguments(), become=self.become)
-        return self.findings_from(target, document)
-
-    run = Scanner.run
 
 
 class AutoFix:

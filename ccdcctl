@@ -537,25 +537,13 @@ def scanner_state(state):
     return state
 
 
-def legacy_scan_script(kind):
-    """The AnsibleScript behind the `lse`/`integrity` commands once it is converted to the new model.
-
-    ScanLSE/ScanIntegrity live in ccdc.scanners.<kind>; until they exist this returns None and the
-    command keeps using the old single-entry transport.
-    """
-    import importlib
-    try:
-        return getattr(importlib.import_module("ccdc.scanners." + kind), {"lse": "ScanLSE", "integrity": "ScanIntegrity"}[kind])
-    except (ImportError, AttributeError):
-        return None
+SCAN_SCRIPTS = {"lse": "ScanLSE", "integrity": "ScanIntegrity"}
 
 
 def scan(kind, hosts, deep=False):
-    script = legacy_scan_script(kind)
-    if script is not None:
-        states, errors = collect(script, hosts, deep=deep)
-    else:  # old single-entry transport
-        states, errors = runner.collect(hosts, "discover_" + kind, ["--deep"] if deep else [], run=run)
+    import importlib
+    script = getattr(importlib.import_module("ccdc.scanners." + kind), SCAN_SCRIPTS[kind])
+    states, errors = collect(script, hosts, deep=deep)
     valid = {}
     for host, state in states.items():
         try:
@@ -646,7 +634,8 @@ def offer_fixes(host, state, auto=None):
     with tempfile.NamedTemporaryFile(mode="w", prefix="ccdc-fixes-", suffix=".json") as out:
         json.dump(approved, out)
         out.flush()
-        success = runner.AnsibleRunner().act(Target(host), "apply_fixes", connection=False, payload=out.name)
+        from ccdc.fixes.permissions import ApplyFixes
+        success = ApplyFixes().run(Target(host), payload=out.name)
     print(("Applied " if success else "Some fixes FAILED on ") + f"{host}; re-run the scan to verify.")
 
 

@@ -1,8 +1,8 @@
 ---
-# The only way controller code runs on targets (see controller/remote.py).
-# ccdc_remote: bundle, entry, args, become, connection, payload (all set by the controller).
+# The only way controller code runs on targets (see ccdc/runner.py and ccdc/ansible/driver.py).
+# ccdc_remote: archive, become, connection, payload (all set by the controller).
 # The callback saves the result of the task named "Run host script".
-- name: Run a bundled host script
+- name: Run a BundleScript archive
   hosts: all
   gather_facts: false
   become: false
@@ -36,7 +36,7 @@
 
         - name: Run host script
           ansible.builtin.script:
-            cmd: "{{ ([remote.bundle, remote.entry] + remote.args) | map('quote') | join(' ') }}"
+            cmd: "{{ remote.archive | quote }}"
           become: "{{ remote.become | bool }}"
           environment: >-
             {{ ({'SSH_CONNECTION': remote_connection.stdout} if remote.connection | bool else {})

@@ -27,26 +27,20 @@ def remote_results(target, scanners):
 
 def scan_target(target, scanners):
     findings, errors = [], []
-    for scanner in scanners:
-        getattr(scanner, "begin_round", lambda t: None)(target)  # duck-typed scanners may lack rounds
-    try:
-        remote = remote_results(target, scanners)
-        for index, scanner in enumerate(scanners):
-            try:
-                if index in remote:  # scanners without a remote step run locally, below
-                    if isinstance(remote[index], Exception):
-                        raise remote[index]
-                    result = scanner.findings_from(target, remote[index])
-                else:
-                    result = scanner.run(target)
-            except Exception as exc:  # one broken scanner must not hide the others
-                errors.append(f"{scanner.name}: {exc}")
-                continue
-            findings.extend(result)
-            errors.extend(f"{scanner.name}: {e}" for e in result.errors)
-    finally:
-        for scanner in scanners:
-            getattr(scanner, "end_round", lambda t: None)(target)
+    remote = remote_results(target, scanners)
+    for index, scanner in enumerate(scanners):
+        try:
+            if index in remote:  # scanners without a remote step run locally, below
+                if isinstance(remote[index], Exception):
+                    raise remote[index]
+                result = scanner.findings_from(target, remote[index])
+            else:
+                result = scanner.run(target)
+        except Exception as exc:  # one broken scanner must not hide the others
+            errors.append(f"{scanner.name}: {exc}")
+            continue
+        findings.extend(result)
+        errors.extend(f"{scanner.name}: {e}" for e in result.errors)
     return list(dict.fromkeys(findings)), errors  # identical findings from overlapping scanners collapse
 
 

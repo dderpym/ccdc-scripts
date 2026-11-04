@@ -287,10 +287,9 @@ kill panes to detach. These keys assume tmux's default bindings.
 ccdcctl, ccdcctl-completion.bash, inventory.yml, setup, Makefile   controller entry points
 src/ccdc/       framework: Script, Target, scanners/ and fixes/ (one package per check), scan
 src/ccdc/ansible/  AnsibleScript, BundleScript, archive driver; ansible.cfg, playbooks/, roles/, callback_plugins/
-src/ccdc/remote_lib/  Python helpers shipped to targets
+src/ccdc/remote_lib/  Python helpers shipped to targets with the scripts that list them
 src/scripts/    phase scripts: init/ firewall/
-src/host/       legacy code that runs ON targets (global bundle; being converted into colocated packages)
-src/controller/ bundle builder, update workflow
+src/controller/ update workflow driver (`ccdcctl update`)
 src/vendor/     pinned upstream LSE
 lab/            disposable test hosts (lab/check is the live smoke suite)
 secrets/        oski.pub, bootstrap and recovery credentials (gitignored)
@@ -321,14 +320,13 @@ when present) instead of recording that it did.
   returning one result per step. A failed step is a `RemoteError` value in its slot
   (`keep_going=False` stops at the first failure and raises); identical steps run once.
   A lone `AnsibleScript.run` is a one-step bundle. Only `src/ccdc/runner.py` spawns Ansible.
-  (`EntryScript`/`EntryScanner` are the old way, a name resolved inside one global
-  bundle of `src/host/`; they are deprecated and are being converted.)
+  There is no global bundle of host code: every script ships its own files.
 - **Phase scripts** (`src/scripts/`) are what `ccdcctl` runs for the interactive
   workflows, grouped by phase: `init/` (`Init`, `HostKeys`, `PamGate`) and `firewall/`
   (`PrepareNetworkTools`, `ApplyFirewall`, `RestoreFirewall`). SSH has no phase script:
   it is a scanner plus an autofix driven by the inventory (see [SSH policy](#ssh-policy)).
-- **OS layer** (`src/ccdc/osinfo.py`): `DetectOS` returns the distro family
-  (debian, rhel, alpine, arch, void, suse). **Package layer** (`src/ccdc/packages.py`):
+- **OS layer** (`src/ccdc/osinfo/`): `DetectOS` returns the distro family
+  (debian, rhel, alpine, arch, void, suse). **Package layer** (`src/ccdc/packages/`):
   `InstallApt`/`InstallDnf`/... install with one manager; `InstallPackage`
   subclasses such as `InstallNftables` hold a family-to-package table, detect the OS
   on every run, and delegate.
@@ -827,7 +825,7 @@ changes without a `y`, and non-interactive runs never change anything.
 `--auto-apply=simple` applies mode-only fixes without asking (ownership changes
 are still prompted, or skipped without a terminal); `--auto-apply=all` also
 applies ownership changes. Fixes are absolute targets (distro-expected values,
-group/other write and secret exposure removed), applied by `src/host/apply_fixes.py`
+group/other write and secret exposure removed), applied by `ApplyFixes` (`src/ccdc/fixes/permissions/`)
 through the file descriptor, never through symlinks. Package-content changes
 are not fixable and stay as findings; re-run the scan to verify.
 
