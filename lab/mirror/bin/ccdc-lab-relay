@@ -1,0 +1,9 @@
+#!/bin/sh
+# Each listener is independently managed, including after an SSH-side restart.
+# Port numbers per host come from /etc/ccdc-lab/ports (lines: ssh=22, http=80, app=3000).
+set -eu
+name=${1#ccdc-relay-}
+port=$(sed -n "s/^$name=//p" /etc/ccdc-lab/ports | head -1)
+[ -n "$port" ] || { echo "no port for $name" >&2; exit 1; }
+owner=$(cat /var/lib/ccdc-lab/socket-owner)
+exec socat "UNIX-LISTEN:/run/lab-sockets/$name,fork,unlink-early,mode=0600,user=$owner" "TCP:127.0.0.1:$port"

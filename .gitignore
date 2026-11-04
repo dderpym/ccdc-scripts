@@ -8,6 +8,8 @@ __pycache__/
 /secrets/
 /lab/inventory.yml
 /lab/secrets/
+/lab/mirror/inventory.yml
+/lab/mirror/secrets/
 # Never commit private keys or plaintext credentials.
 *.pem
 *.key

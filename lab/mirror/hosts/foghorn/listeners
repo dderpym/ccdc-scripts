@@ -1,0 +1,3 @@
+http 80 wiki
+http 3010 chat
+http 3011 chat-api

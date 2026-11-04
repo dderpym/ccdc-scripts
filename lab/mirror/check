@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Lab check: one command that indexes every issue planted in the mirror lab and checks the lab is healthy.
+
+  check                         issue index (PRESENT / FIXED per host) + availability (ping, SSH, birdcage)
+  check --state present         only issues still present        (or: --state fixed)
+  check --host sylvester        one or more hosts                (repeatable)
+  check --category setuid       one category                     (repeatable)
+  check --json                  machine-readable output
+  check --expect faulty         exit 1 unless every issue is present (lab self-test after `manage up`)
+  check --expect fixed          exit 1 unless every issue is fixed   (after you remediate)
+  check --allow daffy:80 foghorn:3010
+                                also assert the firewall result: listed ports open, other stand-in ports
+                                blocked, SSH always open
+
+It reads container state directly with `docker exec` and never talks to the toolkit or to the apps, so a
+FIXED means the file/setting/bit really changed. Exposure rows (open ports) are informational. Exit status is
+nonzero for failed expectations or failed availability checks; a ping that fails only warns, because the
+toolkit's firewall blocks unsolicited echo by design.
+"""
+import argparse
+import json
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import issues as lab  # noqa: E402
+
+WIDTH = {'id': 6, 'host': 9, 'state': 8, 'sev': 6, 'category': 11}
+
+
+def observe(row):
+    ident, issue, host = row
+    try:
+        observed = issue.probe(host)
+    except Exception as exc:  # a dead container must show up as an error, not crash the index
+        return {'id': ident, 'key': issue.key, 'host': host, 'title': issue.title, 'category': issue.category,
+                'severity': issue.severity, 'state': 'error', 'observed': str(exc)[:60],
+                'informational': issue.informational}
+    present = bool(issue.present(observed))
+    return {'id': ident, 'key': issue.key, 'host': host, 'title': issue.title, 'category': issue.category,
+            'severity': issue.severity, 'state': 'present' if present else 'fixed', 'observed': observed,
+            'informational': issue.informational}
+
+
+def availability():
+    """(status, host, check, detail) rows. status: PASS | FAIL | WARN."""
+    jobs = []
+    for host in lab.HOSTS:
+        peer = lab.peer_of(host)
+        jobs.append(('ssh service active', host, lambda h=host: _active(h, 'ssh') or _active(h, 'sshd')))
+        jobs.append(('SSH reachable from ' + peer, host, lambda h=host, p=peer: lab.tcp_open(p, h, 22)))
+        jobs.append(('ping from ' + peer, host, lambda h=host, p=peer: lab.icmp_ping(p, h)))
+    for port in lab.BIRDCAGE_PORTS:
+        jobs.append((f'birdcage port {port} listening locally', 'sylvester',
+                     lambda port=port: lab.tcp_open('sylvester', 'sylvester', port)))
+        jobs.append((f'birdcage port {port} reachable from {lab.peer_of("sylvester")}', 'sylvester',
+                     lambda port=port: lab.tcp_open(lab.peer_of('sylvester'), 'sylvester', port)))
+    jobs.append(('birdcage service active', 'sylvester', lambda: _active('sylvester', 'ccdc-birdcage')))
+    for host in lab.HOSTS:
+        if host != 'sylvester':
+            jobs.append(('stand-in listeners service active', host, lambda h=host: _active(h, 'ccdc-listeners')))
+
+    def run(job):
+        name, host, call = job
+        try:
+            ok = bool(call())
+        except Exception:
+            ok = False
+        warn = name.startswith('ping')
+        return ('PASS' if ok else ('WARN' if warn else 'FAIL'), host, name)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return list(pool.map(run, jobs))
+
+
+def _active(host, unit):
+    return lab.sh(host, f'systemctl is-active {unit} 2>/dev/null') == 'active'
+
+
+def firewall_rows(allow):
+    allowed = {}
+    for item in allow:
+        for entry in item.split(','):
+            host, _, port = entry.partition(':')
+            allowed.setdefault(host, set()).add(int(port))
+    jobs = []
+    for host, ports in lab.STAND_IN_PORTS.items():
+        for port in sorted(set(ports) | {22}):
+            expected = port == 22 or port in allowed.get(host, set())
+            jobs.append((host, port, expected))
+
+    def run(job):
+        host, port, expected = job
+        is_open = lab.tcp_open(lab.peer_of(host), host, port)
+        return ('PASS' if is_open == expected else 'FAIL', host,
+                f'port {port} {"open" if is_open else "blocked"}, expected {"open" if expected else "blocked"}')
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        return list(pool.map(run, jobs))
+
+
+def print_index(rows, shown):
+    print(f'{"ID":{WIDTH["id"]}} {"HOST":{WIDTH["host"]}} {"STATE":{WIDTH["state"]}} '
+          f'{"SEV":{WIDTH["sev"]}} {"CATEGORY":{WIDTH["category"]}} ISSUE')
+    for r in shown:
+        mark = {'present': 'PRESENT', 'fixed': 'fixed', 'error': 'ERROR'}[r['state']]
+        note = ' (informational)' if r['informational'] and r['state'] == 'present' else ''
+        print(f'{r["id"]:{WIDTH["id"]}} {r["host"]:{WIDTH["host"]}} {mark:{WIDTH["state"]}} '
+              f'{r["severity"]:{WIDTH["sev"]}} {r["category"]:{WIDTH["category"]}} {r["title"]}{note}')
+    real = [r for r in rows if not r['informational']]
+    present = sum(r['state'] == 'present' for r in real)
+    fixed = sum(r['state'] == 'fixed' for r in real)
+    errors = sum(r['state'] == 'error' for r in rows)
+    exposed = sum(r['state'] == 'present' for r in rows if r['informational'])
+    print(f'\n{len(real)} planted issues: {present} present, {fixed} fixed'
+          + (f', {errors} unreadable' if errors else '') + f'  |  {exposed} ports exposed (informational)')
+    by_category = {}
+    for r in real:
+        counts = by_category.setdefault(r['category'], [0, 0])
+        counts[0 if r['state'] == 'present' else 1] += 1
+    print('  by category (present/fixed): ' + ', '.join(f'{c} {p}/{f}' for c, (p, f) in sorted(by_category.items())))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--host', action='append', choices=lab.HOSTS)
+    parser.add_argument('--category', action='append')
+    parser.add_argument('--state', choices=('present', 'fixed'))
+    parser.add_argument('--json', action='store_true')
+    parser.add_argument('--expect', choices=('faulty', 'fixed'))
+    parser.add_argument('--allow', nargs='*', help='host:port[,host:port...] approved in the firewall review')
+    parser.add_argument('--no-availability', action='store_true')
+    args = parser.parse_args()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        rows = list(pool.map(observe, lab.expand()))
+    shown = [r for r in rows
+             if (not args.host or r['host'] in args.host)
+             and (not args.category or r['category'] in args.category)
+             and (not args.state or r['state'] == args.state)]
+    avail = [] if args.no_availability else availability()
+    fw = firewall_rows(args.allow) if args.allow is not None else []
+
+    failures = 0
+    real = [r for r in rows if not r['informational']]
+    if args.expect == 'faulty':
+        failures += sum(r['state'] != 'present' for r in real)
+    elif args.expect == 'fixed':
+        failures += sum(r['state'] != 'fixed' for r in real)
+    failures += sum(1 for s, *_ in avail + fw if s == 'FAIL')
+
+    if args.json:
+        print(json.dumps({'issues': shown, 'availability': [dict(zip(('status', 'host', 'check'), a)) for a in avail],
+                          'firewall': [dict(zip(('status', 'host', 'check'), a)) for a in fw],
+                          'failures': failures}, indent=2))
+        sys.exit(1 if failures else 0)
+
+    print(f'LAB ISSUE INDEX: {len(lab.HOSTS)} hosts, {len(rows)} entries\n')
+    print_index(rows, shown)
+    if avail:
+        print('\nAVAILABILITY')
+        for status, host, name in avail:
+            print(f'  {status:4} {host:10} {name}')
+        print(f'  {sum(a[0]=="PASS" for a in avail)} pass, {sum(a[0]=="WARN" for a in avail)} warn, '
+              f'{sum(a[0]=="FAIL" for a in avail)} fail')
+    if fw:
+        print('\nFIREWALL RESULT')
+        for status, host, name in fw:
+            print(f'  {status:4} {host:10} {name}')
+    if args.expect:
+        print(f'\nexpectation "{args.expect}": ' + ('met' if failures == 0 else f'NOT met ({failures} failures)'))
+    sys.exit(1 if failures else 0)
+
+
+if __name__ == '__main__':
+    main()

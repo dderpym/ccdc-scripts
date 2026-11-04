@@ -1,0 +1,4 @@
+http 80 web
+tcp 3306 mysql
+tcp 27017 mongo
+http 8200 vault

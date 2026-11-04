@@ -1,0 +1,13 @@
+[Unit]
+Description=Aviary stand-in app (video, admin, door) - lab fixture
+After=network.target
+ConditionHost=sylvester
+
+[Service]
+# Deliberately runs as root with an optional env file, like the real scenario app.
+EnvironmentFile=-/etc/birdcage.env
+ExecStart=/usr/bin/python3 /usr/local/bin/ccdc-lab-birdcage
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

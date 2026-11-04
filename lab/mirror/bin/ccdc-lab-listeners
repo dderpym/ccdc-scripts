@@ -1,0 +1,50 @@
+#!/usr/bin/env python3
+"""Tiny stand-in listeners so each mirror host exposes the real box's ports.
+
+Config lines: "<http|tcp> <port> <label>". http serves a one-line page; tcp sends a banner.
+No real services run here: this exists so firewall/listener tooling has realistic targets.
+"""
+import socket
+import sys
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+
+def http_server(port, label):
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            body = f'{label} on {socket.gethostname()} (disposable CCDC lab)\n'.encode()
+            self.send_response(200)
+            self.send_header('Content-Length', str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+    ThreadingHTTPServer(('0.0.0.0', port), Handler).serve_forever()
+
+
+def tcp_server(port, label):
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(('0.0.0.0', port))
+    server.listen(16)
+    while True:
+        conn, _ = server.accept()
+        try:
+            conn.sendall(f'{label} stand-in\n'.encode())
+        except OSError:
+            pass
+        conn.close()
+
+
+def main():
+    for line in open(sys.argv[1]):
+        parts = line.split()
+        if len(parts) == 3 and parts[0] in ('http', 'tcp'):
+            target = http_server if parts[0] == 'http' else tcp_server
+            threading.Thread(target=target, args=(int(parts[1]), parts[2]), daemon=True).start()
+    threading.Event().wait()
+
+
+main()
