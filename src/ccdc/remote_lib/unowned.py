@@ -2,8 +2,8 @@
 """scan_unowned [--allowlist FILE]: files in system dirs that no package owns. Read-only.
 
 Package verification only checks files a package owns, so red-team additions are
-invisible to it. Ownership is tested on the path AND its realpath (usrmerge: dpkg
-lists /usr/lib/... on one release and /lib/... on another).
+invisible to it. Ownership uses remote_lib/pkgowner.py, which tries every spelling of a path
+(realpath and the usrmerge /lib <-> /usr/lib counterpart).
 Prints {"findings": [rows], "errors": [...]}; row kinds: unowned-exec, timestomped,
 unit-runs-unowned, unowned-unit, unit-missing-binary.
 """
@@ -16,6 +16,8 @@ import re
 import shutil
 import subprocess
 import sys
+
+import pkgowner
 
 DIRS = ["/usr/bin", "/usr/sbin", "/usr/libexec", "/usr/local/bin", "/usr/local/sbin", "/usr/local/libexec",
         "/bin", "/sbin", "/opt/*/bin", "/lib*/security", "/usr/lib*/security", "/etc/ssh", "/etc/sudoers.d",
@@ -41,54 +43,14 @@ def list_files(directories, walk=os.walk):
                 yield os.path.join(base, name)
 
 
-def candidates(path, root="/"):
-    """Path, its realpath, and the usrmerge alias (/usr/lib/x <-> /lib/x) when /lib is a symlink into /usr."""
-    forms = {path, os.path.realpath(path)}
-    usr = os.path.join(root, "usr")
-    for form in list(forms):
-        if form.startswith(usr + "/"):
-            relative = form[len(usr) + 1:]
-            top = os.path.join(root, relative.split("/")[0])
-            if os.path.islink(top):
-                forms.add(os.path.join(root, relative))
-    return forms
+SEARCH_PATH = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin")
 
 
-def owned_set(paths, backend, run=subprocess.run):
-    """Subset of `paths` some package claims, asking the package database in batches."""
-    paths = sorted(paths)
-    owned = set()
-    for start in range(0, len(paths), 200):
-        batch = paths[start:start + 200]
-        if backend == "dpkg":
-            out = run(["dpkg", "-S", "--", *batch], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True).stdout
-            for line in out.splitlines():
-                if line.startswith("diversion by"):
-                    continue
-                _, sep, path = line.partition(": ")
-                if sep:
-                    owned.add(path.strip())
-        elif backend == "rpm":
-            out = run(["rpm", "-qf", "--qf", "%{NAME}\\n", "--", *batch], stdout=subprocess.PIPE,
-                      stderr=subprocess.DEVNULL, text=True).stdout
-            # rpm prints one line per argument, in order.
-            lines = out.splitlines()
-            if len(lines) == len(batch):
-                owned.update(p for p, line in zip(batch, lines) if "is not owned by" not in line)
-            else:
-                for path in batch:
-                    one = run(["rpm", "-qf", "--", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    if one.returncode == 0:
-                        owned.add(path)
-    return owned
-
-
-def package_backend(which=shutil.which):
-    return "dpkg" if which("dpkg") else "rpm" if which("rpm") else None
-
-
-def is_owned(path, owned, root="/"):
-    return bool(candidates(path, root) & owned)
+def resolve(binary, exists=os.path.exists, search=SEARCH_PATH):
+    """A unit may name a program bare ('systemctl'); systemd finds it on its default PATH, so do the same."""
+    if binary.startswith("/"):
+        return binary
+    return next((os.path.join(d, binary) for d in search if exists(os.path.join(d, binary))), binary)
 
 
 def is_executable(path, stat_result, opener=open):
@@ -204,7 +166,7 @@ def analyze(files, units, owned, running, allowlist=(), lstat=os.lstat, opener=o
     rows = []
     unit_set = set(units)
     for path in sorted(set(files) - unit_set):
-        if allowed(path, allowlist) or is_owned(path, owned):
+        if allowed(path, allowlist) or pkgowner.is_claimed(path, owned):
             continue
         try:
             info = lstat(path)
@@ -226,14 +188,18 @@ def analyze(files, units, owned, running, allowlist=(), lstat=os.lstat, opener=o
     for path in sorted(unit_set):
         if allowed(path, allowlist):
             continue
-        unit_owned = is_owned(path, owned)
+        unit_owned = pkgowner.is_claimed(path, owned)
         targets = list(dict.fromkeys(units[path]))
         before = len(rows)
-        for binary in targets:
+        for binary in (resolve(b, exists) for b in targets):
             base = {"path": path, "unit": path, "binary": binary, "unit_owned": unit_owned}
             if not exists(binary):
+                # A package's own unit pointing at a program that package set does not install (a conditional
+                # or optional unit on a slim image) is normal. A leftover is a unit NO package ships.
+                if unit_owned:
+                    continue
                 rows.append({**base, "kind": "unit-missing-binary", "flags": [], "pids": [], "severity": "info"})
-            elif not allowed(binary, allowlist) and not is_owned(binary, owned):
+            elif not allowed(binary, allowlist) and not pkgowner.is_claimed(binary, owned):
                 rows.append({**base, "kind": "unit-runs-unowned", "flags": ["unit-runs-unowned"],
                              "pids": running.get(os.path.realpath(binary), []),
                              "restart_sec": (getattr(units, "restart_sec", None) or {}).get(path, 0),
@@ -253,9 +219,9 @@ def cap(rows, limit=MAX_ROWS):
 
 
 def scan(allowlist=(), run=subprocess.run):
-    backend = package_backend()
+    backend = pkgowner.backend()
     if backend is None:
-        return {"findings": [], "errors": ["no dpkg or rpm database; ownership cannot be established"]}
+        return {"findings": [], "errors": ["no package database; ownership cannot be established"]}
     files = list(list_files(DIRS))
     try:
         units, unit_errors = loaded_units(run)
@@ -265,8 +231,8 @@ def scan(allowlist=(), run=subprocess.run):
     for binaries in units.values():
         asked.update(binaries)
     for path in list(asked):
-        asked |= candidates(path)
-    owned = owned_set(asked, backend, run)
+        asked.update(pkgowner.aliases(path))
+    owned = pkgowner.claimed(asked, backend, run)
     rows, errors = cap(analyze(files, units, owned, running_executables(), allowlist))
     return {"findings": rows, "errors": unit_errors + errors}
 

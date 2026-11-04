@@ -21,6 +21,8 @@ import re
 import subprocess
 import sys
 
+import pkgowner
+
 PAM_DIR = "/etc/pam.d"
 SECURITY_GLOBS = ("/lib/security", "/lib64/security", "/usr/lib/security", "/usr/lib64/security",
                   "/lib/*/security", "/usr/lib/*/security", "/usr/lib64/*/security")
@@ -132,16 +134,8 @@ def _has(tool):
 
 
 def owner_of(path, run=subprocess.run):
-    """True owned, False unowned, None when no package database exists. Tries path and realpath (usrmerge)."""
-    tools = [t for t in (("dpkg", "-S"), ("rpm", "-qf")) if _has(t[0])]
-    if not tools:
-        return None
-    for candidate in dict.fromkeys((path, os.path.realpath(path))):
-        for tool, flag in tools:
-            result = run([tool, flag, candidate], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
-            if result.returncode == 0:
-                return True
-    return False
+    """True owned, False unowned, None when no package database exists (any spelling of the path counts)."""
+    return pkgowner.checker(run)(path)
 
 
 def mapped_modules(proc="/proc", dirs=None, owner=owner_of):
