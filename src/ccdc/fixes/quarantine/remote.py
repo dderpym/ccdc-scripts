@@ -17,7 +17,7 @@ import subprocess
 import sys
 import time
 
-from host import scan_unowned
+import unowned as scan_unowned
 
 EVIDENCE_ROOT = "/root/ir"
 QUIET = {"check": False, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}

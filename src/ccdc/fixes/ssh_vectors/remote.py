@@ -16,7 +16,7 @@ import stat
 import sys
 import time
 
-from host.scan_ssh_vectors import parse_key_line
+from sshkeys import parse_key_line
 
 EVIDENCE = "/root/ir"
 

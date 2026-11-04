@@ -1,7 +1,8 @@
 """Files in system directories that no package owns (doc 5.1)."""
 from dataclasses import dataclass, field
 
-from ccdc.findings import EntryScanner, Finding
+from ccdc.ansible import AnsibleScript
+from ccdc.findings import Finding, Scanner
 
 
 @dataclass(frozen=True)
@@ -77,8 +78,15 @@ class UnitMissingBinary(Finding):
         return f"unit {self.unit} points at missing {self.binary} (leftover?)"
 
 
-class UnownedScanner(EntryScanner):
-    entry = "scan_unowned"
+class ScanUnowned(AnsibleScript):
+    """remote.py prints {"findings": [rows], "errors": [...]}; the logic is remote_lib/unowned.py (shared with the quarantine fix)."""
+    source = "remote.py"
+    support = ("unowned.py",)
+
+
+class UnownedScanner(Scanner):
+    def remote_step(self, target):
+        return ScanUnowned(self.runner)
 
     def findings(self, target, row):
         kind, pids = row["kind"], tuple(row.get("pids", []))

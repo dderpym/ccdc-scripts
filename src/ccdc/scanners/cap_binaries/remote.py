@@ -5,7 +5,7 @@ import re
 import subprocess
 import sys
 
-from host import pkgowner
+import pkgowner
 
 DIRS = ["/usr", "/bin", "/sbin", "/opt", "/home", "/root", "/tmp", "/var/tmp", "/dev/shm", "/srv"]
 DANGEROUS = ("cap_setuid", "cap_dac_override")

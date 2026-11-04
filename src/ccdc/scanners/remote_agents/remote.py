@@ -7,7 +7,8 @@ import re
 import subprocess
 import sys
 
-from host import ioc_agents, procfs
+import ioc_agents
+import procfs
 
 
 

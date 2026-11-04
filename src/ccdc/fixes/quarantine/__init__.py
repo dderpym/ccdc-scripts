@@ -1,11 +1,12 @@
-from ccdc.ansible import EntryScript
+from ccdc.ansible import AnsibleScript
 from ccdc.findings import AutoFix
 from ccdc.scanners.unowned import TimestompedFile, UnitRunsUnownedBinary, UnownedExecutable
 
 
-class Quarantine(EntryScript):
-    """Evidence copy, freeze, kill and delete of binaries/units (host/fix_quarantine.py)."""
-    entry = "fix_quarantine"
+class Quarantine(AnsibleScript):
+    """Evidence copy, freeze, kill and delete of binaries/units (remote.py)."""
+    source = "remote.py"
+    support = ("unowned.py",)
 
     def arguments(self, paths=(), **kwargs):
         return list(paths)
