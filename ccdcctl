@@ -15,7 +15,7 @@ import sys
 import tempfile
 import time
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent
 STATE = ROOT / "state"
 sys.path.insert(0, str(ROOT / "src"))
 from ccdc import runner  # noqa: E402
@@ -864,9 +864,9 @@ def complete(parser, words):
         return
     before = before[before.index(invoked) + 1:]
     name = Path(invoked).name
-    if name in ("manage", "check-lab"):
+    if name in ("manage", "check"):
         # Load only known repository scripts, never a path from the command line.
-        path = ROOT / ("lab/manage" if name == "manage" else "scripts/check-lab")
+        path = ROOT / ("lab/manage" if name == "manage" else "lab/check")
         parser = runpy.run_path(str(path))["argument_parser"]()
     commands = next((action.choices for action in parser._actions
                      if isinstance(action, argparse._SubParsersAction)), {})
@@ -949,7 +949,7 @@ def main():
         return security_status(args.command, hosts, args.deep, args.auto_apply)
     hosts, variables = select(args.target)
     if args.command == "update":
-        updates = runpy.run_path(str(ROOT / "scripts/update-controller.py"))["updates"]
+        updates = runpy.run_path(str(ROOT / "src/controller/updates.py"))["updates"]
         return updates(globals(), args.action, hosts, variables, args.yes)
     if args.command == "init":
         return initialize(hosts, args.target, args.bootstrap_password_file, args.save_bootstrap_password,

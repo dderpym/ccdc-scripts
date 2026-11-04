@@ -46,17 +46,17 @@ source ./setup                     # Bash: activate .venv and all CLI completion
 # ./lab/manage up --password-file lab/secrets/root.password
 export ANSIBLE_INVENTORY=lab/inventory.yml
 
-./scripts/ccdcctl ping
-./scripts/ccdcctl ssh status
-./scripts/ccdcctl firewall status
-./scripts/ccdcctl listeners
-./scripts/ccdcctl integrity
-./scripts/ccdcctl lse
+./ccdcctl ping
+./ccdcctl ssh status
+./ccdcctl firewall status
+./ccdcctl listeners
+./ccdcctl integrity
+./ccdcctl lse
 
-./scripts/check-lab                 # opt-in live, read-only smoke suite
+./lab/check                 # opt-in live, read-only smoke suite
 ```
 
-The repository's `scripts/check-lab` validates native init and running managed
+The repository's `lab/check` validates native init and running managed
 services, package-repository DNS resolution, HTTP/SSH, existing discovery commands, persistent native integrity
 findings, and LSE test IDs. It writes private evidence to `reports/lab/check.json` and uses the
 normal repository report paths. It checks root password login too if
@@ -106,8 +106,8 @@ For a lab stored elsewhere:
 ```sh
 python3 /path/to/lab/manage up --password-file /path/to/lab/secrets/root.password
 export ANSIBLE_INVENTORY=/path/to/lab/inventory.yml
-./scripts/ccdcctl ping
-./scripts/check-lab --inventory /path/to/lab/inventory.yml
+./ccdcctl ping
+./lab/check --inventory /path/to/lab/inventory.yml
 ```
 
 Setup requires Docker Compose, Python with PyYAML, and `ssh-keygen`.
@@ -175,8 +175,8 @@ lab containers**, for example:
 
 ```sh
 docker exec ccdc-lab-hatchery chmod 0644 /etc/passwd
-./scripts/ccdcctl integrity hatchery
-./scripts/ccdcctl lse hatchery
+./ccdcctl integrity hatchery
+./ccdcctl lse hatchery
 ```
 
 This fixes only that mode; package tampering and other vulnerabilities remain.

@@ -106,7 +106,7 @@ When a new CCDC environment reuses old IP addresses, explicitly reset trust
 **only during init**:
 
 ```sh
-./scripts/ccdcctl init all --replace-host-keys --save-bootstrap-password
+./ccdcctl init all --replace-host-keys --save-bootstrap-password
 ```
 
 This replaces the selected endpoints' saved keys with keys obtained using
@@ -129,7 +129,7 @@ in that shell and run bootstrap:
 
 ```sh
 . .venv/bin/activate
-./scripts/ccdcctl init all --save-bootstrap-password
+./ccdcctl init all --save-bootstrap-password
 ```
 
 At this prompt, type the known competition **default root password** and press
@@ -163,9 +163,9 @@ Keep VM/physical console access available. Run these commands in your tmux pane,
 one at a time, checking each summary before proceeding:
 
 ```sh
-./scripts/ccdcctl ping all
-./scripts/ccdcctl ssh configure all
-./scripts/ccdcctl listeners all
+./ccdcctl ping all
+./ccdcctl ssh configure all
+./ccdcctl listeners all
 ```
 
 For key-only SSH, choose `a` on the first host to disable password authentication
@@ -178,7 +178,7 @@ Read `reports/listeners.txt` and hand it to teammates to identify scoring-critic
 services. Then review firewall decisions:
 
 ```sh
-./scripts/ccdcctl firewall configure all
+./ccdcctl firewall configure all
 ```
 
 TCP/22 is preapproved. Other listening ports default to **blocked**: explicitly
@@ -193,10 +193,10 @@ skip hosts whose requirements this port-only policy cannot safely represent.
 Check the results, then explicitly accept the trusted state:
 
 ```sh
-./scripts/ccdcctl ssh status all
-./scripts/ccdcctl firewall status all
-./scripts/ccdcctl ssh baseline all
-./scripts/ccdcctl firewall baseline all
+./ccdcctl ssh status all
+./ccdcctl firewall status all
+./ccdcctl ssh baseline all
+./ccdcctl firewall baseline all
 ```
 
 Do not baseline an unexplained or failed configuration. Firewall enforcement is
@@ -210,20 +210,20 @@ Beginning-of-competition workflow (review and baseline **only** SSH/firewall as
 explained above):
 
 ```sh
-./scripts/ccdcctl init
-./scripts/ccdcctl ssh configure
-./scripts/ccdcctl firewall configure
-./scripts/ccdcctl ssh baseline       # only after reviewing effective policy
-./scripts/ccdcctl firewall baseline  # only after reviewing effective policy
+./ccdcctl init
+./ccdcctl ssh configure
+./ccdcctl firewall configure
+./ccdcctl ssh baseline       # only after reviewing effective policy
+./ccdcctl firewall baseline  # only after reviewing effective policy
 
 # Find non-stock/tampered system state:
-./scripts/ccdcctl integrity
+./ccdcctl integrity
 # Find high-confidence dangerous Linux configuration:
-./scripts/ccdcctl lse
+./ccdcctl lse
 
 # Run every registered scanner (and apply matching autofixes on request):
-./scripts/ccdcctl scan
-./scripts/ccdcctl scan --fix --wait 45   # fix, wait, rescan for re-planted artifacts
+./ccdcctl scan
+./ccdcctl scan --fix --wait 45   # fix, wait, rescan for re-planted artifacts
 ```
 
 Integrity and LSE are **not baseline-driven**. An initially compromised binary
@@ -307,10 +307,10 @@ Run commands from the repository with the uv environment active:
 ```sh
 uv sync
 source ./setup                  # Bash: activate .venv and all CLI completions
-./scripts/ccdcctl ssh status
+./ccdcctl ssh status
 ```
 
-Alternatively, `uv run ./scripts/ccdcctl ssh status` supplies the environment
+Alternatively, `uv run ./ccdcctl ssh status` supplies the environment
 without shell activation; it also makes Ansible available to child processes.
 
 
@@ -319,7 +319,7 @@ rather than executing `./setup`, so it updates your current shell. Run `uv sync`
 first if `.venv` is missing. For completion only, without activating `.venv`:
 
 ```sh
-source scripts/ccdcctl-completion.bash
+source ccdcctl-completion.bash
 ```
 
 Bash's `complete -C` runs `ccdcctl complete` and reads one candidate per line;
@@ -327,7 +327,7 @@ Bash's `complete -C` runs `ccdcctl complete` and reads one candidate per line;
 It completes commands, actions, flags (including init-only `--replace-host-keys`),
 password-file paths, and hosts from the selected `ANSIBLE_INVENTORY`.
 The sourced setup also completes `lab/manage` (`up`, `down`, `--password-file`),
-and `scripts/check-lab` (`--inventory`, `--password-file`). Lab completion never starts Docker or runs checks.
+and `lab/check` (`--inventory`, `--password-file`). Lab completion never starts Docker or runs checks.
 Host completion requires Ansible on `PATH` (activate `.venv` first); it never connects
 to hosts. To enable it in future shells, add a `source` line using the script's
 absolute path to `~/.bashrc`.
@@ -379,9 +379,9 @@ Failures remain visible, including ignored failures; secret `no_log` results sta
 hidden. Task counts are not a percentage of the entire playbook.
 
 ```sh
-./scripts/ccdcctl ssh status hatchery --json       # full discovery for tooling
-./scripts/ccdcctl firewall status all --json
-./scripts/ccdcctl ssh configure all --verbose     # full Ansible logs + discovery
+./ccdcctl ssh status hatchery --json       # full discovery for tooling
+./ccdcctl firewall status all --json
+./ccdcctl ssh configure all --verbose     # full Ansible logs + discovery
 ```
 
 `--json` is status-only and always emits `{"hosts": {...}, "errors": {...}}`, even
@@ -392,9 +392,9 @@ dependency is required; configuration confirmations and safety checks are unchan
 ### `init [host|all]`: access bootstrap and root rotation
 
 ```sh
-./scripts/ccdcctl init all --save-bootstrap-password
-./scripts/ccdcctl init hatchery
-./scripts/ccdcctl init all --bootstrap-password-file ~/.config/ccdc/bootstrap.password
+./ccdcctl init all --save-bootstrap-password
+./ccdcctl init hatchery
+./ccdcctl init all --bootstrap-password-file ~/.config/ccdc/bootstrap.password
 ```
 
 - `--save-bootstrap-password` requires a terminal, asks once through a hidden
@@ -461,9 +461,9 @@ file does **not** encrypt the separately generated root recovery files.
 Ignore saved root credentials and use normal Ansible options:
 
 ```sh
-ANSIBLE_ARGS='-u root --ask-pass -e ansible_become=false' ./scripts/ccdcctl init all --no-bootstrap-password
-ANSIBLE_ARGS='-u admin --ask-pass --ask-become-pass' ./scripts/ccdcctl init all --no-bootstrap-password
-ANSIBLE_ARGS='-u root --private-key /path/to/bootstrap_key -e ansible_become=false' ./scripts/ccdcctl init all --no-bootstrap-password
+ANSIBLE_ARGS='-u root --ask-pass -e ansible_become=false' ./ccdcctl init all --no-bootstrap-password
+ANSIBLE_ARGS='-u admin --ask-pass --ask-become-pass' ./ccdcctl init all --no-bootstrap-password
+ANSIBLE_ARGS='-u root --private-key /path/to/bootstrap_key -e ansible_become=false' ./ccdcctl init all --no-bootstrap-password
 ```
 
 The **team** private key must separately be available through the agent or
@@ -484,8 +484,8 @@ or `su` access where permitted, not simply `ssh root@host` after hardening.
 ### `ping [host|all]`: verify administrative transport
 
 ```sh
-./scripts/ccdcctl ping
-./scripts/ccdcctl ping hatchery
+./ccdcctl ping
+./ccdcctl ping hatchery
 ```
 
 Runs Ansible's `ping` module through SSH with configured escalation. This checks
@@ -496,10 +496,10 @@ fresh-login safety preflight, so it may use a multiplexed connection.
 ### `ssh status|configure|baseline [host|all]`
 
 ```sh
-./scripts/ccdcctl ssh status                 # inventory summary
-./scripts/ccdcctl ssh status hatchery        # full normalized JSON
-./scripts/ccdcctl ssh configure all
-./scripts/ccdcctl ssh baseline all
+./ccdcctl ssh status                 # inventory summary
+./ccdcctl ssh status hatchery        # full normalized JSON
+./ccdcctl ssh configure all
+./ccdcctl ssh baseline all
 ```
 
 **Status** executes SSH discovery under sudo. Effective settings come from
@@ -550,8 +550,8 @@ configuration; status checks do not prove that edits have been reloaded.
 ### `listeners [host|all]`: service inventory
 
 ```sh
-./scripts/ccdcctl listeners
-./scripts/ccdcctl listeners hatchery
+./ccdcctl listeners
+./ccdcctl listeners hatchery
 ```
 
 Runs listener discovery under sudo, prints the report, and replaces:
@@ -571,11 +571,11 @@ alert on listener changes.
 ### `firewall status|configure|rollback|baseline [host|all]`
 
 ```sh
-./scripts/ccdcctl firewall status
-./scripts/ccdcctl firewall status hatchery
-./scripts/ccdcctl firewall configure all
-./scripts/ccdcctl firewall rollback hatchery
-./scripts/ccdcctl firewall baseline all
+./ccdcctl firewall status
+./ccdcctl firewall status hatchery
+./ccdcctl firewall configure all
+./ccdcctl firewall rollback hatchery
+./ccdcctl firewall baseline all
 ```
 
 **Status** runs privileged discovery for nftables, iptables, firewalld, and ufw.
@@ -633,8 +633,8 @@ No package lists, service mappings, or probes need to be configured in inventory
 The workflow discovers updates on **Debian/systemd** and **Alpine/OpenRC** hosts:
 
 ```sh
-./scripts/ccdcctl update plan all    # interactive walkthrough, one host at a time
-./scripts/ccdcctl update apply all   # install the saved selection, then offer restarts
+./ccdcctl update plan all    # interactive walkthrough, one host at a time
+./ccdcctl update apply all   # install the saved selection, then offer restarts
 ```
 
 **Plan** refreshes authenticated native repository indexes (like `apt update`),
@@ -684,7 +684,7 @@ these are reported rather than silently terminated or declared fully patched.
 
 ```sh
 # Bypass only the package-install confirmation for an already reviewed plan:
-./scripts/ccdcctl update apply web01 --yes
+./ccdcctl update apply web01 --yes
 ```
 
 `--yes` **never approves service restarts**. In a noninteractive apply, restart
@@ -711,9 +711,9 @@ account or package database can falsify checks; updating is not malware removal.
 ### `integrity [status] [host|all] [--deep]`
 
 ```sh
-./scripts/ccdcctl integrity
-./scripts/ccdcctl integrity hatchery
-./scripts/ccdcctl integrity status hatchery --deep
+./ccdcctl integrity
+./ccdcctl integrity hatchery
+./ccdcctl integrity status hatchery --deep
 make integrity HOST=hatchery
 ```
 
@@ -779,9 +779,9 @@ can lie; corroborate serious findings through a trusted console/vendor source.
 ### `lse [status] [host|all] [--deep]`
 
 ```sh
-./scripts/ccdcctl lse
-./scripts/ccdcctl lse hatchery
-./scripts/ccdcctl lse hatchery --deep
+./ccdcctl lse
+./ccdcctl lse hatchery
+./ccdcctl lse hatchery --deep
 make lse HOST=hatchery
 ```
 
@@ -849,9 +849,9 @@ Scanner commands return nonzero for findings or incomplete/failed scans.
 ### `scan [host|all] [--fix [ask|all]] [--wait SECONDS]`
 
 ```sh
-./scripts/ccdcctl scan                       # every registered scanner, report only
-./scripts/ccdcctl scan hatchery --fix        # ask before each matching autofix
-./scripts/ccdcctl scan --fix all --wait 45   # apply all, wait, rescan
+./ccdcctl scan                       # every registered scanner, report only
+./ccdcctl scan hatchery --fix        # ask before each matching autofix
+./ccdcctl scan --fix all --wait 45   # apply all, wait, rescan
 ```
 
 Runs each scanner on each host (hosts in parallel), de-duplicates identical

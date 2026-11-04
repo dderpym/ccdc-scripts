@@ -13,7 +13,7 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 # Never inherit transport overrides that could accidentally select real hosts.
 os.environ['ANSIBLE_ARGS'] = ''
-loader = importlib.machinery.SourceFileLoader('ccdcctl_lab', str(ROOT / 'scripts/ccdcctl'))
+loader = importlib.machinery.SourceFileLoader('ccdcctl_lab', str(ROOT / 'ccdcctl'))
 spec = importlib.util.spec_from_loader(loader.name, loader)
 ctl = importlib.util.module_from_spec(spec)
 loader.exec_module(ctl)
@@ -41,7 +41,7 @@ def main():
         checks.append({'check': label, 'passed': True})
 
     def command(*args, expected=0):
-        result = subprocess.run([sys.executable, str(ROOT / 'scripts/ccdcctl'), *args],
+        result = subprocess.run([sys.executable, str(ROOT / 'ccdcctl'), *args],
                                 cwd=ROOT, capture_output=True, text=True, timeout=180)
         checks.append({'command': list(args), 'rc': result.returncode,
                        'stdout': result.stdout, 'stderr': result.stderr})

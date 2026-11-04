@@ -1,5 +1,5 @@
 HOST ?= all
-CTL := ./scripts/ccdcctl
+CTL := ./ccdcctl
 .PHONY: ping init ssh listeners firewall integrity lse baseline
 ping:
 	$(CTL) ping $(HOST)
