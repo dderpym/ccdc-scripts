@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""scan_ssh_vectors [--allow-key LINE]... [--allow OPTION=VALUE]... [--allow-path PATH]...
+"""scan_ssh_vectors [--policy JSON] [--allow-key LINE]... [--allow OPTION=VALUE]... [--allow-path PATH]...
 
 Judges what the RUNNING sshd does, not what its files say. Read-only. Prints
 {"findings": [row...], "errors": [...]}; rows have a "kind":
   sshd-option      option, value, severity, why, contexts    (`sshd -T -C` per login user and address, so Match
                                                               blocks count; contexts like "deploy@192.0.2.1")
+  sshd-policy      option, value, wanted, severity, contexts (effective value differs from --policy, the sshd
+                                                              options the inventory declares; none = no check)
   authorized-key   file, user, line, fingerprint, comment    (key file the effective AuthorizedKeysFile gives that
                                                               user, key not in the allowlist)
   ssh-startup      path, what                                (sshrc that sshd would really run at login)
@@ -145,23 +147,26 @@ def effective_by_user(binary, accounts, run=subprocess.run):
 
 
 # option -> hardened value. Numeric limits: above the value is weak (clientaliveinterval: 0 = disabled).
-WEAK_LIMITS = (("maxauthtries", "3"), ("logingracetime", "30"), ("x11forwarding", "no"),
-               ("allowagentforwarding", "no"), ("allowtcpforwarding", "no"),
-               ("clientaliveinterval", "300"), ("clientalivecountmax", "2"))
 MAX_LIMITS = {"maxauthtries", "logingracetime", "clientalivecountmax"}
 
 
-def weaker(option, value, wanted):
-    value = value.lower()
+def deviates(option, value, expected):
+    """Does an effective sshd value differ from the inventory's declared one?
+
+    Most options must match exactly (case-insensitive); the declared value of
+    maxauthtries/logingracetime/clientalivecountmax is a maximum, and
+    clientaliveinterval only deviates when it is 0 (keepalives off).
+    """
+    value, expected = str(value).lower(), str(expected).lower()
     if option in MAX_LIMITS:
-        return value.isdigit() and int(value) > int(wanted)
+        return value.isdigit() and expected.isdigit() and int(value) > int(expected)
     if option == "clientaliveinterval":
-        return value == "0"
-    return value != wanted
+        return value == "0" and expected != "0"
+    return value != expected
 
 
-def option_rows(effective, allow=()):
-    """Rule-based findings on one effective configuration. allow: set of 'option=value'."""
+def option_rows(effective, allow=(), policy=None):
+    """Findings on one effective configuration. allow: set of 'option=value'; policy: {option: expected}."""
     rows = []
 
     def add(option, value, severity, why, kind="sshd-option", wanted=""):
@@ -180,23 +185,18 @@ def option_rows(effective, allow=()):
     for value in effective.get("banner", []):
         if value.lower() != "none":
             add("banner", value, "warning", "banner configured; proves sshd_config was edited")
-    for value in effective.get("permitrootlogin", []):
-        if value.lower() != "no":
-            add("permitrootlogin", value, "critical", "root may log in over SSH")
     for value in effective.get("permituserenvironment", []):
         if value.lower() != "no":
             add("permituserenvironment", value, "critical", "users can set environment (LD_PRELOAD) for sshd sessions")
     for value in effective.get("permitemptypasswords", []):
         if value.lower() != "no":
             add("permitemptypasswords", value, "critical", "accounts with empty passwords may log in")
-    for value in effective.get("passwordauthentication", []):
-        if value.lower() != "no":
-            add("passwordauthentication", value, "warning", "passwords accepted; the team standard is key-only")
-    # Hardening targets (what fix_sshd_hardening writes): effective values weaker than these are findings.
-    for option, wanted in WEAK_LIMITS:
-        for value in effective.get(option, []):
-            if weaker(option, value, wanted):
-                add(option, value, "warning", "weaker than the hardened value %s" % wanted, "sshd-weak", wanted)
+    # Policy is declared per host in inventory.yml (`ssh:`); nothing here is built in.
+    for option, expected in sorted((policy or {}).items()):
+        for value in effective.get(option.lower(), []):
+            if deviates(option.lower(), value, expected):
+                add(option.lower(), value, "critical" if option.lower() == "permitrootlogin" else "warning",
+                    "inventory says %s" % expected, "sshd-policy", str(expected))
     return rows
 
 
@@ -204,14 +204,14 @@ def identity(row):
     return (row["kind"], row["option"], row["value"], row["severity"], row["why"], row.get("wanted", ""))
 
 
-def effective_option_rows(per_user, base, allow=()):
+def effective_option_rows(per_user, base, allow=(), policy=None):
     """Every distinct option finding with the contexts it is effective for."""
     found = {}
-    for row in option_rows(base, allow):
+    for row in option_rows(base, allow, policy):
         found.setdefault(identity(row), set()).add("default")
     for user, contexts in per_user.items():
         for addr, effective in contexts:
-            for row in option_rows(effective, allow):
+            for row in option_rows(effective, allow, policy):
                 found.setdefault(identity(row), set()).add("%s@%s" % (user, addr))
     return [{"kind": k, "option": o, "value": v, "severity": s, "why": w, "wanted": wanted, "contexts": sorted(c)}
             for (k, o, v, s, w, wanted), c in sorted(found.items())]
@@ -500,8 +500,10 @@ def listener_rows(master, effective, proc="/proc"):
 
 
 def scan(allow_keys=(), allow_options=(), allow_paths=(), proc="/proc", run=subprocess.run, accounts=None,
-         config=None):
+         config=None, policy=None):
     rows, errors = [], []
+    if not policy:
+        errors.append("no ssh policy declared in inventory; policy checks skipped")
     allowed = {parsed[0] for parsed in map(parse_key_line, allow_keys) if parsed}
     if not allowed:
         errors.append("no key allowlist supplied; every authorized key is reported")
@@ -514,7 +516,7 @@ def scan(allow_keys=(), allow_options=(), allow_paths=(), proc="/proc", run=subp
     errors += problems
     if not base:
         return {"findings": [], "errors": errors}
-    rows += effective_option_rows(per_user, base, set(allow_options))
+    rows += effective_option_rows(per_user, base, set(allow_options), policy)
     found, problems = key_rows(key_files(per_user, accounts), allowed)
     rows += found
     errors += problems
@@ -545,11 +547,19 @@ def scan(allow_keys=(), allow_options=(), allow_paths=(), proc="/proc", run=subp
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--policy", default="{}", help='JSON {"option": expected} from the inventory')
     parser.add_argument("--allow-key", action="append", default=[])
     parser.add_argument("--allow", action="append", default=[])
     parser.add_argument("--allow-path", action="append", default=[])
     args = parser.parse_args(argv)
-    print(json.dumps(scan(args.allow_key, args.allow, args.allow_path), sort_keys=True))
+    try:
+        policy = json.loads(args.policy)
+        if not isinstance(policy, dict):
+            raise ValueError("policy must be an object")
+    except ValueError as exc:
+        print(json.dumps({"findings": [], "errors": ["invalid --policy: %s" % exc]}))
+        return 1
+    print(json.dumps(scan(args.allow_key, args.allow, args.allow_path, policy=policy), sort_keys=True))
     return 0
 
 

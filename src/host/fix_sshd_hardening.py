@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""fix_sshd_hardening apply|confirm|revert: harden sshd with a self-reverting safety net.
+"""fix_sshd_hardening apply OPTION=VALUE... | confirm | revert: enforce declared sshd settings safely.
 
-apply   writes sshd_config.d/00-hardening.conf (first value wins, so it beats
-        distro drop-ins), validates with `sshd -t`, reloads, and starts a detached
-        watchdog that reverts unless `confirm` runs within the timeout.
+apply   merges the given settings into sshd_config.d/00-hardening.conf (first value
+        wins, so it beats distro drop-ins; earlier managed settings are kept),
+        validates with `sshd -t`, reloads, and starts a detached watchdog that
+        reverts unless `confirm` runs within the timeout.
 confirm cancels the watchdog (run only after a fresh key login worked).
 revert  removes the drop-in and reloads.
 Prints one JSON object.
@@ -19,16 +20,32 @@ DROPIN_DIR = "/etc/ssh/sshd_config.d"
 DROPIN = DROPIN_DIR + "/00-hardening.conf"
 MAIN = "/etc/ssh/sshd_config"
 TIMEOUT = 90
-OPTIONS = (
-    ("MaxAuthTries", "3"), ("LoginGraceTime", "30"), ("X11Forwarding", "no"),
-    ("AllowAgentForwarding", "no"), ("AllowTcpForwarding", "no"),
-    ("PermitEmptyPasswords", "no"), ("PermitUserEnvironment", "no"),
-    ("ClientAliveInterval", "300"), ("ClientAliveCountMax", "2"),
-)
+NAME = re.compile(r"[A-Za-z][A-Za-z0-9]*")
+VALUE = re.compile(r"[A-Za-z0-9_.,:@/+*-]+")  # no whitespace or newlines: nothing else can ride along
 
 
-def render(options=OPTIONS):
-    return "# Managed by CCDC: sshd hardening\n" + "".join(f"{k} {v}\n" for k, v in options)
+def parse_settings(pairs):
+    """['Option=value', ...] -> {'option': 'value'}; refuses anything that is not a plain keyword/value."""
+    settings = {}
+    for pair in pairs:
+        name, sep, value = pair.partition("=")
+        if not sep or not NAME.fullmatch(name) or not VALUE.fullmatch(value):
+            raise ValueError("invalid setting: %r" % pair)
+        settings[name.lower()] = value
+    if not settings:
+        raise ValueError("no settings given")
+    return settings
+
+
+def current_settings(text):
+    """The options an earlier run of this script wrote."""
+    return {parts[0].lower(): parts[1] for parts in (line.split(None, 1) for line in text.splitlines()
+                                                      if line.strip() and not line.startswith("#")) if len(parts) == 2}
+
+
+def render(settings):
+    return "# Managed by CCDC: sshd settings declared in the inventory\n" + "".join(
+        f"{k} {v}\n" for k, v in sorted(settings.items()))
 
 
 def includes_dropins(main_text):
@@ -65,7 +82,8 @@ def _restore(previous):
             handle.write(previous)
 
 
-def apply():
+def apply(pairs):
+    settings = parse_settings(pairs)
     sshd = sshd_binary()
     if not sshd:
         raise RuntimeError("sshd not found")
@@ -76,13 +94,14 @@ def apply():
     if os.path.exists(DROPIN):
         with open(DROPIN) as handle:
             previous = handle.read()
+    settings = {**current_settings(previous or ""), **settings}
     os.makedirs(DROPIN_DIR, exist_ok=True)
     with open(DROPIN, "w") as handle:
-        handle.write(render())
+        handle.write(render(settings))
     os.chmod(DROPIN, 0o644)
     if subprocess.run([sshd, "-t"], stderr=subprocess.PIPE, text=True).returncode:
         _restore(previous)
-        raise RuntimeError("sshd -t rejected the hardened configuration; reverted")
+        raise RuntimeError("sshd -t rejected the configuration; reverted")
     if os.path.exists(ok_flag()):
         os.unlink(ok_flag())
     if not reload_sshd():
@@ -90,7 +109,7 @@ def apply():
         raise RuntimeError("could not reload sshd; reverted")
     subprocess.Popen(["sh", "-c", watchdog_command()], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                      stderr=subprocess.DEVNULL, start_new_session=True)
-    return {"applied": True, "watchdog_seconds": TIMEOUT}
+    return {"applied": True, "settings": settings, "watchdog_seconds": TIMEOUT}
 
 
 def confirm():
@@ -106,13 +125,13 @@ def revert():
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    actions = {"apply": apply, "confirm": confirm, "revert": revert}
-    if len(argv) != 1 or argv[0] not in actions:
-        print("usage: fix_sshd_hardening apply|confirm|revert", file=sys.stderr)
+    actions = {"apply": lambda: apply(argv[1:]), "confirm": confirm, "revert": revert}
+    if not argv or argv[0] not in actions or (argv[0] != "apply" and len(argv) != 1):
+        print("usage: fix_sshd_hardening apply OPTION=VALUE... | confirm | revert", file=sys.stderr)
         return 2
     try:
         print(json.dumps(actions[argv[0]]()))
-    except (OSError, RuntimeError) as exc:
+    except (OSError, RuntimeError, ValueError) as exc:
         print(json.dumps({"error": str(exc)}))
         return 1
     return 0

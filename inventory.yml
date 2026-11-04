@@ -4,6 +4,22 @@ all:
     firewall_poll_interval: 10
     integrity_poll_interval: 60
     lse_poll_interval: 180
+    # Declared sshd policy, checked by `ccdcctl scan` against the EFFECTIVE `sshd -T` values
+    # (Match blocks included). Names are exactly what `sshd -T` prints, in lowercase.
+    # Exact match, except maxauthtries/logingracetime/clientalivecountmax (declared value
+    # is a maximum) and clientaliveinterval (deviates only if 0). Override per group/host,
+    # e.g. a scored host that must take passwords: ssh: {passwordauthentication: "yes"}.
+    # Omit an option to leave it unchecked; omit `ssh` entirely and scan reports it.
+    ssh:
+      permitrootlogin: "no"
+      passwordauthentication: "no"
+      maxauthtries: 3
+      logingracetime: 30
+      x11forwarding: "no"
+      allowagentforwarding: "no"
+      allowtcpforwarding: "no"
+      clientaliveinterval: 300
+      clientalivecountmax: 2
   hosts:
     hatchery:
       ansible_host: 127.0.0.1

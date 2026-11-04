@@ -62,6 +62,22 @@ Aliases such as `web01` are how you target individual hosts. Use letters, number
 Do **not** set `ansible_user: root` for the normal workflow: bootstrap selects
 root itself, and subsequent commands use `oski`.
 
+The same file declares the **sshd policy** the scanner enforces, as an `ssh:` mapping
+of `sshd -T` option names (lowercase) to expected values, set under `all.vars` and
+overridable per group or host:
+
+```yaml
+all:
+  vars:
+    ssh: {permitrootlogin: "no", passwordauthentication: "no", maxauthtries: 3}
+  hosts:
+    web01:
+      ssh: {passwordauthentication: "yes"}   # scored service logs in with passwords
+```
+
+Quote `"yes"`/`"no"`. Nothing is a built-in policy: unlisted options are not checked,
+and a host with no `ssh:` policy is reported as unchecked.
+
 Keep the team's **private key outside the repository**. Copy its matching public
 key into the one configured public-key source:
 
@@ -307,8 +323,14 @@ when present) instead of recording that it did.
   latter returns a script with the finding's data already filled in, so `.run()` takes
   no arguments. The script a fix runs lives in the same module as the fix.
   `GlobalAutofix.register(autofix, priority)` picks the highest-priority match.
-- **Hardening is a scan plus a fix**, not a command: weak effective sshd settings,
-  unneeded daemons, missing audit watches and so on are findings with autofixes.
+- **Hardening is a scan plus a fix**, not a command: unneeded daemons, missing audit
+  watches and so on are findings with autofixes. SSH settings are **declarative**:
+  `ssh:` in `inventory.yml` says what each host's sshd should do, the scanner compares
+  it with the effective `sshd -T -C` values (Match blocks included) and reports each
+  `SSHPolicyDeviation`; its autofix writes only the declared value for that option
+  (`maxauthtries`, `logingracetime`, `clientalivecountmax` are maximums;
+  `clientaliveinterval` deviates only at 0). Inventory vars reach scanners as
+  `Target.vars`.
 - **Auto-discovery** (`src/ccdc/registry.py`): every `Scanner` in a module under
   `src/ccdc/scanners/` and every `AutoFix` in `src/ccdc/fixes/` is registered; a module
   may set `PRIORITY = {FixClass: n}`. No central list exists to edit. Mark a shared

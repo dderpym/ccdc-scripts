@@ -48,6 +48,8 @@ class Target:
     """A host name, or any Ansible --limit pattern ('all', 'a:b') for scripts that fan out."""
     host: str
     auth: Auth = field(default_factory=AgentAuth)
+    # Inventory hostvars (e.g. the `ssh:` policy). Declarative input for scanners: not identity, never printed.
+    vars: dict = field(default_factory=dict, compare=False, repr=False)
 
     def __str__(self):
         return self.host

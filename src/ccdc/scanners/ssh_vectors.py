@@ -1,6 +1,7 @@
 """SSH side doors, judged on what the running sshd does: per-user effective settings (Match blocks),
 the key files sshd would read, sshrc it would run, files its config references, config edited after
 the daemon started, live LD_* environment and libraries, and sockets its config does not explain."""
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -44,19 +45,22 @@ class UnexpectedSSHOption(Finding):
 
 
 @dataclass(frozen=True)
-class WeakSSHSetting(Finding):
-    """An effective sshd value weaker than the hardened one; ccdc.fixes.ssh_hardening writes the drop-in."""
+class SSHPolicyDeviation(Finding):
+    """An effective sshd value that differs from what the inventory's `ssh:` policy declares."""
     option: str
     value: str
-    wanted: str
-    contexts: tuple = ()
-    code = "weak-ssh-setting"
-    severity = "warning"
+    expected: str
+    contexts: tuple = ()  # "default" or "user@address" the value is effective for
+    code = "ssh-policy-deviation"
+
+    @property
+    def severity(self):
+        return "critical" if self.option == "permitrootlogin" else "warning"
 
     @property
     def summary(self):
         who = " for " + ", ".join(self.contexts[:4]) + (" ..." if len(self.contexts) > 4 else "") if self.contexts else ""
-        return f"sshd {self.option} is {self.value}{who}; hardened value is {self.wanted}"
+        return f"{self.option} is {self.value}{who}, inventory says {self.expected}"
 
 
 @dataclass(frozen=True)
@@ -148,6 +152,11 @@ class OddSSHListener(Finding):
         return f"sshd listens on {self.address}:{self.port}: {self.why}"
 
 
+def yaml_text(value):
+    """Unquoted yes/no in YAML arrive as booleans; sshd spells them yes/no."""
+    return {True: "yes", False: "no"}.get(value, str(value)) if isinstance(value, bool) else str(value)
+
+
 def team_keys(path=TEAM_KEYS):
     try:
         return tuple(line.strip() for line in path.read_text().splitlines() if line.strip() and not line.startswith("#"))
@@ -166,6 +175,9 @@ class SSHVectorScanner(BundleScanner):
     def arguments(self, target=None, **kwargs):
         allow = self.allowlist.get(getattr(target, "host", None), SSHAllow())
         args = []
+        policy = (getattr(target, "vars", None) or {}).get("ssh")
+        if isinstance(policy, dict) and policy:
+            args += ["--policy", json.dumps({str(k).lower(): yaml_text(v) for k, v in policy.items()}, sort_keys=True)]
         for key in (*self.keys, *allow.keys):
             args += ["--allow-key", key]
         for option in allow.options:
@@ -184,8 +196,8 @@ class SSHVectorScanner(BundleScanner):
         if kind == "sshd-option":
             return [UnexpectedSSHOption(target, row["option"], row["value"], row["why"], row["severity"],
                                         tuple(row.get("contexts", ())))]
-        if kind == "sshd-weak":
-            return [WeakSSHSetting(target, row["option"], row["value"], row["wanted"], tuple(row.get("contexts", ())))]
+        if kind == "sshd-policy":
+            return [SSHPolicyDeviation(target, row["option"], row["value"], row["wanted"], tuple(row.get("contexts", ())))]
         if kind == "authorized-key":
             return [RogueAuthorizedKey(target, row["file"], row["user"], row["line"], row["fingerprint"], row["comment"])]
         if kind == "ssh-startup":

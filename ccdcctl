@@ -760,8 +760,9 @@ def security_status(kind, hosts, deep=False, auto=None):
 def scan_command(args):
     from ccdc import registry, scan as scanning
     from ccdc.target import Target
-    hosts, _ = select(args.target)
-    targets = [Target(host) for host in hosts]
+    hosts, hostvars = select(args.target)
+    # Inventory vars travel with the target: scanners read declared policy (e.g. `ssh:`) from them.
+    targets = [Target(host, vars=hostvars.get(host, {})) for host in hosts]
     autofix = registry.global_autofix()
     scanners = registry.scanners()
     results = scanning.scan_all(targets, scanners)
