@@ -1,8 +1,9 @@
 """The EFFECTIVE inbound firewall (discover_firewall, as root) against the services the inventory declares."""
 from dataclasses import dataclass
 
-from ccdc.findings import EntryScanner, Finding, ScanResult
+from ccdc.findings import Finding, Scanner, ScanResult
 from ccdc.services import declared
+from scripts.firewall.discover import DiscoverFirewall
 
 
 @dataclass(frozen=True)
@@ -41,18 +42,27 @@ class FirewallNotRestricting(Finding):
         return f"inbound default is accept ({self.backend}): nothing outside the inventory is blocked"
 
 
-class FirewallPolicyScanner(EntryScanner):
+class FirewallPolicyScanner(Scanner):
     """Exact comparison only when the policy is one we can summarize; otherwise an explicit error, never a guess."""
-    entry = "discover_firewall"
+
+    def remote_step(self, target):
+        try:
+            if declared(target.vars) is None:
+                return None
+        except ValueError:
+            return None
+        return DiscoverFirewall(self.runner)
 
     def scan(self, target):
         try:
-            approved = declared(target.vars)
+            if declared(target.vars) is None:
+                return ScanResult([], ["no services declared in inventory; firewall comparison skipped"])
         except ValueError as exc:
             return ScanResult([], [str(exc)])
-        if approved is None:
-            return ScanResult([], ["no services declared in inventory; firewall comparison skipped"])
-        state = self.runner.entry(target, self.entry, [], become=self.become)
+        return super().scan(target)
+
+    def findings_from(self, target, state):
+        approved = declared(target.vars)
         tcp, udp = state.get("allowed_tcp"), state.get("allowed_udp")
         if state.get("default_inbound") == "accept":
             return ScanResult([FirewallNotRestricting(target, state.get("backend") or "none")])

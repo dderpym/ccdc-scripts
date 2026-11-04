@@ -20,7 +20,7 @@ import sys
 import tarfile
 import tempfile
 
-from host import update_services
+import update_services  # shipped beside this script
 
 BACKUP_ROOT = Path('/var/backups/ccdc-updates')
 LOCK = '/run/ccdc-updates.lock'

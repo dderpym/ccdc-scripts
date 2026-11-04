@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""install_packages MANAGER PACKAGE...: install only what is missing; JSON {"installed": [...], "already": [...]}.
+"""install MANAGER PACKAGE...: install only what is missing; JSON {"installed": [...], "already": [...]}.
 
 Never assumes an earlier run: each call asks the package database first.
 """
@@ -46,7 +46,7 @@ def install(manager, packages, run=subprocess.run):
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     if len(argv) < 2:
-        print("usage: install_packages MANAGER PACKAGE...", file=sys.stderr)
+        print("usage: remote.py MANAGER PACKAGE...", file=sys.stderr)
         return 2
     try:
         print(json.dumps(install(argv[0], argv[1:])))

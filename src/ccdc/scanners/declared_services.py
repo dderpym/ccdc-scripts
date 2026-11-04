@@ -1,8 +1,9 @@
 """Listening services judged against the services the inventory declares (live `ss`, not a file)."""
 from dataclasses import dataclass
 
-from ccdc.findings import EntryScanner, Finding, ScanResult
+from ccdc.findings import Finding, Scanner, ScanResult
 from ccdc.services import NOT_DECLARED, declared, exposed
+from scripts.firewall.discover import DiscoverListeners
 
 
 @dataclass(frozen=True)
@@ -32,18 +33,29 @@ class ApprovedServiceDown(Finding):
         return f"approved service {self.name} ({self.proto}/{self.port}) is not listening"
 
 
-class DeclaredServicesScanner(EntryScanner):
+class DeclaredServicesScanner(Scanner):
     """Non-loopback listeners (discover_listeners, as root) against `services:` in the inventory."""
-    entry = "discover_listeners"
+
+    def remote_step(self, target):
+        try:
+            if declared(target.vars) is None:
+                return None
+        except ValueError:
+            return None
+        return DiscoverListeners(self.runner)
 
     def scan(self, target):
+        # No usable declaration: say so and run nothing on the host.
         try:
-            approved = declared(target.vars)
+            if declared(target.vars) is None:
+                return ScanResult([], [NOT_DECLARED])
         except ValueError as exc:
             return ScanResult([], [str(exc)])
-        if approved is None:
-            return ScanResult([], [NOT_DECLARED])
-        live = exposed(self.runner.entry(target, self.entry, [], become=self.become))
+        return super().scan(target)
+
+    def findings_from(self, target, result):
+        approved = declared(target.vars)
+        live = exposed(result)
         listed = {(proto, port) for proto, port, _ in approved}
         findings = [UnapprovedService(target, port, proto, info["process"] or "unknown", ", ".join(info["addresses"]))
                     for (proto, port), info in sorted(live.items()) if (proto, port) not in listed]

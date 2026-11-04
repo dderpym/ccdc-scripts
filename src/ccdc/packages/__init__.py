@@ -5,18 +5,24 @@ subclasses (InstallNftables) hold a table of what each OS family calls the packa
 detect the OS on every run and delegate. Nothing is remembered between runs: the
 host script asks the package database each time.
 """
-from ccdc.ansible import EntryScript
+from ccdc.ansible import AnsibleScript
 from ccdc.osinfo import DetectOS
+from ccdc.runner import RemoteError, failure_message
 from ccdc.script import HostScript
 
 
-class InstallWith(EntryScript):
-    """Install packages with one specific package manager."""
-    entry = "install_packages"
+class InstallWith(AnsibleScript):
+    """Install packages with one specific package manager (remote.py asks the package database first)."""
+    source = "remote.py"
     manager = None
 
     def arguments(self, packages=(), **kwargs):
         return [self.manager, *packages]
+
+    def parse(self, result, **kwargs):
+        if result["rc"] != 0:
+            raise RemoteError("%s: %s" % (self.name, failure_message(result)))
+        return super().parse(result, **kwargs)
 
 
 class InstallApt(InstallWith):

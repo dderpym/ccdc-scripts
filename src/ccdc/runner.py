@@ -93,6 +93,19 @@ class RemoteError(RuntimeError):
     pass
 
 
+def failure_message(result):
+    """Best explanation of a failed step: the {"error": ...} a script printed, else its stderr/stdout."""
+    for stream in ("stdout", "stderr"):
+        try:
+            document = json.loads(result.get(stream) or "")
+        except ValueError:
+            continue
+        if isinstance(document, dict) and isinstance(document.get("error"), str):
+            return document["error"]
+    return (result.get("stderr", "").strip() or result.get("stdout", "").strip()
+            or "exit status %s" % result.get("rc"))
+
+
 class AnsibleRunner:
     """Runs bundle entries and playbooks on one Target. Tests substitute a fake.
 

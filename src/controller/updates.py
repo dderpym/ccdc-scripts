@@ -21,36 +21,23 @@ def endpoint(ctl, variables):
 
 
 def call_host(ctl, host, action, **fields):
-    """Send one request to host/manage_updates.py through the shared remote runner."""
+    """Send one request to the host's package manager (ccdc.updates.ManageUpdates)."""
+    from ccdc.target import Target
+    from ccdc.updates import ManageUpdates
     document = {"action": action, **fields}
     token = fields.get("token")
     destination = ctl.STATE / "reports" / host / "updates" / "backups" / token if token else None
     if destination:
         destination.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with tempfile.TemporaryDirectory(prefix="ccdc-update-results-") as directory:
-        with tempfile.NamedTemporaryFile(mode="w", prefix="ccdc-update-request-", suffix=".json") as out:
-            json.dump(document, out)
-            out.flush()
-            result = ctl.run(["ansible-playbook", str(ctl.runner.PLAYBOOKS / "remote.yml"), "--limit", host, *ctl.EXTRA,
-                              "--extra-vars", ctl.runner.remote.request("manage_updates", payload=out.name)],
-                             result_dir=directory, result_task=ctl.runner.remote.TASK)
-        if getattr(ctl, "VERBOSE", False):
-            print(ctl.terminal(result.stdout + result.stderr))
+    with tempfile.NamedTemporaryFile(mode="w", prefix="ccdc-update-request-", suffix=".json") as out:
+        json.dump(document, out)
+        out.flush()
         try:
-            response = json.loads((Path(directory) / host).read_text())
-            if response.get("failed") or response.get("unreachable") or response.get("rc", 0) or result.returncode:
-                ctl.save(ctl.STATE / "reports" / host / "updates" / "remote-failure.json",
-                         {"action": action, "token": token, "response": response})
-                try:
-                    error = json.loads(response.get("stdout", "")).get("error")
-                except ValueError:
-                    error = None
-                raise RuntimeError(error or response.get("msg") or "update task failed; inspect remote-failure.json")
-            state = json.loads(response["stdout"])
-            if not isinstance(state, dict) or state.get("error"):
-                raise ValueError("invalid remote update result")
-        except (OSError, KeyError, ValueError) as exc:
-            raise RuntimeError("No usable update result: " + str(exc)) from exc
+            state = ManageUpdates().run(Target(host), payload=out.name)
+        except Exception as exc:
+            ctl.save(ctl.STATE / "reports" / host / "updates" / "remote-failure.json",
+                     {"action": action, "token": token, "error": str(exc)})
+            raise RuntimeError(str(exc) or "update task failed; inspect remote-failure.json") from exc
     if action == "apply":
         fetch_backup(ctl, host, token, state, destination)
     return state
