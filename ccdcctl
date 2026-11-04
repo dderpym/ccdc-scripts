@@ -690,18 +690,31 @@ def scan_command(args):
     autofix = registry.global_autofix()
     scanners = registry.scanners()
     results = scanning.scan_all(targets, scanners)
-    bad = scanning.report(results, autofix)
+    if args.json and args.recheck:
+        raise RuntimeError("--json does not combine with --recheck")
+    out = (lambda text: print(text, file=sys.stderr)) if args.json else print
+    bad = False if args.json else scanning.report(results, autofix)
     if args.recheck and args.fix:
         raise RuntimeError("--recheck is for scans without --fix; use --wait with --fix")
     if args.fix:
         def approve(finding, text):
             return args.fix == "all" or ask(f"\n{finding.host}: {text}\n  Apply? [y/N]", ["y", "n"], "n") == "y"
-        fixed = {}
+        fixed, fixed_text = {}, {}
         for target, (findings, _) in results.items():
-            fixed[target] = [f for f, ok, _ in scanning.apply_fixes(findings, autofix, approve) if ok]
+            chosen = [f for f in findings if scanning.selected(f, args.only)]
+            outcome = scanning.apply_fixes(chosen, autofix, approve, out)
+            fixed[target] = [f for f, ok, _ in outcome if ok]
+            fixed_text[target] = [text for _, ok, text in outcome if ok]
         if not any(fixed.values()):
-            print("\nNothing was fixed; no rescan needed.")
+            out("\nNothing was fixed; no rescan needed.")
+            if args.json:
+                print(json.dumps(scanning.to_json(results, autofix, fixed_text), indent=1, sort_keys=True))
             return bad
+        if args.json:
+            time.sleep(args.wait)
+            rescan = scanning.scan_all(targets, scanners)
+            print(json.dumps(scanning.to_json(rescan, autofix, fixed_text), indent=1, sort_keys=True))
+            return any(findings or errors for findings, errors in rescan.values())
         from ccdc import respawn
         print(f"\nWaiting for restart delays, then rescanning for respawned artifacts...")
         bad = respawn.render(respawn.verify_all(results, scanners, fixed, wait=args.wait))
@@ -709,6 +722,9 @@ def scan_command(args):
         from ccdc import respawn
         print(f"\nWaiting {args.recheck}s, then scanning again...")
         bad = respawn.render_guard(respawn.guard_all(targets, scanners, results, delay=args.recheck))
+    elif args.json:
+        print(json.dumps(scanning.to_json(results, autofix), indent=1, sort_keys=True))
+        return any(findings or errors for findings, errors in results.values())
     return bad
 
 
@@ -768,6 +784,10 @@ def argument_parser():
                      help="after fixing, wait then rescan to catch re-planted artifacts")
     cmd.add_argument("--recheck", type=int, default=0, metavar="SECONDS",
                      help="scan, wait, scan again and report what vanished or appeared (no fixes)")
+    cmd.add_argument("--json", action="store_true",
+                     help="print machine-readable findings (after --fix: the rescan) instead of the report")
+    cmd.add_argument("--only", action="append", default=[], metavar="CODE[=TEXT]",
+                     help="with --fix: fix only findings with this code (whose summary contains TEXT); repeatable")
     cmd = sub.add_parser("complete", help="emit candidates for Bash complete -C")
     cmd.add_argument("words", nargs=argparse.REMAINDER, help="Bash supplies command, current word, previous word")
     for command, child in sub.choices.items():
