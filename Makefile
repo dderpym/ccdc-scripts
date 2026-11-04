@@ -1,6 +1,6 @@
 HOST ?= all
-CTL := ./scripts/ccdcctl
-.PHONY: ping init ssh listeners firewall integrity lse baseline monitor
+CTL := ./ccdcctl
+.PHONY: ping init ssh listeners firewall integrity lse baseline
 ping:
 	$(CTL) ping $(HOST)
 init:
@@ -18,5 +18,3 @@ lse:
 baseline:
 	@status=0; $(CTL) ssh baseline $(HOST) || status=1; \
 	$(CTL) firewall baseline $(HOST) || status=1; exit $$status
-monitor:
-	$(CTL) monitor --host $(HOST)

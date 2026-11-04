@@ -12,5 +12,5 @@ if [[ ! -f $_ccdc_setup_root/.venv/bin/activate ]]; then
     return 1
 fi
 source "$_ccdc_setup_root/.venv/bin/activate" || { unset _ccdc_setup_root; return 1; }
-source "$_ccdc_setup_root/scripts/ccdcctl-completion.bash" || { unset _ccdc_setup_root; return 1; }
+source "$_ccdc_setup_root/ccdcctl-completion.bash" || { unset _ccdc_setup_root; return 1; }
 unset _ccdc_setup_root
