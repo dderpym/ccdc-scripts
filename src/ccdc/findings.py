@@ -90,6 +90,13 @@ class AutoFix:
     def describe(self, finding):
         return type(self).__name__
 
+    def group_key(self, finding):
+        """Findings with the same non-None key are fixed by ONE script run (get_group_fix)."""
+        return None
+
+    def get_group_fix(self, findings):
+        raise NotImplementedError
+
 
 class GlobalAutofix:
     """Several AutoFixes; the highest-priority one that matches a finding wins."""
@@ -116,6 +123,14 @@ class GlobalAutofix:
 
     def describe(self, finding):
         return self._match(finding).describe(finding)
+
+    def group_key(self, finding):
+        autofix = self._match(finding)
+        key = autofix.group_key(finding)
+        return None if key is None else (id(autofix), key)
+
+    def get_group_fix(self, findings):
+        return self._match(findings[0]).get_group_fix(findings)
 
 
 def finding_types():

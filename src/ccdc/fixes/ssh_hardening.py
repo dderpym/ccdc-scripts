@@ -18,37 +18,61 @@ class FreshLogin(Auth):
         return variables
 
 
-class EnforceSSHSetting(AnsibleScript):
-    """Write one declared sshd setting, prove a fresh key login still works, then cancel the on-host revert.
+# Turning these off only is safe if key login works, so it is proven before AND after.
+LOCKOUT_RISK = {("passwordauthentication", "no"), ("permitrootlogin", "no"), ("pubkeyauthentication", "no")}
 
-    If the login fails, the host's watchdog removes the drop-in by itself; we also
-    ask for an immediate revert when the host is still reachable.
+
+class EnforceSSHSettings(AnsibleScript):
+    """Write every given sshd setting as ONE change, prove a fresh key login still works, then confirm.
+
+    The host script verifies the effective values with `sshd -T -C` before sshd reloads,
+    falls back to a managed block at the top of sshd_config when a drop-in would lose
+    (first value wins), and restores everything on failure. If the fresh login fails after
+    the change, we ask for an immediate revert; the host's watchdog reverts on its own anyway.
     """
 
-    def run(self, target, option, value, **kwargs):
-        applied = self.runner.entry(target, "fix_sshd_hardening", ["apply", f"{option}={value}"])
-        fresh = Target(target.host, FreshLogin(target.auth))
+    def _fresh_login(self, target):
+        self.runner.entry(Target(target.host, FreshLogin(target.auth)), "detect_os", [], become=False)
+
+    def run(self, target, settings, **kwargs):
+        pairs = [f"{option}={value}" for option, value in sorted(settings.items())]
+        risky = any((o.lower(), str(v).lower()) in LOCKOUT_RISK for o, v in settings.items())
+        if risky:
+            try:
+                self._fresh_login(target)
+            except Exception as exc:
+                raise RuntimeError(f"refusing to change {', '.join(sorted(settings))}: a fresh key login "
+                                   f"does not work before the change: {exc}") from exc
+        applied = self.runner.entry(target, "fix_sshd_hardening", ["apply", *pairs])
+        token = applied["token"]
         try:
-            self.runner.entry(fresh, "detect_os", [], become=False)
+            self._fresh_login(target)
         except Exception as exc:
             try:
-                self.runner.entry(target, "fix_sshd_hardening", ["revert"])
+                self.runner.entry(target, "fix_sshd_hardening", ["revert", token])
             except Exception:
                 pass  # the on-host watchdog still reverts
-            raise RuntimeError(f"fresh login failed after setting {option}; reverted: {exc}") from exc
-        self.runner.entry(target, "fix_sshd_hardening", ["confirm"])
+            raise RuntimeError(f"fresh login failed after the change; reverted: {exc}") from exc
+        self.runner.entry(target, "fix_sshd_hardening", ["confirm", token])
         return applied
 
 
 class EnforceSSHPolicy(AutoFix):
-    """Set exactly the deviating option to the inventory's value; the key-login proof guards lock-outs."""
+    """Set the deviating options to the inventory's values; deviations on one host are fixed together."""
 
     def can_fix(self, finding):
         return isinstance(finding, SSHPolicyDeviation)
 
     def get_fix(self, finding):
-        return EnforceSSHSetting().bind(target=finding.host, option=finding.option, value=finding.expected)
+        return EnforceSSHSettings().bind(target=finding.host, settings={finding.option: finding.expected})
+
+    def group_key(self, finding):
+        return finding.host.host
+
+    def get_group_fix(self, findings):
+        return EnforceSSHSettings().bind(target=findings[0].host,
+                                         settings={f.option: f.expected for f in findings})
 
     def describe(self, finding):
-        return (f"set sshd {finding.option} to {finding.expected} via 00-hardening.conf "
-                "(sshd -t validated; auto-revert unless a fresh key login succeeds)")
+        return (f"set sshd {finding.option} to {finding.expected} (verified with sshd -T before reload; "
+                "auto-revert unless a fresh key login succeeds)")

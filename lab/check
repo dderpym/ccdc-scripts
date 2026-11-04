@@ -96,7 +96,7 @@ def main():
         raise RuntimeError('Containers cannot communicate over their private virtual network')
     passed('private bridge connectivity between hatchery and tarpit')
 
-    for args in [('ping',), ('ssh', 'status'), ('firewall', 'status'), ('listeners',)]:
+    for args in [('ping',), ('firewall', 'status'), ('listeners',)]:
         command(*args)
         passed('ccdcctl ' + ' '.join(args) + ', both inventory hosts')
 

@@ -47,7 +47,7 @@ source ./setup                     # Bash: activate .venv and all CLI completion
 export ANSIBLE_INVENTORY=lab/inventory.yml
 
 ./ccdcctl ping
-./ccdcctl ssh status
+./ccdcctl scan
 ./ccdcctl firewall status
 ./ccdcctl listeners
 ./ccdcctl integrity
@@ -123,7 +123,7 @@ is not a test of `ccdcctl init`, which rotates root credentials and needs a real
 team public key. Run init only explicitly if you want to test that workflow.
 The entrypoint provisions fixtures, then execs the normal distro init. SSH is
 managed by the vendor `sshd` OpenRC service on Alpine and `ssh.service` on Debian;
-`ccdcctl ssh configure` can validate and reload it normally. The fixture app and
+`ccdcctl scan --fix` can validate and reload it normally. The fixture app and
 private socket relays have their own services too. For example:
 
 ```sh
