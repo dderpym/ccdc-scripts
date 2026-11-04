@@ -5,8 +5,9 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ccdc.ansible import AnsibleScript
+from ccdc.findings import Finding, Scanner
 from ccdc.runner import ROOT
-from ccdc.findings import EntryScanner, Finding, ScanResult
 
 TEAM_KEYS = ROOT / "secrets" / "oski.pub"
 
@@ -178,32 +179,37 @@ def declared_policy(variables):
     return {k: v for k, v in merged.items() if v is not None}
 
 
-class SSHVectorScanner(EntryScanner):
-    entry = "scan_ssh_vectors"
+class ScanSSHVectors(AnsibleScript):
+    """remote.py [--policy JSON] [--allow-key LINE]... [--allow OPTION=VALUE]... [--allow-path PATH]...
 
+    Prints {"findings": [rows], "errors": [...]}; reads sshd's EFFECTIVE configuration on the host.
+    """
+    source = "remote.py"
+    support = ("sshkeys.py",)
+
+    def arguments(self, policy=None, keys=(), options=(), paths=(), **kwargs):
+        args = []
+        if policy:
+            args += ["--policy", json.dumps({k: yaml_text(v) for k, v in policy.items()}, sort_keys=True)]
+        for key in keys:
+            args += ["--allow-key", key]
+        for option in options:
+            args += ["--allow", option]
+        for path in paths:
+            args += ["--allow-path", path]
+        return args
+
+
+class SSHVectorScanner(Scanner):
     def __init__(self, runner=None, allowlist=None, keys=None):
         super().__init__(runner)
         self.allowlist = ALLOWLIST if allowlist is None else allowlist
         self.keys = team_keys() if keys is None else tuple(keys)
 
-    def arguments(self, target=None, **kwargs):
+    def remote_step(self, target):
         allow = self.allowlist.get(getattr(target, "host", None), SSHAllow())
-        args = []
-        policy = declared_policy(getattr(target, "vars", None) or {})
-        if policy:
-            args += ["--policy", json.dumps({k: yaml_text(v) for k, v in policy.items()}, sort_keys=True)]
-        for key in (*self.keys, *allow.keys):
-            args += ["--allow-key", key]
-        for option in allow.options:
-            args += ["--allow", option]
-        for path in allow.paths:
-            args += ["--allow-path", path]
-        return args
-
-    def scan(self, target):
-        document = self.runner.entry(target, self.entry, self.arguments(target=target), become=self.become)
-        findings = [f for row in document.get("findings", []) for f in self.findings(target, row)]
-        return ScanResult(findings, document.get("errors", []))
+        return ScanSSHVectors(self.runner, policy=declared_policy(getattr(target, "vars", None) or {}),
+                              keys=(*self.keys, *allow.keys), options=tuple(allow.options), paths=tuple(allow.paths))
 
     def findings(self, target, row):
         kind = row["kind"]

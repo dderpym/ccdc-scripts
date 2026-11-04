@@ -32,7 +32,8 @@ import shutil
 import subprocess
 import sys
 
-KEY_TYPE = re.compile(r"^(ssh-[a-z0-9]+|ecdsa-sha2-nistp\d+|sk-[a-z0-9@.-]+)$")
+from sshkeys import KEY_TYPE, fingerprint, parse_key_line  # noqa: E402,F401
+
 DEFAULT_KEY_FILES = {".ssh/authorized_keys", ".ssh/authorized_keys2"}
 SSHD_COMMS = {"sshd", "sshd-session", "sshd-auth"}
 LIVE_ENV = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT")
@@ -42,26 +43,6 @@ LISTEN = "0A"
 # Options whose value names a file or program sshd reads or runs.
 REFERENCED = ("authorizedkeyscommand", "authorizedprincipalscommand", "trustedusercakeys", "revokedkeys",
               "banner", "authorizedprincipalsfile")
-
-
-def fingerprint(blob):
-    raw = base64.b64decode(blob, validate=True)
-    return "SHA256:" + base64.b64encode(hashlib.sha256(raw).digest()).decode().rstrip("=")
-
-
-def parse_key_line(line):
-    """(fingerprint, comment) for an authorized_keys/.pub line, else None. Options may precede the key."""
-    line = line.strip()
-    if not line or line.startswith("#"):
-        return None
-    tokens = line.split()
-    for index, token in enumerate(tokens[:-1]):
-        if KEY_TYPE.match(token):
-            try:
-                return fingerprint(tokens[index + 1]), " ".join(tokens[index + 2:])
-            except (binascii.Error, ValueError):
-                return None
-    return None
 
 
 # ---- the running daemon and its effective configuration ------------------------------

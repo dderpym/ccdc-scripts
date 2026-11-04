@@ -1,20 +1,22 @@
 """sshd_config problems are reported only: editing it can lock the team out."""
-from ccdc.ansible import EntryScript
+from ccdc.ansible import AnsibleScript
 from ccdc.findings import AutoFix
 from ccdc.scanners.ssh_vectors import RogueAuthorizedKey, SSHStartupScript, team_keys
 
 
-class RemoveSSHStartupFile(EntryScript):
-    """Remove sshrc / ~/.ssh/rc after copying it to /root/ir (the host script refuses anything else)."""
-    entry = "fix_ssh_vectors"
+class RemoveSSHStartupFile(AnsibleScript):
+    """Remove sshrc / ~/.ssh/rc after copying it to /root/ir (remote.py refuses anything else)."""
+    source = "remote.py"
+    support = ("sshkeys.py",)
 
     def arguments(self, path, **kwargs):
         return ["remove-file", path]
 
 
-class RemoveAuthorizedKey(EntryScript):
+class RemoveAuthorizedKey(AnsibleScript):
     """Drop every line with this fingerprint from an authorized_keys file, keeping a backup in /root/ir."""
-    entry = "fix_ssh_vectors"
+    source = "remote.py"
+    support = ("sshkeys.py",)
 
     def arguments(self, path, fingerprint, allow_keys=(), **kwargs):
         return ["remove-key", path, fingerprint, *[a for key in allow_keys for a in ("--allow-key", key)]]

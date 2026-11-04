@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
-from ccdc.findings import EntryScanner, Finding
+from ccdc.ansible import AnsibleScript
+from ccdc.findings import Finding, Scanner
 
 
 @dataclass(frozen=True)
@@ -15,8 +16,15 @@ class UnownedCapabilityBinary(Finding):
         return f"unowned binary {self.path} has file capabilities {self.capabilities}"
 
 
-class CapBinaryScanner(EntryScanner):
-    entry = "scan_cap_binaries"
+class ScanCapBinaries(AnsibleScript):
+    """remote.py prints {"findings": [{path, capabilities}], "errors": [...]}."""
+    source = "remote.py"
+    support = ("pkgowner.py",)
+
+
+class CapBinaryScanner(Scanner):
+    def remote_step(self, target):
+        return ScanCapBinaries(self.runner)
 
     def findings(self, target, row):
         return [UnownedCapabilityBinary(target, row["path"], row["capabilities"])]

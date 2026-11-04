@@ -8,7 +8,7 @@ import os
 import subprocess
 import sys
 
-from host import pkgowner
+import pkgowner
 
 STANDARD = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin")
 
