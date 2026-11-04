@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Read-only SSH discovery. --context accepts sshd -C syntax; --config is diagnostic.
+"""Read-only SSH discovery, kept as an internal helper: `ccdcctl firewall configure` reads the listening
+ports from it so SSH is never locked out. SSH policy itself is scanned by ccdc.scanners.ssh_vectors.
+
+Read-only SSH discovery. --context accepts sshd -C syntax; --config is diagnostic.
 
 No context means global defaults, NOT the policy for all possible Match blocks.
 """

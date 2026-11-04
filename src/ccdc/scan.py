@@ -31,20 +31,39 @@ def scan_all(targets, scanners=None, workers=10):
 
 
 def apply_fixes(findings, autofix, approve=lambda finding, text: True, out=print):
-    """Run the fix for every fixable finding the callback approves; returns [(finding, ok, detail)]."""
-    outcome = []
+    """Run the fix for every fixable finding the callback approves; returns [(finding, ok, detail)].
+
+    Approved findings that share an AutoFix group key are fixed by one script run, so a
+    host with several deviating settings gets one change, one proof and one watchdog.
+    """
+    approved = []
     for finding in findings:
-        if not autofix.can_fix(finding):
-            continue
-        text = autofix.describe(finding)
-        if not approve(finding, text):
-            continue
+        if autofix.can_fix(finding):
+            text = autofix.describe(finding)
+            if approve(finding, text):
+                approved.append((finding, text))
+    batches, order = {}, []
+    for finding, text in approved:
+        key = autofix.group_key(finding)
+        key = ("single", len(order)) if key is None else key
+        if key not in batches:
+            batches[key] = []
+            order.append(key)
+        batches[key].append((finding, text))
+    outcome = []
+    for key in order:
+        members = batches[key]
         try:
-            autofix.get_fix(finding).run()
-            outcome.append((finding, True, text))
+            if autofix.group_key(members[0][0]) is None:
+                autofix.get_fix(members[0][0]).run()
+            else:
+                autofix.get_group_fix([f for f, _ in members]).run()
+            results = [(f, True, text) for f, text in members]
         except Exception as exc:
-            outcome.append((finding, False, f"{text}: {exc}"))
-        out(("fixed   " if outcome[-1][1] else "FAILED  ") + outcome[-1][2])
+            results = [(f, False, f"{text}: {exc}") for f, text in members]
+        for row in results:
+            out(("fixed   " if row[1] else "FAILED  ") + row[2])
+        outcome.extend(results)
     return outcome
 
 

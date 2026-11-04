@@ -10,7 +10,7 @@ import runpy
 import sys
 
 ENTRIES = (
-    "apply_fixes", "apply_ssh", "discover_firewall", "discover_integrity", "discover_listeners",
+    "apply_fixes", "discover_firewall", "discover_integrity", "discover_listeners",
     "discover_lse", "discover_ssh", "manage_updates",
 )
 # New entries follow a naming convention instead of editing the tuple above, so
