@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
-"""Find library injection: LD_PRELOAD/LD_LIBRARY_PATH in units, drop-ins, env files, ld.so.preload,
-and unowned shared objects mapped into running processes.
+"""Find library injection from live state: systemd's resolved environment for every startable unit
+(`systemctl show`), the environment fresh login shells and the manager really produce, ld.so.preload as
+the loader applies it, and unowned shared objects mapped into running processes.
 
 Prints {"findings": [row...], "errors": [...]}. Fails closed: a unit that cannot be read or
 parsed becomes a row naming it, never silence. Read-only.
 """
-import glob
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
 
 VARS = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT")
-UNIT_DIRS = ("/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system")
-ENV_FILES = ("/etc/environment",)
-ENV_GLOBS = ("/etc/profile.d/*", "/etc/profile", "/etc/bash.bashrc", "/etc/environment.d/*.conf")
 MAX_MAPPED = 50
 
 
@@ -58,77 +56,152 @@ def env_assignments(text):
             yield name.strip(), value.strip().strip("\"'")
 
 
-def unit_files(dirs=UNIT_DIRS):
-    for directory in dirs:
-        yield from sorted(glob.glob(os.path.join(directory, "*.service")))
-        yield from sorted(glob.glob(os.path.join(directory, "*.socket")))
-        yield from sorted(glob.glob(os.path.join(directory, "*.d", "*.conf")))
-
-
-def unit_name(path):
-    parent = os.path.basename(os.path.dirname(path))
-    return parent[:-2] if parent.endswith(".d") else os.path.basename(path)
-
-
 def read(path):
     with open(path, encoding="utf-8") as handle:
         return handle.read(1 << 20)
 
 
-def scan_units(dirs=UNIT_DIRS, reader=read):
-    rows, seen = [], set()
-    for path in unit_files(dirs):
-        if path in seen:
-            continue
-        seen.add(path)
-        unit = unit_name(path)
-        try:
-            entries = parse_unit(reader(path))
-        except (OSError, UnicodeDecodeError, ValueError) as exc:
-            rows.append({"kind": "unreadable", "file": path, "unit": unit, "reason": str(exc)})
-            continue
-        for directive, name, value in entries:
-            if directive == "Environment" and name in VARS:
-                rows.append({"kind": "unit-env", "file": path, "unit": unit, "variable": name, "value": value})
-            elif directive == "EnvironmentFile":
-                try:
-                    pairs = list(env_assignments(reader(name)))
-                except FileNotFoundError:
-                    continue
-                except (OSError, UnicodeDecodeError, ValueError) as exc:
-                    rows.append({"kind": "unreadable", "file": name, "unit": unit, "reason": str(exc)})
-                    continue
-                rows.extend({"kind": "unit-env", "file": name, "unit": unit, "variable": v, "value": val}
-                            for v, val in pairs)
-    return rows
+def systemctl(*args, run=subprocess.run):
+    result = run(["systemctl", "--no-pager", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                 universal_newlines=True, timeout=60)
+    if result.returncode:
+        raise OSError("systemctl %s: %s" % (" ".join(args[:2]), result.stderr.strip() or result.returncode))
+    return result.stdout
 
 
-def scan_env_files(files=ENV_FILES, globs=ENV_GLOBS, reader=read):
-    paths = list(files)
-    for pattern in globs:
-        paths.extend(sorted(glob.glob(pattern)))
-    rows = []
+def unit_names(run=subprocess.run):
+    """Every service/socket systemd could start: installed unit files plus anything loaded (incl. transient)."""
+    names = set()
+    for args in (("list-unit-files", "--type=service,socket", "--no-legend"),
+                 ("list-units", "--all", "--type=service,socket", "--no-legend", "--plain")):
+        for line in systemctl(*args, run=run).splitlines():
+            fields = line.split()
+            if fields and "." in fields[0] and not fields[0].endswith("@.service"):
+                names.add(fields[0])
+    return sorted(names)
+
+
+SHOW = ("Id", "LoadState", "FragmentPath", "DropInPaths", "Environment", "EnvironmentFiles", "ExecStart")
+
+
+def show_units(names, run=subprocess.run, chunk=100):
+    """{unit: {property: value}} from `systemctl show`, the manager's own view of each unit."""
+    units = {}
+    for i in range(0, len(names), chunk):
+        batch = names[i:i + chunk]
+        out = systemctl("show", "-p", ",".join(SHOW), *batch, run=run)
+        for block in out.strip("\n").split("\n\n"):
+            props = dict(line.partition("=")[::2] for line in block.splitlines() if "=" in line)
+            if props.get("Id"):
+                units[props["Id"]] = props
+    for name in names:
+        units.setdefault(name, {})  # asked for but not answered: fail closed below
+    return units
+
+
+def environment_items(value):
+    """['A=1', 'LD_PRELOAD=/x'] from systemd's rendering of Environment=; ValueError if malformed."""
+    return shlex.split(value) if value.strip() else []
+
+
+ENV_FILE = re.compile(r"(\S+) \(ignore_errors=(?:yes|no)\)")
+
+
+def locate(variable, props):
+    """Best effort: the last file among fragment + drop-ins that sets `variable` (later drop-ins win)."""
+    paths = ([props["FragmentPath"]] if props.get("FragmentPath") else []) + props.get("DropInPaths", "").split()
+    hit = ""
     for path in paths:
         try:
-            pairs = list(env_assignments(reader(path)))
-        except (FileNotFoundError, IsADirectoryError):
+            if variable in read(path):
+                hit = path
+        except (OSError, UnicodeDecodeError):
             continue
-        except (OSError, UnicodeDecodeError) as exc:
-            rows.append({"kind": "unreadable", "file": path, "unit": "", "reason": str(exc)})
+    return hit or props.get("FragmentPath", "")
+
+
+def scan_units(run=subprocess.run, reader=read):
+    """Effective per-unit environment as systemd resolved it, not as any one file says."""
+    rows = []
+    for unit, props in sorted(show_units(unit_names(run), run).items()):
+        state = props.get("LoadState", "")
+        if state in ("not-found", "masked"):
             continue
-        rows.extend({"kind": "profile-env", "file": path, "unit": "", "variable": v, "value": val}
-                    for v, val in pairs)
+        if state != "loaded":
+            rows.append({"kind": "unreadable", "file": props.get("FragmentPath", ""), "unit": unit,
+                         "reason": "systemd reports LoadState=%s" % (state or "no answer")})
+            continue
+        try:
+            items = environment_items(props.get("Environment", ""))
+        except ValueError as exc:
+            rows.append({"kind": "unreadable", "file": props.get("FragmentPath", ""), "unit": unit,
+                         "reason": "cannot parse Environment: %s" % exc})
+            continue
+        for item in items:
+            name, _, value = item.partition("=")
+            if name in VARS:
+                rows.append({"kind": "unit-env", "file": locate(name, props), "unit": unit,
+                             "variable": name, "value": value})
+        for path in ENV_FILE.findall(props.get("EnvironmentFiles", "")):
+            try:
+                pairs = list(env_assignments(reader(path)))
+            except FileNotFoundError:
+                continue
+            except (OSError, UnicodeDecodeError, ValueError) as exc:
+                rows.append({"kind": "unreadable", "file": path, "unit": unit, "reason": str(exc)})
+                continue
+            rows.extend({"kind": "unit-env", "file": path, "unit": unit, "variable": v, "value": val}
+                        for v, val in pairs)
+        for token in props.get("ExecStart", "").replace(";", " ").split():
+            name, eq, value = token.partition("=")
+            if eq and name in VARS:  # e.g. ExecStart=/usr/bin/env LD_PRELOAD=/x sshd
+                rows.append({"kind": "unit-env", "file": props.get("FragmentPath", ""), "unit": unit,
+                             "variable": name, "value": value})
     return rows
 
 
-def scan_ld_so_preload(path="/etc/ld.so.preload", reader=read):
+def probe_environment(command, run=subprocess.run):
+    result = run(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, universal_newlines=True,
+                 timeout=30, env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "HOME": "/root", "TERM": "dumb"})
+    return dict(line.partition("=")[::2] for line in result.stdout.splitlines() if "=" in line)
+
+
+PROBES = (("login shell (sh -l)", ["sh", "-lc", "env"]), ("login shell (bash -l)", ["bash", "-lc", "env"]))
+
+
+def scan_environment(run=subprocess.run, probes=PROBES):
+    """What a fresh login shell and the systemd manager actually hand to new processes."""
+    rows = []
+    sources = [(label, lambda c=command: probe_environment(c, run)) for label, command in probes]
+    sources.append(("systemd manager environment", lambda: dict(
+        line.partition("=")[::2] for line in systemctl("show-environment", run=run).splitlines() if "=" in line)))
+    for label, get in sources:
+        try:
+            environment = get()
+        except FileNotFoundError:
+            continue  # that shell is not installed
+        for name in VARS:
+            if environment.get(name):
+                rows.append({"kind": "profile-env", "file": label, "unit": "", "variable": name,
+                             "value": environment[name]})
+    return rows
+
+
+def scan_ld_so_preload(path="/etc/ld.so.preload", reader=read, maps="/proc/self/maps"):
+    """The loader's own input, plus whether it really took effect (mapped into this very process)."""
     try:
         libs = list(logical_lines(reader(path)))
     except FileNotFoundError:
         return []
     except (OSError, UnicodeDecodeError) as exc:
         return [{"kind": "unreadable", "file": path, "unit": "", "reason": str(exc)}]
-    return [{"kind": "ld-so-preload", "file": path, "libraries": libs}] if libs else []
+    try:
+        with open(maps) as handle:
+            mapped = handle.read()
+    except OSError:
+        mapped = ""
+    active = [lib for lib in libs if os.path.realpath(lib) in mapped or lib in mapped]
+    return [{"kind": "ld-so-preload", "file": path, "libraries": libs, "active": active}] if libs else []
 
 
 def owned(path, run=subprocess.run):
@@ -175,7 +248,7 @@ def scan_maps(proc="/proc", is_owned=owned, exists=os.path.exists):
 
 def scan():
     rows, errors = [], []
-    for name, step in (("units", scan_units), ("environment files", scan_env_files),
+    for name, step in (("units", scan_units), ("login/manager environment", scan_environment),
                        ("ld.so.preload", scan_ld_so_preload), ("process maps", scan_maps)):
         try:
             rows.extend(step())

@@ -39,33 +39,90 @@ class HostScan(unittest.TestCase):
         path.write_text(text)
         return path
 
-    def test_dropin_and_continuation_and_envfile(self):
-        self.write("ssh.service.d/x.conf", DROPIN)
-        self.write("a.service", "[Service]\nEnvironment=A=1 \\\n  LD_LIBRARY_PATH=/tmp/x\nEnvironmentFile=-%s\n"
-                   % (self.root / "env"))
-        self.write("env", "export LD_PRELOAD=/opt/evil.so\nOTHER=1\n")
-        rows = scan.scan_units([str(self.root)])
+    def systemd(self, units, env=None):
+        """Fake `systemctl` answering list-unit-files/list-units/show/show-environment."""
+        class Result:
+            returncode, stderr = 0, ""
+
+            def __init__(self, stdout):
+                self.stdout = stdout
+
+        def run(argv, **kwargs):
+            args = argv[2:]
+            if args[0] == "list-unit-files":
+                return Result("".join(f"{u} enabled enabled\n" for u in units))
+            if args[0] == "list-units":
+                return Result("")
+            if args[0] == "show-environment":
+                return Result("".join(f"{k}={v}\n" for k, v in (env or {}).items()))
+            asked = [a for a in args if "." in a and not a.startswith("-")]
+            return Result("\n".join("".join(f"{k}={v}\n" for k, v in units[u].items())
+                                    for u in asked if u in units))
+        return run
+
+    def test_effective_environment_from_systemd(self):
+        dropin = self.write("ssh.service.d/x.conf", DROPIN)
+        envfile = self.write("env", "export LD_PRELOAD=/opt/evil.so\nOTHER=1\n")
+        units = {
+            "ssh.service": {"Id": "ssh.service", "LoadState": "loaded", "FragmentPath": str(self.root / "ssh.service"),
+                            "DropInPaths": str(dropin), "Environment": "LANG=C LD_PRELOAD=/usr/lib/libudev-cache.so.1 FOO=bar"},
+            "a.service": {"Id": "a.service", "LoadState": "loaded", "Environment": "A=1 LD_LIBRARY_PATH=/tmp/x",
+                          "EnvironmentFiles": "%s (ignore_errors=yes)" % envfile},
+            "ok.service": {"Id": "ok.service", "LoadState": "loaded", "Environment": "PATH=/usr/bin"},
+            "gone.service": {"Id": "gone.service", "LoadState": "not-found"},
+            "mask.service": {"Id": "mask.service", "LoadState": "masked"},
+            "env.service": {"Id": "env.service", "LoadState": "loaded",
+                            "ExecStart": "{ path=/usr/bin/env ; argv[]=/usr/bin/env LD_PRELOAD=/x.so sshd ; }"},
+        }
+        rows = scan.scan_units(self.systemd(units))
         seen = {(r["unit"], r["variable"], r["value"]) for r in rows if r["kind"] == "unit-env"}
         self.assertEqual(seen, {("ssh.service", "LD_PRELOAD", "/usr/lib/libudev-cache.so.1"),
                                 ("a.service", "LD_LIBRARY_PATH", "/tmp/x"),
-                                ("a.service", "LD_PRELOAD", "/opt/evil.so")})
+                                ("a.service", "LD_PRELOAD", "/opt/evil.so"),
+                                ("env.service", "LD_PRELOAD", "/x.so")})
+        located = {r["unit"]: r["file"] for r in rows if r["variable"] == "LD_PRELOAD" and r["unit"] == "ssh.service"}
+        self.assertEqual(located["ssh.service"], str(dropin))  # file is only located, systemd decided
 
-    def test_unparseable_unit_fails_closed(self):
-        self.write("bad.service", '[Service]\nEnvironment="LD_PRELOAD=/x\n')
-        rows = scan.scan_units([str(self.root)])
+    def test_unit_systemd_cannot_load_fails_closed(self):
+        units = {"bad.service": {"Id": "bad.service", "LoadState": "bad-setting"}}
+        rows = scan.scan_units(self.systemd(units))
         self.assertEqual([(r["kind"], r["unit"]) for r in rows], [("unreadable", "bad.service")])
 
-    def test_clean_unit_is_silent(self):
-        self.write("ok.service", "[Service]\nEnvironment=PATH=/usr/bin\nExecStart=/bin/true\n")
-        self.assertEqual(scan.scan_units([str(self.root)]), [])
+    def test_unanswered_unit_fails_closed(self):
+        run = self.systemd({"x.service": {"Id": "x.service"}})
+        base = run
 
-    def test_ld_so_preload_and_env_files(self):
+        def partial(argv, **kw):
+            result = base(argv, **kw)
+            if argv[2] == "show":
+                result.stdout = ""
+            return result
+        rows = scan.scan_units(partial)
+        self.assertEqual([(r["kind"], r["unit"]) for r in rows], [("unreadable", "x.service")])
+
+    def test_systemctl_failure_is_an_error_not_clean(self):
+        class Failed:
+            returncode, stdout, stderr = 1, "", "no bus"
+        with self.assertRaises(OSError):
+            scan.scan_units(lambda *a, **k: Failed())
+
+    def test_login_and_manager_environment(self):
+        def run(argv, **kwargs):
+            class R:
+                returncode, stderr = 0, ""
+                stdout = "LD_PRELOAD=/x.so\nLANG=C\n" if argv[0] == "bash" else "LANG=C\n"
+            return R()
+        rows = scan.scan_environment(run)
+        self.assertEqual([(r["file"], r["variable"], r["value"]) for r in rows],
+                         [("login shell (bash -l)", "LD_PRELOAD", "/x.so")])
+
+    def test_ld_so_preload_reports_whether_loader_applied_it(self):
         path = self.write("ld.so.preload", "# c\n/usr/lib/evil.so\n")
-        self.assertEqual(scan.scan_ld_so_preload(str(path))[0]["libraries"], ["/usr/lib/evil.so"])
+        maps = self.write("maps", "7f00-7f01 r-xp 0 08:01 5 /usr/lib/evil.so\n")
+        row = scan.scan_ld_so_preload(str(path), maps=str(maps))[0]
+        self.assertEqual((row["libraries"], row["active"]), (["/usr/lib/evil.so"], ["/usr/lib/evil.so"]))
+        self.assertEqual(scan.scan_ld_so_preload(str(path), maps=str(self.root / "none"))[0]["active"], [])
         self.assertEqual(scan.scan_ld_so_preload(str(self.root / "none")), [])
-        env = self.write("environment", "LD_PRELOAD=\"/x.so\"\nLANG=C\n")
-        rows = scan.scan_env_files([str(env)], [])
-        self.assertEqual([(r["variable"], r["value"]) for r in rows], [("LD_PRELOAD", "/x.so")])
 
     def test_maps_unowned_only(self):
         for pid, lib in (("10", "/usr/lib/libudev-cache.so.1"), ("11", "/usr/lib/libc.so.6")):
