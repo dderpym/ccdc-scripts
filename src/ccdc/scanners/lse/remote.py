@@ -258,6 +258,9 @@ def drop_privileges(name=None):
         account = None
     if account is None or account.pw_uid == 0:
         raise SystemExit("Running as root requires an unprivileged target account (--user or SUDO_USER)")
+    # The driver runs us inside a root-only work directory. Leave it first: as the dropped account
+    # find(1) cannot restore an unreadable cwd and exits 1, which looked like "no -writable".
+    os.chdir("/")
     os.setgroups(os.getgrouplist(account.pw_name, account.pw_gid))
     os.setresgid(account.pw_gid, account.pw_gid, 0)
     os.setresuid(account.pw_uid, account.pw_uid, 0)
@@ -387,12 +390,24 @@ def scan(script, deep=False, only=None):
 
 @contextlib.contextmanager
 def bundled_script():
-    """The pinned lse.sh shipped beside the helper modules, as a private file; /bin/sh runs it, so no exec bit is needed."""
+    """The pinned lse.sh as a file the dropped account can read; /bin/sh runs it, so no exec bit is needed.
+
+    Staged BEFORE privileges are dropped: the archive directory is private to root, and the
+    assessed account (the whole point of dropping) must not be given access to it. The copy
+    lives in its own world-readable directory and is removed afterwards with the saved root uid.
+    """
     source = Path(kernel_risks.__file__).resolve().with_name("lse.sh")
-    with tempfile.TemporaryDirectory(prefix="ccdc-lse-pin-") as directory:
+    directory = tempfile.mkdtemp(prefix="ccdc-lse-pin-")
+    try:
+        os.chmod(directory, 0o755)
         path = Path(directory) / "lse.sh"
         path.write_bytes(source.read_bytes())
+        path.chmod(0o644)
         yield path
+    finally:
+        if os.geteuid() != 0 and os.getresuid()[2] == 0:
+            os.seteuid(0)  # drop_privileges kept root as the saved uid for exactly this
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 def main():
@@ -402,9 +417,9 @@ def main():
     parser.add_argument("--only", help="comma-separated finding ids; run just those checks")
     parser.add_argument("--user", help="unprivileged account to assess when started as root (default SUDO_USER)")
     args = parser.parse_args()
-    drop_privileges(args.user)
     try:
         with (contextlib.nullcontext(args.script) if args.script else bundled_script()) as script:
+            drop_privileges(args.user)  # after the pinned copy is staged, before anything is assessed
             result = scan(script, args.deep, set(args.only.split(",")) if args.only else None)
     except OSError as exc:
         result = {"findings": [], "raw": "", "errors": [str(exc)]}
