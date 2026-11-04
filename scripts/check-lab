@@ -103,7 +103,7 @@ def main():
     for _ in range(2):
         command('integrity', expected=1)
         for host in hosts:
-            state = json.loads((ROOT / 'reports' / host / 'integrity/report.json').read_text())
+            state = json.loads((ROOT / 'state' / 'reports' / host / 'integrity/report.json').read_text())
             if state.get('errors'):
                 raise RuntimeError(host + ': integrity scan incomplete: ' + str(state['errors']))
             critical = {f.get('path') for f in state['findings'] if f['severity'] == 'critical'}
@@ -113,7 +113,7 @@ def main():
 
     command('lse', expected=1)
     for host in hosts:
-        state = json.loads((ROOT / 'reports' / host / 'lse/report.json').read_text())
+        state = json.loads((ROOT / 'state' / 'reports' / host / 'lse/report.json').read_text())
         if state.get('errors') or state.get('incomplete_ids'):
             raise RuntimeError(host + ': LSE coverage incomplete')
         ids = {f['id'] for f in state['findings']}
@@ -122,8 +122,8 @@ def main():
         if 'sud000' in ids:
             raise RuntimeError(host + ': expected oski sudo was reported as a vulnerability')
     passed('LSE detects writable critical file and recurring task, without alerting on expected oski sudo')
-    ctl.save(ROOT / 'reports/lab/check.json', {'checks': checks})
-    print('Live suite passed; evidence: reports/lab/check.json')
+    ctl.save(ROOT / 'state/reports/lab/check.json', {'checks': checks})
+    print('Live suite passed; evidence: state/reports/lab/check.json')
 
 
 if __name__ == '__main__':
