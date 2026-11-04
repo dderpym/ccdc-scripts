@@ -330,6 +330,13 @@ class PermissionFixTests(unittest.TestCase):
         self.assertEqual([f['mode'] for f in fixes], [0o4755, 0o644])
         self.assertEqual({f['tier'] for f in fixes}, {'simple' if os.getuid() == 0 else 'all'})
 
+    def test_uncommon_setuid_binary_loses_setuid_only_with_all_tier(self):
+        binary = self.root / 'odd'
+        binary.write_text('x')
+        binary.chmod(0o6755)
+        fix, = self.fixes('fst020', str(binary))
+        self.assertEqual((fix['mode'], fix['tier']), (0o755, 'all'))
+
     def test_path_dirs_keep_owner_and_shadow_only_loses_other_access(self):
         path = self.root / 'bin'
         path.mkdir()

@@ -86,7 +86,10 @@ ROOT_PERMISSION_TESTS = {
 
 # Permission tests whose affirmative path evidence has a mechanical fix:
 # bits to clear, and whether a non-root owner of a system path becomes root.
+# Removing setuid can break a working program, so it is never a 'simple' fix.
+ALWAYS_PROMPT = {"fst020"}
 PERMISSION_FIXES = {
+    "fst020": (0o6000, False),  # strips setuid/setgid; may break a legitimate helper
     "fst030": (0o022, True), "fst160": (0o022, True), "fst170": (0o022, True),
     "fst180": (0o022, False),  # PATH entries may legitimately be the user's own
     "sys030": (0o007, False),
@@ -117,7 +120,7 @@ def permission_fixes(test_id, contexts, lstat=os.lstat):
             target = dict(was, mode=was["mode"] & ~clear, uid=0 if chown_root else was["uid"])
             if target != was:
                 fixes.append(dict(path=path, **target, was=was,
-                                  tier="simple" if target["uid"] == was["uid"] else "all"))
+                                  tier="simple" if target["uid"] == was["uid"] and test_id not in ALWAYS_PROMPT else "all"))
     return fixes
 
 

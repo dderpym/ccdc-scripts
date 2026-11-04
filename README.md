@@ -761,7 +761,9 @@ through the file descriptor, never through symlinks. Package-content changes
 are not fixable and stay as findings; re-run the scan to verify.
 
 `lse` offers the same prompts and `--auto-apply` flag for its basic permission
-tests. For fst030/fst160/fst170/fst180/sys030 it takes the paths named in the
+tests. For fst020 (uncommon setuid binaries) it proposes clearing the setuid and
+setgid bits; this can break a legitimate helper, so it needs `--auto-apply=all`.
+For fst030/fst160/fst170/fst180/sys030 it takes the paths named in the
 evidence, re-reads their metadata on the target and proposes: clear group/other
 write (sys030: other access), and for fst030/fst160/fst170 make a non-root owner
 root (an ownership change, so `--auto-apply=all`). Symlinks, sticky directories
