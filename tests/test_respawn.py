@@ -42,6 +42,65 @@ class Seq(Scanner):
         return ScanResult(found, [])
 
 
+class RescanGuardTests(unittest.TestCase):
+    def test_stable_vanished_appeared(self):
+        a, b, c = Planted(T, "/a"), Planted(T, "/b"), Planted(T, "/c")
+        clock = Clock()
+        guard = respawn.RescanGuard([Seq([a, b], [a, c])], delay=30, sleep=clock.sleep, clock=clock)
+        report = guard.run(T)
+        self.assertEqual((report.stable, report.vanished, report.appeared), ([a], [b], [c]))
+        self.assertEqual(clock.sleeps, [30])
+        self.assertTrue(report.changed)
+
+    def test_unchanged_scan_is_not_changed(self):
+        a = Planted(T, "/a")
+        report = respawn.RescanGuard([Seq([a])], sleep=Clock().sleep).run(T)
+        self.assertEqual(report.stable, [a])
+        self.assertFalse(report.changed)
+
+    def test_restart_sec_is_a_floor(self):
+        clock = Clock()
+        respawn.RescanGuard([Seq([Planted(T, "/a", 45)])], delay=5, sleep=clock.sleep).run(T)
+        self.assertEqual(clock.sleeps, [45])
+
+    def test_error_in_one_round_is_partial(self):
+        class Flaky(Scanner):
+            calls = 0
+
+            def run(self, target):
+                Flaky.calls += 1
+                return ScanResult([], ["ssh timeout"] if Flaky.calls == 2 else [])
+        report = respawn.RescanGuard([Flaky()], sleep=Clock().sleep).run(T)
+        self.assertTrue(report.partial)
+        self.assertTrue(report.changed)
+        self.assertEqual(len(report.errors), 1)
+
+    def test_seeded_first_round_skips_initial_scan(self):
+        a, scanner = Planted(T, "/a"), Seq([])
+        report = respawn.RescanGuard([scanner], sleep=Clock().sleep).run(T, ([a], []))
+        self.assertEqual(scanner.calls, 1)
+        self.assertEqual(report.vanished, [a])
+
+    def test_hosts_share_one_delay(self):
+        import threading
+        t2 = Target("web02")
+        lock, sleeps = threading.Lock(), []
+
+        def sleep(seconds):
+            with lock:
+                sleeps.append(seconds)
+        reports = respawn.guard_all([T, t2], [Seq([])], delay=60, sleep=sleep)
+        self.assertEqual(set(reports), {T, t2})
+        self.assertEqual(sleeps, [60, 60])  # concurrent: two sleeps of 60, not one of 120
+
+    def test_render_guard(self):
+        a = Planted(T, "/a")
+        reports = {T: respawn.RescanGuard([Seq([a], [])], sleep=Clock().sleep).run(T)}
+        lines = []
+        self.assertTrue(respawn.render_guard(reports, lines.append))
+        self.assertTrue(any("VANISHED" in l for l in lines))
+
+
 class RespawnTests(unittest.TestCase):
     def test_wait_uses_largest_restartsec_plus_slack(self):
         self.assertEqual(respawn.settle_time([Planted(T, "a", 30)], wait=5), 40)
