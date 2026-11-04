@@ -1,5 +1,5 @@
 """Files in system directories that no package owns (doc 5.1)."""
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from ccdc.findings import BundleScanner, Finding
 
@@ -41,6 +41,8 @@ class UnitRunsUnownedBinary(Finding):
     unit_owned: bool
     pids: tuple = ()
     level: str = "warning"
+    # RestartSec of the unit: the rescan guard waits at least this long. Not part of identity.
+    restart_sec: int = field(default=0, compare=False)
     code = "unit-runs-unowned-binary"
 
     @property
@@ -85,7 +87,7 @@ class UnownedScanner(BundleScanner):
         if kind == "timestomped":
             return [TimestompedFile(target, row["path"], tuple(row["flags"]), pids)]
         if kind == "unit-runs-unowned":
-            return [UnitRunsUnownedBinary(target, row["unit"], row["binary"], row["unit_owned"], pids, row["severity"])]
+            return [UnitRunsUnownedBinary(target, row["unit"], row["binary"], row["unit_owned"], pids, row["severity"], row.get("restart_sec", 0))]
         if kind == "unowned-unit":
             return [UnownedUnit(target, row["unit"])]
         if kind == "unit-missing-binary":

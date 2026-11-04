@@ -17,6 +17,7 @@ class PathShadowing(Finding):
 
 
 class PathShadowScanner(BundleScanner):
+    cheap = True  # live and quick: eligible for the rescan guard\'s fast poll
     entry = "scan_path_shadow"
 
     def findings(self, target, row):

@@ -795,8 +795,11 @@ def scan_command(args):
         fixed = {}
         for target, (findings, _) in results.items():
             fixed[target] = [f for f, ok, _ in scanning.apply_fixes(findings, autofix, approve) if ok]
+        if not any(fixed.values()):
+            print("\nNothing was fixed; no rescan needed.")
+            return bad
         from ccdc import respawn
-        print(f"\nWaiting {respawn.settle_time([], args.wait)}s, then rescanning for respawned artifacts...")
+        print(f"\nWaiting for restart delays, then rescanning for respawned artifacts...")
         bad = respawn.render(respawn.verify_all(results, scanners, fixed, wait=args.wait, **polling))
     elif args.recheck:
         from ccdc import respawn

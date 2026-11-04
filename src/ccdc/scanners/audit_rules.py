@@ -25,6 +25,7 @@ class AuditDisabled(Finding):
 
 
 class AuditRulesScanner(BundleScanner):
+    cheap = True  # live and quick: eligible for the rescan guard\'s fast poll
     entry = "scan_audit_rules"
 
     def findings(self, target, row):

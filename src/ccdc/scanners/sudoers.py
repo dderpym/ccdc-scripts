@@ -58,6 +58,7 @@ class SudoersInvalid(Finding):
 
 
 class SudoersScanner(BundleScanner):
+    cheap = True  # live and quick: eligible for the rescan guard\'s fast poll
     entry = "scan_sudoers"
     KINDS = {"world": SudoGrantsEveryone, "grant": UnexpectedSudoGrant}
 

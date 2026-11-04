@@ -106,7 +106,21 @@ def timestomped(stat_result):
 
 
 EXEC_PROPS = ("ExecStart", "ExecStartPre", "ExecStartPost")
-SHOW = ("Id", "LoadState", "FragmentPath", *EXEC_PROPS)
+SHOW = ("Id", "LoadState", "FragmentPath", "RestartUSec", *EXEC_PROPS)
+UNITS = {"us": 1e-6, "usec": 1e-6, "ms": 1e-3, "msec": 1e-3, "s": 1, "sec": 1, "min": 60, "h": 3600, "hr": 3600}
+
+
+def restart_seconds(text):
+    """systemd's rendering ('100ms', '30s', '1min 30s') in whole seconds, rounded up; 0 when unknown."""
+    total = 0.0
+    for number, unit in re.findall(r"([0-9.]+)([a-z]+)", text or ""):
+        total += float(number) * UNITS.get(unit, 0)
+    return int(-(-total // 1))
+
+
+class ResolvedUnits(dict):
+    """{fragment path: [binaries]}; .restart_sec maps the same paths to RestartSec in seconds."""
+    restart_sec = None
 
 
 def exec_paths(show_value):
@@ -129,7 +143,8 @@ def loaded_units(run=subprocess.run, chunk=100):
                  ("list-units", "--all", "--type=service", "--no-legend", "--plain")):
         names.update(f[0] for f in (l.split() for l in systemctl(*args, run=run).splitlines())
                      if f and f[0].endswith(".service") and not f[0].endswith("@.service"))
-    units, errors, answered = {}, [], set()
+    units, errors, answered = ResolvedUnits(), [], set()
+    units.restart_sec = {}
     names = sorted(names)
     for i in range(0, len(names), chunk):
         out = systemctl("show", "-p", ",".join(SHOW), *names[i:i + chunk], run=run)
@@ -144,6 +159,7 @@ def loaded_units(run=subprocess.run, chunk=100):
                 errors.append("unit %s not inspected: LoadState=%s" % (props["Id"], props.get("LoadState") or "?"))
                 continue
             units.setdefault(props["FragmentPath"], [])
+            units.restart_sec[props["FragmentPath"]] = restart_seconds(props.get("RestartUSec"))
             units[props["FragmentPath"]] += [b for k in EXEC_PROPS for b in exec_paths(props.get(k, ""))]
     errors += ["unit %s not inspected: systemd gave no answer" % n for n in names if n not in answered]
     return units, errors
@@ -220,6 +236,7 @@ def analyze(files, units, owned, running, allowlist=(), lstat=os.lstat, opener=o
             elif not allowed(binary, allowlist) and not is_owned(binary, owned):
                 rows.append({**base, "kind": "unit-runs-unowned", "flags": ["unit-runs-unowned"],
                              "pids": running.get(os.path.realpath(binary), []),
+                             "restart_sec": (getattr(units, "restart_sec", None) or {}).get(path, 0),
                              "severity": "warning" if unit_owned else "critical"})
         if not unit_owned and len(rows) == before:
             rows.append({"kind": "unowned-unit", "path": path, "unit": path, "flags": ["unowned-unit"],

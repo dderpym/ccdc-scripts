@@ -82,6 +82,7 @@ class PamModuleModified(Finding):
 
 
 class PamScanner(BundleScanner):
+    cheap = True  # live and quick: eligible for the rescan guard\'s fast poll
     entry = "scan_pam"
 
     def findings(self, target, row):

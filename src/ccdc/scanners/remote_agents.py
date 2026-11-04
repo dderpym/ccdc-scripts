@@ -18,6 +18,7 @@ class RemoteAccessAgent(Finding):
 
 
 class RemoteAgentScanner(BundleScanner):
+    cheap = True  # live and quick: eligible for the rescan guard\'s fast poll
     entry = "scan_remote_agents"
 
     def findings(self, target, row):
