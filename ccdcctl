@@ -845,10 +845,6 @@ def argument_parser():
                      help="after fixing, wait then rescan to catch re-planted artifacts")
     cmd.add_argument("--recheck", type=int, default=0, metavar="SECONDS",
                      help="scan, wait, scan again and report what vanished or appeared (no fixes)")
-    cmd = sub.add_parser("harden", help="apply sshd hardening and disable unneeded daemons")
-    cmd.add_argument("target", nargs="?", default="all")
-    cmd.add_argument("--allow", action="append", default=[], metavar="UNIT", help="keep this service (repeatable)")
-    cmd.add_argument("--yes", action="store_true", help="do not ask per host")
     cmd = sub.add_parser("complete", help="emit candidates for Bash complete -C")
     cmd.add_argument("words", nargs=argparse.REMAINDER, help="Bash supplies command, current word, previous word")
     for command, child in sub.choices.items():
@@ -954,9 +950,6 @@ def main():
         return complete(parser, args.words)
     if args.command == "scan":
         return scan_command(args)
-    if args.command == "harden":
-        from ccdc import harden_cli
-        return harden_cli.harden(select(args.target)[0], args.allow, args.yes)
     if args.command in SCANNERS:
         if args.action_or_target == "baseline":
             parser.error(f"{args.command} has no baseline acceptance")
