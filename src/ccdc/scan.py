@@ -87,6 +87,37 @@ def apply_fixes(findings, autofix, approve=lambda finding, text: True, out=print
     return outcome
 
 
+def jsonable(value):
+    """JSON-safe copy of a finding field: tuples/sets become lists, unknown objects become text."""
+    if isinstance(value, dict):
+        return {str(k): jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [jsonable(v) for v in (sorted(value, key=str) if isinstance(value, (set, frozenset)) else value)]
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
+def to_json(results, autofix, fixed=None):
+    """{host: {"findings": [...], "errors": [...], "fixable": [bool per finding], "fixed": [summary...]}}."""
+    return {str(target): {"findings": [jsonable(f.as_dict()) for f in findings],
+                          "errors": list(errors),
+                          "fixable": [bool(autofix.can_fix(f)) for f in findings],
+                          "fixed": list((fixed or {}).get(target, []))}
+            for target, (findings, errors) in results.items()}
+
+
+def selected(finding, only):
+    """--only filter: items are 'CODE' or 'CODE=SUBSTRING' (substring of the summary); empty means all."""
+    if not only:
+        return True
+    for item in only:
+        code, _, needle = item.partition("=")
+        if finding.code == code and needle in finding.summary:
+            return True
+    return False
+
+
 def report(results, autofix, out=print):
     bad = False
     for target, (findings, errors) in results.items():

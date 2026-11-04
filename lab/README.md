@@ -152,6 +152,37 @@ Private keys and optional password files are under gitignored `lab/secrets/`.
 The Docker build context includes only the Dockerfile, entrypoint, and service
 definitions, never credentials or generated reports.
 
+## One test per finding
+
+`lab/findings` plants one condition in a running lab container, scans, and checks that the
+scanner reports it (and, with `--fix`, that the autofix removes it):
+
+```sh
+./lab/findings                        # every scenario on every host it applies to
+./lab/findings --host tarpit --fix writable-suid-binary memfd-process
+```
+
+Each line is `PASS`, `FAIL`, `SKIP` or `LEAK` plus the finding code, host and why. `LEAK`
+means the scenario's `clean` step did not bring the host back to its baseline. The exit
+status is nonzero for `FAIL` or `LEAK`. The clean lab already has many findings (some are
+intentional, some are scanner noise), so the runner never asserts on a whole list: it scans
+before and after the plant and only looks at what is new. Runs are serialised with
+`lab/.findings.lock`, so two people (or agents) cannot plant at once.
+
+A scenario is `lab/scenarios/<finding-code>.sh`, run inside the container as
+`sh -s -- plant` and `sh -s -- clean` (plain `sh`: Alpine has no bash). Header lines:
+
+| Header | Meaning |
+| --- | --- |
+| `# hosts: tarpit hatchery` | where it applies (default: both) |
+| `# match: TEXT` | text the new finding must contain (in its summary or any field); `plant` prints this as its **first output line** |
+| `# fix: yes\|no` | whether an autofix exists and `--fix` should see the finding disappear |
+| `# skip: REASON` | cannot be planted in these containers (for example no kernel audit); reported as `SKIP` with the reason, never as a pass |
+
+`plant` must leave the condition in place and `clean` must undo it completely, even after
+an autofix already changed things. `ccdcctl scan --json [--fix all --only CODE=TEXT]` is the
+machine-readable interface the runner uses.
+
 ## Intentional faults
 
 - Modified package-owned `/usr/bin/ssh` contents (inert appended bytes) and mode
