@@ -976,6 +976,10 @@ def argument_parser():
                      help="apply autofixes: ask per fix (default when given) or all without asking")
     cmd.add_argument("--wait", type=int, default=0, metavar="SECONDS",
                      help="after fixing, wait then rescan to catch re-planted artifacts")
+    cmd = sub.add_parser("harden", help="apply sshd hardening and disable unneeded daemons")
+    cmd.add_argument("target", nargs="?", default="all")
+    cmd.add_argument("--allow", action="append", default=[], metavar="UNIT", help="keep this service (repeatable)")
+    cmd.add_argument("--yes", action="store_true", help="do not ask per host")
     cmd = sub.add_parser("monitor")
     cmd.add_argument("kind", nargs="?", choices=list(POLL_INTERVALS))
     cmd.add_argument("--host", default="all")
@@ -1087,6 +1091,9 @@ def main():
         return complete(parser, args.words)
     if args.command == "scan":
         return scan_command(args)
+    if args.command == "harden":
+        from ccdc import harden_cli
+        return harden_cli.harden(select(args.target)[0], args.allow, args.yes)
     if args.command == "monitor":
         if args.interval is not None and args.interval < 5:
             parser.error("--interval must be at least 5 seconds")
