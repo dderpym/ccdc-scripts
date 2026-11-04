@@ -56,20 +56,21 @@ class CompletionTests(unittest.TestCase):
             (('init', 'alpha', '--save'), '--save-bootstrap-password'),
             (('integrity', '--d'), '--deep'),
             (('lse', '--d'), '--deep'),
-            (('monitor', 'i'), 'integrity'),
-            (('monitor', '--o'), '--once'),
+            (('scan', '--f'), '--fix'),
+            (('scan', '--fix', ''), 'ask'),
+            (('scan', '--w'), '--wait'),
         ]
         for words, expected in cases:
             with self.subTest(words=words):
                 self.assertIn(expected, self.complete(*words))
         self.assertEqual(self.complete('ssh', '--replace'), [])
-        self.assertEqual(self.complete('monitor', '--interval', ''), [])
+        self.assertEqual(self.complete('scan', '--wait', ''), [])
         self.assertFalse(self.log.exists(), 'Command/flag completion must not read inventory')
 
     def test_hosts_come_from_selected_inventory_without_secret_variables(self):
         for words in [('ping', 'a'), ('--verbose', 'ssh', 'status', 'a'), ('init', '--replace-host-keys', 'b'),
                       ('firewall', 'status', 'a'), ('lse', 'status', 'b'),
-                      ('monitor', '--host', 'a')]:
+                      ('scan', 'a')]:
             with self.subTest(words=words):
                 matches = self.complete(*words)
                 self.assertEqual(matches, ['all', 'alpha'] if words[-1] == 'a' else ['beta'])
@@ -80,7 +81,7 @@ class CompletionTests(unittest.TestCase):
         for line in self.log.read_text().splitlines():
             self.assertEqual(line, f'selected.yml|{ROOT}/ansible.cfg|--list|{ROOT}')
 
-    def test_lab_and_monitor_commands(self):
+    def test_lab_commands(self):
         for tool in ('docker', 'ssh-keygen'):
             fake = self.root / tool
             fake.write_text('#!/bin/sh\nprintf "%s\\n" "$0 $*" >> "$CALL_LOG"\nexit 99\n')
@@ -96,29 +97,23 @@ class CompletionTests(unittest.TestCase):
             ('check-lab', ('--p',), ['--password-file']),
             ('./scripts/check-lab', ('--inventory', 'selected.yml', '--p'), ['--password-file']),
             ('./scripts/check-lab', ('--inventory', 'selected'), []),
-            ('./monitor/ssh-monitor', ('--o',), ['--once']),
-            ('firewall-monitor', ('--i',), ['--interval']),
-            ('./monitor/firewall-monitor', ('--interval', '10', '--h'), ['--help', '--host']),
-            ('./monitor/ssh-monitor', ('i',), []),
         ]
         for invoked, words, expected in cases:
             with self.subTest(invoked=invoked, words=words):
                 self.assertEqual(self.complete(*words, invoked=invoked), expected)
         self.assertNotIn('_forward', self.complete('', invoked='./lab/manage'))
         self.assertFalse(self.log.exists(), 'Lab/flag completion must not run inventory')
-        for invoked in ('./monitor/ssh-monitor', './monitor/firewall-monitor'):
-            self.assertEqual(self.complete('--host', 'a', invoked=invoked), ['all', 'alpha'])
 
     def test_bash_registration_and_native_filename_fallback(self):
         result = subprocess.run(['bash', '--noprofile', '--norc', '-c',
             'source "$1"; complete -p ccdcctl ./scripts/ccdcctl ./lab/manage '
-            './scripts/check-lab ./monitor/ssh-monitor ./monitor/firewall-monitor', 'bash', str(SCRIPT)],
+            './scripts/check-lab', 'bash', str(SCRIPT)],
             capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('-o default', result.stdout)
         self.assertIn(' complete', result.stdout)
         self.assertIn('-C ', result.stdout)
-        self.assertEqual(len(result.stdout.splitlines()), 6)
+        self.assertEqual(len(result.stdout.splitlines()), 4)
         self.assertEqual(self.complete('init', '--bootstrap-password-file', 'password'), [])
         self.assertFalse(self.log.exists())
 
@@ -134,12 +129,11 @@ class CompletionTests(unittest.TestCase):
             'source "$1" || exit; [[ "$VIRTUAL_ENV" == "$2/.venv" ]] || exit 2; '
             '[[ "$(command -v python)" == "$2/.venv/bin/python" ]] || exit 3; '
             '[[ ! -v _ccdc_setup_root ]] || exit 4; '
-            'complete -p ccdcctl ./lab/manage ./scripts/check-lab '
-            './monitor/ssh-monitor ./monitor/firewall-monitor',
+            'complete -p ccdcctl ./lab/manage ./scripts/check-lab',
             'bash', str(checkout / 'setup'), str(checkout)],
             cwd=self.root, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(result.stdout.splitlines()), 5)
+        self.assertEqual(len(result.stdout.splitlines()), 3)
         self.assertEqual(result.stderr, '')
 
     def test_setup_explains_missing_venv_and_direct_execution(self):
@@ -155,9 +149,9 @@ class CompletionTests(unittest.TestCase):
                 self.assertIn(message, result.stderr)
 
     def test_incomplete_quotes_and_cursor_in_middle(self):
-        self.assertEqual(self.complete_line('ccdcctl monitor --host "a', 'a', '--host'), ['all', 'alpha'])
-        self.assertIn('--once', self.complete_line('ccdcctl monitor --o ignored', '--o', 'monitor',
-                                                  len('ccdcctl monitor --o')))
+        self.assertEqual(self.complete_line('ccdcctl scan "a', 'a', 'scan'), ['all', 'alpha'])
+        self.assertIn('--fix', self.complete_line('ccdcctl scan --f ignored', '--f', 'scan',
+                                                  len('ccdcctl scan --f')))
         self.assertEqual(self.complete_line('ccdcctl init --bootstrap-password-file "password with ',
                                             'password with ', '--bootstrap-password-file'), [])
 

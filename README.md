@@ -5,6 +5,7 @@ services, enforce inbound firewall rules, verify packaged system state, and tria
 security findings across one Ansible inventory. **Commands target the whole inventory by default.**
 
 - [Quickstart guide](#quickstart-guide)
+- [Architecture](#architecture)
 - [Command reference and internals](#command-reference-and-internals)
 - [Disposable local hatchery/tarpit lab](lab/README.md) — intentional package and permission faults, host-loopback services only
 
@@ -37,7 +38,7 @@ missing networking tools (`ip`, `ss`, `nft`, and dual-stack iptables save/restor
 tools) through Ansible before discovery (native package modules, or the apk/xbps
 CLI with ansible-core). Direct firewall apply also prepares them before snapshots;
 init only bootstraps access and does not install firewall tools.
-Package installation requires working repositories; status/monitor commands stay
+Package installation requires working repositories; status commands stay
 read-only. Some older Ansible password transports need controller `sshpass`.
 
 ### 2. Set up the inventory and team key
@@ -199,11 +200,11 @@ Check the results, then explicitly accept the trusted state:
 ```
 
 Do not baseline an unexplained or failed configuration. Firewall enforcement is
-**runtime-only**: it must be reapplied after reboot. Monitoring does not fix drift.
+**runtime-only**: it must be reapplied after reboot. Status checks do not fix drift.
 Root recovery passwords are for console/login or `su` where permitted, **not a
 root SSH backdoor after hardening**.
 
-### 5. Triage current vulnerabilities and start the combined monitor
+### 5. Triage current vulnerabilities
 
 Beginning-of-competition workflow (review and baseline **only** SSH/firewall as
 explained above):
@@ -220,8 +221,9 @@ explained above):
 # Find high-confidence dangerous Linux configuration:
 ./scripts/ccdcctl lse
 
-# Teammates investigate and remediate findings, then run continuously:
-./scripts/ccdcctl monitor
+# Run every registered scanner (and apply matching autofixes on request):
+./scripts/ccdcctl scan
+./scripts/ccdcctl scan --fix --wait 45   # fix, wait, rescan for re-planted artifacts
 ```
 
 Integrity and LSE are **not baseline-driven**. An initially compromised binary
@@ -231,79 +233,10 @@ trusted. Detection does not perform repairs. Detailed evidence is saved under
 `reports/<host>/`; terminal output is severity-ranked and capped at 40 findings
 per host, with remaining findings available in JSON.
 
-The combined monitor uses independent workers: SSH/firewall default to 10s,
-integrity to 60s, and LSE to 180s. A slow LSE run does not hold up SSH/firewall.
-Startup lists intervals; afterwards it prints only new/changed/resolved findings
-or scanner/connectivity failures, not periodic `OK` lines.
+### 6. tmux survival guide
 
-### 6. Optional separate tmux views
-
-Use the combined monitor above for all four modules. The following optional
-three-pane arrangement focuses on the existing network views; it does **not**
-include integrity/LSE unless you run the combined monitor in another window.
-The three views use existing commands, not a separate dashboard application:
-
-```text
-+--------------------------+--------------------------+
-| SSH drift alerts         | Firewall drift alerts    |
-+--------------------------+--------------------------+
-| Refreshing listener / service inventory             |
-+-----------------------------------------------------+
-```
-
-**How tmux keys work:** press `Ctrl+b`, release both keys, then press the indicated
-key. The prefix is not held down while typing the second key.
-
-Starting from your single setup pane:
-
-1. `Ctrl+b`, then `"` (double quote): split into top and bottom. You land below.
-2. `Ctrl+b`, then Up Arrow: return to the top pane.
-3. `Ctrl+b`, then `%`: split the top into left and right. You land on the right.
-4. `Ctrl+b`, then Left Arrow: select the top-left pane.
-
-In **each pane**, ensure you are in the repository and activate `.venv`. Replace
-the checkout path in these examples with yours.
-
-**Top-left — SSH baseline drift:**
-
-```sh
-cd /path/to/berke1337-ccdc
-. .venv/bin/activate
-./monitor/ssh-monitor --interval 30
-```
-
-Select the top-right pane with `Ctrl+b`, then Right Arrow.
-
-**Top-right — firewall baseline drift:**
-
-```sh
-cd /path/to/berke1337-ccdc
-. .venv/bin/activate
-./monitor/firewall-monitor --interval 30
-```
-
-Select the bottom pane with `Ctrl+b`, then Down Arrow.
-
-**Bottom — current listener inventory, refreshed every minute:**
-
-```sh
-cd /path/to/berke1337-ccdc
-. .venv/bin/activate
-while :; do
-    clear
-    date
-    ./scripts/ccdcctl listeners all
-    sleep 60
-done
-```
-
-The first two panes print `Monitoring ...` and then stay **quiet when healthy**.
-They alert on drift, failed discovery/unreachability, and missing baselines;
-recoveries are announced. The third pane is a **live snapshot**, not a third
-drift detector: it refreshes `reports/listeners.txt` and `.json`, with no listener
-baseline or change alerts. It runs read-only discovery, not firewall changes.
-
-#### tmux survival guide
+Run long commands inside a persistent tmux session (`tmux new-session -s ccdc`).
+Press `Ctrl+b`, release both keys, then press the indicated key.
 
 | Keys / command | What it does |
 | --- | --- |
@@ -311,17 +244,59 @@ baseline or change alerts. It runs read-only discovery, not firewall changes.
 | `Ctrl+b`, `o` | Cycle through panes |
 | `Ctrl+b`, `z` | Zoom/unzoom the current pane |
 | `Ctrl+b`, `[` | Enter scrollback; use arrows/Page Up, then `q` to leave |
-| `Ctrl+b`, `c` | Open another shell window without stopping monitors |
+| `Ctrl+b`, `c` | Open another shell window without stopping running commands |
 | `Ctrl+b`, `w` | List/select windows |
 | `Ctrl+b`, `d` | Detach; processes keep running |
 | `tmux attach-session -t ccdc` | Reattach from an outside terminal |
 | `tmux list-sessions` | Find running sessions |
-| `Ctrl+c` (no tmux prefix) | Stop the foreground monitor/loop in this pane |
+| `Ctrl+c` (no tmux prefix) | Stop the foreground command in this pane |
 
 For a long listener report, zoom the bottom pane or open another window and run
 `less reports/listeners.txt` from the repository (`q` exits less). Detaching does
-not stop monitoring, but shutting down the controller does. Do not use `exit` or
+not stop running commands, but shutting down the controller does. Do not use `exit` or
 kill panes to detach. These keys assume tmux's default bindings.
+
+## Architecture
+
+Everything the controller does is a **Script** (`ccdc/script.py`): an object with a
+`run()` that may return anything. Scripts are declarative and stateless: they never
+assume an earlier run, so a script that needs `nftables` installs it first (a no-op
+when present) instead of recording that it did.
+
+- `ComposedScript(Step(script, **prefilled), other, ...)` runs scripts in order and
+  returns their results. Arguments given to `run(**kw)` are injected into steps that
+  accept them and override prefilled values. `script.bind(**kw)` is a one-step
+  composition with arguments filled in.
+- `AnsibleScript` (`ccdc/ansible.py`) acts on a `Target` (`ccdc/target.py`): a host
+  plus an `Auth` (`AgentAuth` for the ssh-agent team key, `PasswordAuth` for a
+  bootstrap password, never shown in `repr`). `BundleScript` runs one `host/<entry>.py`
+  from the bundle and returns its JSON; `PlaybookScript` runs `playbooks/<name>.yml`.
+  Only `ccdc/runner.py` spawns Ansible.
+- **OS layer** (`ccdc/osinfo.py`): `DetectOS` returns the distro family
+  (debian, rhel, alpine, arch, void, suse). **Package layer** (`ccdc/packages.py`):
+  `InstallApt`/`InstallDnf`/... install with one manager; `InstallPackage`
+  subclasses such as `InstallNftables` hold a family-to-package table, detect the OS
+  on every run, and delegate.
+- **Scanners** (`ccdc/findings.py`) are scripts that intend no lasting effect on the
+  host, so they are safe to run repeatedly. `scanner.run(target)` returns a
+  `ScanResult` (a list of `Finding`s plus `.errors`; empty with errors is not clean).
+  A `Finding` is a frozen dataclass starting with `host` (a `Target`), with a class
+  `code` and `severity`. LSE is split into per-test scanners (`ccdc/scanners/`) that
+  ask the pinned LSE only for their own tests (`discover_lse --only ids`).
+- **AutoFix** has `can_fix(finding)` and `get_fix(finding)`; the latter returns a
+  script with the finding's data already filled in, so `.run()` takes no arguments.
+  `GlobalAutofix.register(autofix, priority)` picks the highest-priority match.
+- **Auto-discovery** (`ccdc/registry.py`): every `Scanner` in a module under
+  `ccdc/scanners/` and every `AutoFix` in `ccdc/fixes/` is registered; a module may set
+  `PRIORITY = {FixClass: n}`. No central list exists to edit. Mark a shared base class
+  with `abstract = True` in its own body to keep it out of the registry.
+
+**Adding a scanner:** write `host/scan_<thing>.py` printing
+`{"findings": [...], "errors": [...]}` (the launcher allows `scan_*`, `fix_*`,
+`install_*`, `detect_*` entries automatically); add `ccdc/scanners/<thing>.py` with
+a `Finding` dataclass and a `BundleScanner` whose `findings(target, row)` builds it;
+add a test with a fake runner (see `tests/test_framework.py`). **Adding a fix:** add
+`ccdc/fixes/<thing>.py` with an `AutoFix` that returns a `Script.bind(...)`.
 
 ## Command reference and internals
 
@@ -337,7 +312,7 @@ source ./setup                  # Bash: activate .venv and all CLI completions
 
 Alternatively, `uv run ./scripts/ccdcctl ssh status` supplies the environment
 without shell activation; it also makes Ansible available to child processes.
-The same works for wrappers: `uv run ./monitor/ssh-monitor --interval 30`.
+
 
 `source ./setup` activates `.venv` and enables all Bash completions. Source it
 rather than executing `./setup`, so it updates your current shell. Run `uv sync`
@@ -352,8 +327,7 @@ Bash's `complete -C` runs `ccdcctl complete` and reads one candidate per line;
 It completes commands, actions, flags (including init-only `--replace-host-keys`),
 password-file paths, and hosts from the selected `ANSIBLE_INVENTORY`.
 The sourced setup also completes `lab/manage` (`up`, `down`, `--password-file`),
-`scripts/check-lab` (`--inventory`, `--password-file`), and both monitor wrappers
-(flags and `--host` values). Lab completion never starts Docker or runs checks.
+and `scripts/check-lab` (`--inventory`, `--password-file`). Lab completion never starts Docker or runs checks.
 Host completion requires Ansible on `PATH` (activate `.venv` first); it never connects
 to hosts. To enable it in future shells, add a `source` line using the script's
 absolute path to `~/.bashrc`.
@@ -361,15 +335,14 @@ absolute path to `~/.bashrc`.
 `all` is the default for commands accepting a target. An exact **inventory alias**
 can be used instead, such as `hatchery`; IP addresses, arbitrary Ansible patterns,
 and groups other than `all` are not CLI targets. Hosts are re-enumerated using
-`ansible-inventory`; there is no second host list. Monitors use `--host`, not a
-positional host argument.
+`ansible-inventory`; there is no second host list.
 
 | Operation | SSH authentication | Privilege |
 | --- | --- | --- |
 | First saved-password init | Root password from the private bootstrap file, with one manual retry on authentication failure | Already root; sudo bypassed |
 | Saved-host init rerun | Fresh `oski` key/sudo check first; if that fails, the saved per-host root password, then at most one manual retry | Sudo as `oski`, or already root |
 | Manual init | Your supplied Ansible bootstrap user/key/password options | Root directly or your administrator's escalation |
-| Ping, status, listeners, baselines, monitors, firewall rollback | Configured SSH user, normally `oski`, using the team key from the controller agent or inventory key path | Sudo, passwordless after init |
+| Ping, status, listeners, baselines, scans, firewall rollback | Configured SSH user, normally `oski`, using the team key from the controller agent or inventory key path | Sudo, passwordless after init |
 | SSH/firewall configuration safety checks | Explicit fresh, key-only `oski` login, bypassing multiplexing and password authentication | Passwordless sudo to root |
 
 Ansible owns SSH transport. `ansible.cfg` defaults to `oski` with sudo escalation;
@@ -562,17 +535,17 @@ and the effective state is rediscovered. Keep console access available.
 Match rules with per-Include scope boundaries, and active socket bindings to
 `baselines/<host>/ssh.json`. Source and drop-in hashes, daemon paths, and diagnostic
 caveats remain available in status
-but are not trusted monitoring state. Comments/whitespace changes do not cause
+but are not trusted state. Comments/whitespace changes do not cause
 hash drift; conditional rule changes still alert even when global `sshd -T`
 values stay the same. Older full-discovery baselines are compared using the same
 settings-only projection; preexisting Match rules absent from an old baseline
 require review. Older flattened Include/Match baselines also require review when
 the new scoped representation differs. Baselines never auto-update on configure
-or monitoring. Accepting a malicious policy explicitly would still make it the
+or drift checks. Accepting a malicious policy explicitly would still make it the
 expected policy.
 
 `sshd -T` evaluates the configuration on disk, not the running daemon's in-memory
-configuration; monitoring does not prove that edits have been reloaded.
+configuration; status checks do not prove that edits have been reloaded.
 
 ### `listeners [host|all]`: service inventory
 
@@ -645,7 +618,7 @@ with console access, or manage that host separately. Fresh admin access and
 observed firewall state are checked after application.
 
 **Rollback** restores the latest pre-apply snapshot at
-`reports/rollback/<host>/firewall.json`, not a monitoring baseline. Snapshots are
+`reports/rollback/<host>/firewall.json`, not a baseline. Snapshots are
 sensitive and gitignored; retain an independent controller copy. Rollback still
 needs working SSH/sudo. If SSH is already blocked, use the console; there is no
 timer-based automatic rollback daemon.
@@ -692,7 +665,7 @@ if installed packages, repository settings/candidates, or connection settings
 change. Old configuration-based plans are incompatible: run `update plan` again.
 Updates verify fresh SSH/sudo access before and after installation/restarts. They
 neither require nor read/write SSH/firewall baselines; policy drift belongs to the
-independent monitors. Existing schema-2 package plans remain usable even if they
+independent checks. Existing schema-2 package plans remain usable even if they
 contain an obsolete policy snapshot.
 
 After installation, processes using replaced executable/library mappings are
@@ -741,7 +714,6 @@ account or package database can falsify checks; updating is not malware removal.
 ./scripts/ccdcctl integrity
 ./scripts/ccdcctl integrity hatchery
 ./scripts/ccdcctl integrity status hatchery --deep
-./scripts/ccdcctl monitor integrity
 make integrity HOST=hatchery
 ```
 
@@ -810,7 +782,6 @@ can lie; corroborate serious findings through a trusted console/vendor source.
 ./scripts/ccdcctl lse
 ./scripts/ccdcctl lse hatchery
 ./scripts/ccdcctl lse hatchery --deep
-./scripts/ccdcctl monitor lse
 make lse HOST=hatchery
 ```
 
@@ -851,8 +822,7 @@ full coverage is needed. Coverage warnings do not resolve previously detected
 conditions for affected tests, but do not block unrelated resolutions.
 
 Both modes request upstream output level 1 so the promoted checks include their
-evidence. `--deep` selects more checks for manual investigation, not the normal
-monitor loop. Complete human-readable output replaces `reports/<host>/lse.txt`
+evidence. `--deep` selects more checks for manual investigation, not the normal scan. Complete human-readable output replaces `reports/<host>/lse.txt`
 and `reports/<host>/lse/raw.txt`; parsed records replace
 `reports/<host>/lse/report.json`. Reports can contain sensitive data and are
 private/gitignored. LSE is triage, not a proof that the host is secure.
@@ -876,55 +846,24 @@ The workflow for both scanners is **finding → investigate/fix → next scan ve
 it is gone**, not first scan → accept vulnerability → ignore forever.
 Scanner commands return nonzero for findings or incomplete/failed scans.
 
-### `monitor [ssh|firewall|integrity|lse]`: polling and alerts
+### `scan [host|all] [--fix [ask|all]] [--wait SECONDS]`
 
 ```sh
-./scripts/ccdcctl monitor                          # all four, independent schedules
-./scripts/ccdcctl monitor ssh --interval 30
-./scripts/ccdcctl monitor firewall --host hatchery
-./scripts/ccdcctl monitor integrity
-./scripts/ccdcctl monitor lse --host hatchery
-./scripts/ccdcctl monitor ssh --host hatchery --once
-./monitor/ssh-monitor --interval 30                # existing wrapper
-./monitor/firewall-monitor --interval 30           # existing wrapper
-make monitor
+./scripts/ccdcctl scan                       # every registered scanner, report only
+./scripts/ccdcctl scan hatchery --fix        # ask before each matching autofix
+./scripts/ccdcctl scan --fix all --wait 45   # apply all, wait, rescan
 ```
 
-Omitting the kind monitors all four. `--host` defaults to `all`. Set intervals in
-inventory `all.vars` or individual host variables:
-
-```yaml
-ssh_poll_interval: 10
-firewall_poll_interval: 10
-integrity_poll_interval: 60
-lse_poll_interval: 180
-```
-
-These are also the defaults. `--interval SECONDS` explicitly overrides all
-selected modules; intervals must be 5..86400 seconds. Each module has its own
-worker and schedule; scans never overlap themselves, and a slow scan does not
-block other modules. The inventory is refreshed periodically. `--once` scans
-each selected module once and returns nonzero if active alerts exist.
-
-SSH/firewall alone compare effective policy with reviewed controller baselines.
-Integrity/LSE repeatedly evaluate current known-good/security state. Runtime
-alert deduplication suppresses repeat **terminal messages**, not findings: status
-and latest reports still show persistent conditions. New or materially changed
-findings alert immediately; disappeared findings emit one `RESOLVED` event.
-A failed/incomplete scan does not claim previous findings were fixed. Scanner
-and connectivity failures are deduplicated too. Restarting rediscovers all
-current findings; no persistent integrity/LSE acceptance state is stored.
-
-Healthy hosts are quiet. This is state polling, not login-log auditing,
-service health monitoring, or automatic remediation. New hosts need init and
-explicit reviewed **SSH/firewall only** baselines. Those baselines never
-auto-update; failed baseline commands leave previous trust intact. After a
-legitimate SSH/firewall policy change, inspect status before explicitly accepting
-it; do not hide unexplained drift by rebaselining.
+Runs each scanner on each host (hosts in parallel), de-duplicates identical
+findings reported by overlapping scanners, and lists which findings have an
+autofix. Without `--fix` nothing on a host changes. With `--fix`, matching
+autofixes run (per-fix confirmation by default), then everything is rescanned;
+`--wait` sleeps first so respawning persistence shows up in the rescan. Exit
+status is nonzero for findings or incomplete scans. See [Architecture](#architecture).
 
 ### Make aliases and controller files
 
-`make ping/init/ssh/listeners/firewall/integrity/lse/baseline/monitor` wrap the corresponding
+`make ping/init/ssh/listeners/firewall/integrity/lse/baseline` wrap the corresponding
 commands. `make ssh HOST=hatchery` targets one inventory alias. `make baseline`
 accepts **both** SSH and firewall state; use it only after review. First-run
 password storage uses the explicit CLI flag from the quickstart, not `make init`.
@@ -939,7 +878,7 @@ Use an activated environment, or `uv run make ping` / `uv run make test`.
 | `secrets/root/<host>.password` and backups | Plaintext generated recovery passwords |
 | `reports/listeners.{txt,json}` | Latest selected-host listener inventory |
 | `reports/rollback/<host>/firewall.json` | Latest pre-apply firewall snapshot |
-| `baselines/<host>/{ssh,firewall}.json` | Explicitly accepted SSH/firewall monitoring state only |
+| `baselines/<host>/{ssh,firewall}.json` | Explicitly accepted SSH/firewall state only |
 | `reports/<host>/{integrity,lse}/{raw.txt,report.json}` | Latest raw evidence and current normalized findings |
 | `reports/<host>/lse.txt` | Latest human-readable LSE report |
 | `vendor/lse.sh` | Pinned upstream security triage script; never downloaded at runtime |

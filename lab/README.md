@@ -52,21 +52,19 @@ export ANSIBLE_INVENTORY=lab/inventory.yml
 ./scripts/ccdcctl listeners
 ./scripts/ccdcctl integrity
 ./scripts/ccdcctl lse
-./scripts/ccdcctl monitor integrity --once
-./scripts/ccdcctl monitor lse --once
 
 ./scripts/check-lab                 # opt-in live, read-only smoke suite
 ```
 
 The repository's `scripts/check-lab` validates native init and running managed
 services, package-repository DNS resolution, HTTP/SSH, existing discovery commands, persistent native integrity
-findings, LSE test IDs, and the combined monitor. It writes private evidence to `reports/lab/check.json` and uses the
+findings, and LSE test IDs. It writes private evidence to `reports/lab/check.json` and uses the
 normal repository report paths. It checks root password login too if
 `lab/secrets/root.password` exists. No tests run against real inventory hosts.
 
 Scanners return nonzero for these intentional findings; that is expected.
 Integrity/LSE findings must not be accepted as baselines.
-SSH/firewall monitoring still needs an explicitly reviewed policy baseline;
+SSH/firewall drift checks still need an explicitly reviewed policy baseline;
 there is no implicit baseline during lab startup. Firewall configure uses
 Ansible to provision missing networking tools from distribution repositories;
 init only bootstraps access. To apply changed DNS settings to existing containers,

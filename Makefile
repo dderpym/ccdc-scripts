@@ -1,6 +1,6 @@
 HOST ?= all
 CTL := ./scripts/ccdcctl
-.PHONY: ping init ssh listeners firewall integrity lse baseline monitor test
+.PHONY: ping init ssh listeners firewall integrity lse baseline test
 ping:
 	$(CTL) ping $(HOST)
 init:
@@ -18,7 +18,5 @@ lse:
 baseline:
 	@status=0; $(CTL) ssh baseline $(HOST) || status=1; \
 	$(CTL) firewall baseline $(HOST) || status=1; exit $$status
-monitor:
-	$(CTL) monitor --host $(HOST)
 test:
 	python3 -m unittest discover -s tests -v

@@ -279,22 +279,7 @@ class ControllerTests(unittest.TestCase):
         self.assertEqual(structured['hosts']['b']['error'], 'unreachable')
         self.assertEqual(structured['hosts']['a']['listeners'][0]['port'], 3000)
 
-    def test_monitor_never_accepts_drift_and_is_quiet_when_healthy(self):
-        path = self.root / 'baselines/a/ssh.json'
-        ctl.save(path, SSH)
-        original = path.read_bytes()
-        with patch.object(ctl, 'select', return_value=(['a'], {})), \
-                patch.object(ctl, 'collect', return_value=({'a': SSH}, {})):
-            self.assertFalse(ctl.monitor(['ssh'], 'all', 5, True))
-        self.assertNotIn('CRITICAL', self.output.getvalue())
-        changed = {'effective': dict(SSH['effective'], passwordauthentication=['yes'])}
-        with patch.object(ctl, 'select', return_value=(['a'], {})), \
-                patch.object(ctl, 'collect', return_value=({'a': changed}, {})):
-            self.assertTrue(ctl.monitor(['ssh'], 'all', 5, True))
-        self.assertIn('CRITICAL', self.output.getvalue())
-        self.assertEqual(path.read_bytes(), original)
-
-    def test_ssh_baseline_and_monitor_compare_settings_not_hashes(self):
+    def test_ssh_baseline_saves_settings_not_hashes(self):
         observed = dict(SSH, sources={'/etc/ssh/sshd_config': 'old'},
                         dropins={'/etc/ssh/sshd_config.d/vendor.conf': 'old'},
                         context=None, socket_listeners={}, caveats=['old'], sshd='/old/sshd')
@@ -305,38 +290,6 @@ class ControllerTests(unittest.TestCase):
         self.assertNotIn('sources', saved)
         self.assertNotIn('dropins', saved)
         self.assertEqual(saved['effective'], SSH['effective'])
-        # Old full-discovery baselines also work without reaccepting host state.
-        ctl.save(path, observed)
-        trusted = path.read_bytes()
-        changed = dict(observed, sources={'/etc/ssh/sshd_config': 'new'}, dropins={},
-                       caveats=['new'], sshd='/new/sshd')
-        previous = {}
-        self.assertEqual(ctl.monitor_events(previous, 'ssh', ['a'], {'a': changed}, {}), [])
-        changed['effective'] = dict(SSH['effective'], passwordauthentication=['yes'])
-        events = ctl.monitor_events(previous, 'ssh', ['a'], {'a': changed}, {})
-        self.assertEqual(events[0][0], 'CRITICAL')
-        self.assertIn('passwordauthentication', events[0][-1])
-        self.assertNotIn('sources', events[0][-1])
-        self.assertEqual(ctl.monitor_events(previous, 'ssh', ['a'], {'a': observed}, {})[0][0], 'RESOLVED')
-        self.assertEqual(path.read_bytes(), trusted)
-        for field, new in [('socket_listeners', {'ssh.socket': '2222 (Stream)'}),
-                           ('context', 'user=root,addr=192.0.2.1'),
-                           ('match_rules', [{'directive': 'match', 'arguments': ['User', 'root']},
-                                            {'directive': 'permitrootlogin', 'arguments': ['yes']}])]:
-            events = ctl.monitor_events({}, 'ssh', ['a'], {'a': dict(observed, **{field: new})}, {})
-            self.assertEqual(events[0][0], 'CRITICAL')
-
-    def test_invalid_ssh_baseline_preserves_trust_and_alerts(self):
-        path = self.root / 'baselines/a/ssh.json'
-        ctl.save(path, SSH)
-        original = path.read_bytes()
-        with patch.object(ctl, 'collect', return_value=({'a': {}}, {})), contextlib.redirect_stderr(io.StringIO()):
-            self.assertTrue(ctl.baseline('ssh', ['a']))
-        self.assertEqual(path.read_bytes(), original)
-        for invalid in ({}, [], None):
-            ctl.save(path, invalid)
-            events = ctl.monitor_events({}, 'ssh', ['a'], {'a': SSH}, {})
-            self.assertEqual(events[0][0], 'WARNING')
 
     def test_failed_baseline_leaves_previous_trust_intact(self):
         path = self.root / 'baselines/a/ssh.json'

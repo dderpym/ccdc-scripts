@@ -122,12 +122,6 @@ def main():
         if 'sud000' in ids:
             raise RuntimeError(host + ': expected oski sudo was reported as a vulnerability')
     passed('LSE detects writable critical file and recurring task, without alerting on expected oski sudo')
-
-    output = command('monitor', '--once', expected=1)
-    for kind in ('SSH', 'FIREWALL', 'INTEGRITY', 'LSE'):
-        if kind not in output:
-            raise RuntimeError('Combined monitor did not include ' + kind)
-    passed('combined monitor includes all four modules, without accepting baselines')
     ctl.save(ROOT / 'reports/lab/check.json', {'checks': checks})
     print('Live suite passed; evidence: reports/lab/check.json')
 
