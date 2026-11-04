@@ -185,7 +185,7 @@ class ScanSSHVectors(AnsibleScript):
     Prints {"findings": [rows], "errors": [...]}; reads sshd's EFFECTIVE configuration on the host.
     """
     source = "remote.py"
-    support = ("sshkeys.py",)
+    support = ("sshkeys.py", "pkgowner.py")
 
     def arguments(self, policy=None, keys=(), options=(), paths=(), **kwargs):
         args = []

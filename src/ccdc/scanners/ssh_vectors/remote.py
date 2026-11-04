@@ -30,6 +30,8 @@ import pwd
 import re
 import shutil
 import subprocess
+
+import pkgowner
 import sys
 
 from sshkeys import KEY_TYPE, fingerprint, parse_key_line  # noqa: E402,F401
@@ -254,15 +256,8 @@ def startup_rows(per_user, accounts, exists=os.path.lexists):
 
 
 def owned(path, run=subprocess.run):
-    """True/False when a package database can answer, None when none is available. Tries path and realpath."""
-    tools = [argv for argv in (["dpkg", "-S"], ["rpm", "-qf"]) if shutil.which(argv[0])]
-    if not tools:
-        return None
-    for candidate in dict.fromkeys((path, os.path.realpath(path))):
-        for argv in tools:
-            if run([*argv, candidate], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-                return True
-    return False
+    """True/False when a package database can answer, None when none is available (any spelling counts)."""
+    return pkgowner.checker(run)(path)
 
 
 def referenced_paths(per_user, base):

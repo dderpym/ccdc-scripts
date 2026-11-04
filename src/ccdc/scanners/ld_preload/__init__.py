@@ -47,7 +47,7 @@ class UnownedMappedLibrary(Finding):
 class ScanLibraryInjection(AnsibleScript):
     """Prints {"findings": [unit-env/profile-env/ld-so-preload/unreadable/mapped-unowned rows], "errors": [...]}."""
     source = "remote.py"
-    support = ("ldpreload.py",)
+    support = ("ldpreload.py", "pkgowner.py")
 
 
 class LibraryInjectionScanner(Scanner):

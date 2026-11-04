@@ -11,6 +11,8 @@ import os
 import re
 import shlex
 import subprocess
+
+import pkgowner
 import sys
 
 from ldpreload import logical_lines, mapped_libraries
@@ -192,16 +194,8 @@ def scan_ld_so_preload(path="/etc/ld.so.preload", reader=read, maps="/proc/self/
 
 
 def owned(path, run=subprocess.run):
-    """True when a package owns the path or its realpath (usrmerge makes either form lie)."""
-    forms = list(dict.fromkeys([path, os.path.realpath(path)]))
-    for query in (["dpkg", "-S"], ["rpm", "-qf"]):
-        try:
-            for form in forms:
-                if run([*query, form], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
-                    return True
-        except FileNotFoundError:
-            continue
-    return False
+    """True when a package owns any spelling of the path (usrmerge makes one form lie)."""
+    return bool(pkgowner.checker(run)(path))
 
 
 def scan_maps(proc="/proc", is_owned=owned, exists=os.path.exists):

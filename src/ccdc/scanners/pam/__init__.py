@@ -85,6 +85,7 @@ class PamModuleModified(Finding):
 class ScanPam(AnsibleScript):
     """Prints {"findings": [pam-* rows], "errors": [...]}: effective stacks, mapped modules, package verify."""
     source = "remote.py"
+    support = ("pkgowner.py",)
 
 
 class PamScanner(Scanner):

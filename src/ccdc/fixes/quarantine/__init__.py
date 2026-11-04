@@ -6,7 +6,7 @@ from ccdc.scanners.unowned import TimestompedFile, UnitRunsUnownedBinary, Unowne
 class Quarantine(AnsibleScript):
     """Evidence copy, freeze, kill and delete of binaries/units (remote.py)."""
     source = "remote.py"
-    support = ("unowned.py",)
+    support = ("unowned.py", "pkgowner.py")
 
     def arguments(self, paths=(), **kwargs):
         return list(paths)

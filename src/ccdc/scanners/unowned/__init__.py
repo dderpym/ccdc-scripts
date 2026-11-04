@@ -81,7 +81,7 @@ class UnitMissingBinary(Finding):
 class ScanUnowned(AnsibleScript):
     """remote.py prints {"findings": [rows], "errors": [...]}; the logic is remote_lib/unowned.py (shared with the quarantine fix)."""
     source = "remote.py"
-    support = ("unowned.py",)
+    support = ("unowned.py", "pkgowner.py")
 
 
 class UnownedScanner(Scanner):
