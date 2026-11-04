@@ -68,8 +68,9 @@ TESTS = {
 DEPENDENCIES = ("usr070", "fst000", "fst010", "sec010")
 
 
-def selection(deep=False):
-    return ",".join(sorted({test_id for test_id, (level, _, _) in TESTS.items() if level <= int(deep)} | set(DEPENDENCIES)))
+def selection(deep=False, only=None):
+    wanted = {test_id for test_id, (level, _, _) in TESTS.items() if level <= int(deep) and (only is None or test_id in only)}
+    return ",".join(sorted(wanted | set(DEPENDENCIES)))
 
 
 SELECTION = selection()
@@ -274,9 +275,9 @@ def exec_scratch():
     return None
 
 
-def scan_lse(script, deep=False):
+def scan_lse(script, deep=False, only=None):
     command = ["/bin/sh", str(Path(script).resolve()), "-c", "-i", "-l", "1",
-               "-p", "0", "-s", selection(deep)]
+               "-p", "0", "-s", selection(deep, only)]
     # LSE creates scratch files even with monitoring disabled. Keep these private
     # and remove them on success, warnings, missing commands, or timeout.
     with tempfile.TemporaryDirectory(prefix="ccdc-lse-") as directory:
@@ -360,8 +361,12 @@ def supplemental_scan(raw, deep=False, capability_status=None):
     return states
 
 
-def scan(script, deep=False):
-    result = scan_lse(script, deep)
+def scan(script, deep=False, only=None):
+    """`only` limits the run to those finding ids (LSE tests and/or supplemental checks)."""
+    if only is not None and not only & set(TESTS):
+        result = {"findings": [], "raw": "", "errors": []}
+    else:
+        result = scan_lse(script, deep, only)
     incomplete = set(result.get('incomplete_ids', []))
     capability_status = result.pop('_capability_status', None)
     for extra in supplemental_scan(result['raw'], deep, capability_status):
@@ -370,6 +375,8 @@ def scan(script, deep=False):
         incomplete.update(extra.get('incomplete_ids', []))
         if extra.get('raw'):
             result['raw'] += '\n--- passive supplemental checks ---\n' + extra['raw']
+    if only is not None:
+        result['findings'] = [f for f in result['findings'] if f['id'] in only]
     result['findings'].sort(key=lambda finding: finding['id'])
     result['errors'] = sorted(set(result['errors']))
     if incomplete:
@@ -390,12 +397,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--script", help="path to a local lse.sh (default: the pinned copy in the bundle)")
     parser.add_argument("--deep", action="store_true", help="include actionable level-1 checks")
+    parser.add_argument("--only", help="comma-separated finding ids; run just those checks")
     parser.add_argument("--user", help="unprivileged account to assess when started as root (default SUDO_USER)")
     args = parser.parse_args()
     drop_privileges(args.user)
     try:
         with (contextlib.nullcontext(args.script) if args.script else bundled_script()) as script:
-            result = scan(script, args.deep)
+            result = scan(script, args.deep, set(args.only.split(",")) if args.only else None)
     except OSError as exc:
         result = {"findings": [], "raw": "", "errors": [str(exc)]}
     print(json.dumps(result, sort_keys=True))

@@ -18,6 +18,7 @@ import time
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
+from ccdc import runner  # noqa: E402
 from controller import remote  # noqa: E402
 
 EXTRA = shlex.split(os.environ.get("ANSIBLE_ARGS", ""))
@@ -25,23 +26,7 @@ VERBOSE = False
 
 
 def run(args, capture=True, result_dir=None, result_task=None):
-    env = dict(os.environ, ANSIBLE_CONFIG=str(ROOT / "ansible.cfg"),
-               ANSIBLE_NOCOLOR="1")
-    if not capture and not VERBOSE:
-        env.update(ANSIBLE_STDOUT_CALLBACK="ccdc_progress", ANSIBLE_LOAD_CALLBACK_PLUGINS="1",
-                   ANSIBLE_CALLBACKS_ENABLED="ccdc_results")
-    if result_dir:
-        env.update(CCDC_RESULT_DIR=result_dir, ANSIBLE_LOAD_CALLBACK_PLUGINS="1",
-                   ANSIBLE_CALLBACKS_ENABLED="ccdc_results")
-    else:
-        env.pop("CCDC_RESULT_DIR", None)
-    if result_task:
-        env["CCDC_RESULT_TASK"] = result_task
-    else:
-        env.pop("CCDC_RESULT_TASK", None)
-    return subprocess.run(args, cwd=ROOT, env=env, text=True,
-                          stdout=subprocess.PIPE if capture else None,
-                          stderr=subprocess.PIPE if capture else None, check=False)
+    return runner.run_ansible(args, capture, result_dir, result_task, verbose=VERBOSE)
 
 
 def inventory():
@@ -73,31 +58,7 @@ def select(target="all"):
 
 def collect(kind, hosts, args=()):
     """One Ansible batch; retain successful hosts even if another is unreachable."""
-    with tempfile.TemporaryDirectory(prefix="ccdc-results-") as directory:
-        result = run(["ansible-playbook", "playbooks/remote.yml", "--limit", ":".join(hosts), *EXTRA,
-                      "--extra-vars", remote.request("discover_" + kind, args)],
-                     result_dir=directory, result_task=remote.TASK)
-        states, errors = {}, {}
-        for host in hosts:
-            try:
-                response = json.loads((Path(directory) / host).read_text())
-                if response.get("unreachable") or response.get("failed") or response.get("rc", 0):
-                    # SSH script tasks use a PTY: the script's stderr can land
-                    # in stdout, leaving only SSH's close notice in stderr.
-                    for stream in ("stdout", "stderr"):
-                        try:
-                            document = json.loads(response.get(stream) or "")
-                        except ValueError:
-                            continue
-                        if isinstance(document, dict) and isinstance(document.get("error"), str):
-                            raise ValueError(document["error"])
-                    raise ValueError("\n".join(response[key].strip() for key in ("stdout", "stderr")
-                                              if response.get(key)) or response.get("msg") or "remote command failed")
-                states[host] = json.loads(response["stdout"])
-            except (OSError, ValueError, KeyError) as exc:
-                errors[host] = str(exc) if not isinstance(exc, FileNotFoundError) else (
-                    result.stderr.strip() or result.stdout.strip() or "No Ansible result")
-        return states, errors
+    return runner.collect(hosts, "discover_" + kind, args, run=run)
 
 
 def run_with_vars(args, variables, capture=True, result_dir=None):
@@ -958,6 +919,27 @@ def monitor(kinds, target, interval=None, once=False):
         executor.shutdown(wait=True, cancel_futures=True)
 
 
+def scan_command(args):
+    from ccdc import registry, scan as scanning
+    from ccdc.target import Target
+    hosts, _ = select(args.target)
+    targets = [Target(host) for host in hosts]
+    autofix = registry.global_autofix()
+    scanners = registry.scanners()
+    results = scanning.scan_all(targets, scanners)
+    bad = scanning.report(results, autofix)
+    if args.fix:
+        def approve(finding, text):
+            return args.fix == "all" or ask(f"\n{finding.host}: {text}\n  Apply? [y/N]", ["y", "n"], "n") == "y"
+        for target, (findings, _) in results.items():
+            scanning.apply_fixes(findings, autofix, approve)
+        if args.wait:
+            time.sleep(args.wait)
+        print("\nRescanning to verify fixes" + (f" after {args.wait}s" if args.wait else "") + "...")
+        bad = scanning.report(scanning.scan_all(targets, scanners), autofix)
+    return bad
+
+
 def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--verbose", action="store_true", help="show full Ansible logs and discovered SSH/firewall documents")
@@ -988,6 +970,12 @@ def argument_parser():
         cmd.add_argument("--auto-apply", choices=["simple", "all"],
                          help="apply fixes without prompting: simple = permission-mode only, all = also ownership; "
                               "without it, fixes are offered interactively on a terminal")
+    cmd = sub.add_parser("scan", help="run every registered scanner; --fix applies matching autofixes")
+    cmd.add_argument("target", nargs="?", default="all")
+    cmd.add_argument("--fix", choices=["ask", "all"], nargs="?", const="ask",
+                     help="apply autofixes: ask per fix (default when given) or all without asking")
+    cmd.add_argument("--wait", type=int, default=0, metavar="SECONDS",
+                     help="after fixing, wait then rescan to catch re-planted artifacts")
     cmd = sub.add_parser("monitor")
     cmd.add_argument("kind", nargs="?", choices=list(POLL_INTERVALS))
     cmd.add_argument("--host", default="all")
@@ -1097,6 +1085,8 @@ def main():
         parser.error("--json is only available for status")
     if args.command == "complete":
         return complete(parser, args.words)
+    if args.command == "scan":
+        return scan_command(args)
     if args.command == "monitor":
         if args.interval is not None and args.interval < 5:
             parser.error("--interval must be at least 5 seconds")
