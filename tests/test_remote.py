@@ -65,12 +65,12 @@ class RemotePlaybookTests(unittest.TestCase):
         shutil.rmtree(results, ignore_errors=True)
         results.mkdir(mode=0o700)
         config = self.root / 'ansible.cfg'
-        config.write_text(f'[defaults]\ncallback_plugins = {ROOT}/callback_plugins\ncallbacks_enabled = ccdc_results\n')
+        config.write_text(f'[defaults]\ncallback_plugins = {ROOT}/transport/callback_plugins\ncallbacks_enabled = ccdc_results\n')
         request = {'ccdc_remote': {'bundle': str(self.bundle), 'entry': entry, 'args': list(args), 'become': False,
                                   'connection': connection, 'payload': str(payload or '')}}
         env = dict(os.environ, ANSIBLE_CONFIG=str(config), CCDC_RESULT_DIR=str(results),
                    CCDC_RESULT_TASK=remote.TASK, ANSIBLE_NOCOLOR='1')
-        command = ['ansible-playbook', str(ROOT / 'playbooks/remote.yml'), '-i', 'fixture,', '-c', 'local',
+        command = ['ansible-playbook', str(ROOT / 'transport/playbooks/remote.yml'), '-i', 'fixture,', '-c', 'local',
                    '-e', json.dumps(dict(request, ansible_python_interpreter=sys.executable, ansible_become=False))]
         run = subprocess.run(command, env=env, capture_output=True, text=True, timeout=90)
         return run, results / 'fixture'

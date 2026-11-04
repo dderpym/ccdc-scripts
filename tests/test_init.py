@@ -216,7 +216,7 @@ class RootRotationRoleTests(unittest.TestCase):
     def test_save_before_change_backups_no_log_and_failed_preflight(self):
         import yaml
         repo = Path(__file__).resolve().parents[1]
-        tasks = yaml.safe_load((repo / 'roles/init/tasks/main.yml').read_text())
+        tasks = yaml.safe_load((repo / 'transport/roles/init/tasks/main.yml').read_text())
         block = copy.deepcopy(tasks[-1])
         self.assertIn('unique root recovery', block['name'])
         with tempfile.TemporaryDirectory() as directory:
@@ -241,7 +241,7 @@ class RootRotationRoleTests(unittest.TestCase):
             play = [{'hosts': 'localhost', 'connection': 'local', 'gather_facts': False,
                      'become': True, 'tasks': [block]}]
             path = root / 'playbooks/rotate.yml'
-            env = dict(os.environ, ANSIBLE_CONFIG=str(repo / 'ansible.cfg'), ANSIBLE_BECOME_EXE='/bin/false')
+            env = dict(os.environ, ANSIBLE_CONFIG=str(repo / 'transport/ansible.cfg'), ANSIBLE_BECOME_EXE='/bin/false')
             def invoke():
                 path.write_text(yaml.safe_dump(play))
                 return subprocess.run(['ansible-playbook', str(path), '-i', 'localhost,'], env=env,

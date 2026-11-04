@@ -78,7 +78,7 @@ class CompletionTests(unittest.TestCase):
         self.assertNotIn('$(unsafe)', matches)
         self.assertNotIn('must-not-complete', matches)
         for line in self.log.read_text().splitlines():
-            self.assertEqual(line, f'selected.yml|{ROOT}/ansible.cfg|--list|{ROOT}')
+            self.assertEqual(line, f'selected.yml|{ROOT}/transport/ansible.cfg|--list|{ROOT}')
 
     def test_lab_and_monitor_commands(self):
         for tool in ('docker', 'ssh-keygen'):

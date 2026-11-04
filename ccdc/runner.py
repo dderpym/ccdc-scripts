@@ -16,7 +16,7 @@ def extra_args():
 
 
 def run_ansible(args, capture=True, result_dir=None, result_task=None, verbose=False):
-    env = dict(os.environ, ANSIBLE_CONFIG=str(ROOT / "ansible.cfg"), ANSIBLE_NOCOLOR="1")
+    env = dict(os.environ, ANSIBLE_CONFIG=str(ROOT / "transport" / "ansible.cfg"), ANSIBLE_NOCOLOR="1")
     if not capture and not verbose:
         env.update(ANSIBLE_STDOUT_CALLBACK="ccdc_progress", ANSIBLE_LOAD_CALLBACK_PLUGINS="1",
                    ANSIBLE_CALLBACKS_ENABLED="ccdc_results")
@@ -63,7 +63,7 @@ def collect(hosts, entry, args=(), variables=None, run=run_ansible, **request):
     connection overrides (see ccdc.target.Auth); `request` goes to remote.request.
     """
     with tempfile.TemporaryDirectory(prefix="ccdc-results-") as directory:
-        command = ["ansible-playbook", "playbooks/remote.yml", "--limit", ":".join(hosts), *extra_args(),
+        command = ["ansible-playbook", "transport/playbooks/remote.yml", "--limit", ":".join(hosts), *extra_args(),
                    "--extra-vars", remote.request(entry, args, **request)]
         if variables:
             result = with_vars(command, variables, run, result_dir=directory, result_task=remote.TASK)
@@ -97,7 +97,7 @@ class AnsibleRunner:
         return states[target.host]
 
     def playbook(self, target, name, variables=None):
-        command = ["ansible-playbook", f"playbooks/{name}.yml", "--limit", target.host, *extra_args()]
+        command = ["ansible-playbook", f"transport/playbooks/{name}.yml", "--limit", target.host, *extra_args()]
         result = with_vars(command, {**target.auth.variables(), **(variables or {})}, capture=False)
         if result.returncode:
             raise RemoteError(f"{target.host}: playbook {name} failed")

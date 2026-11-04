@@ -31,7 +31,7 @@ def call_host(ctl, host, action, **fields):
         with tempfile.NamedTemporaryFile(mode="w", prefix="ccdc-update-request-", suffix=".json") as out:
             json.dump(document, out)
             out.flush()
-            result = ctl.run(["ansible-playbook", "playbooks/remote.yml", "--limit", host, *ctl.EXTRA,
+            result = ctl.run(["ansible-playbook", "transport/playbooks/remote.yml", "--limit", host, *ctl.EXTRA,
                               "--extra-vars", ctl.remote.request("manage_updates", payload=out.name)],
                              result_dir=directory, result_task=ctl.remote.TASK)
         if getattr(ctl, "VERBOSE", False):

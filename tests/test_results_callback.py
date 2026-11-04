@@ -16,7 +16,7 @@ except ImportError:
 @unittest.skipIf(ansible is None, 'Ansible not installed in test environment')
 class ResultsCallbackTests(unittest.TestCase):
     def test_selected_scanner_task_survives_cleanup_and_failures_are_retained(self):
-        path = Path(__file__).resolve().parents[1] / 'callback_plugins/ccdc_results.py'
+        path = Path(__file__).resolve().parents[1] / 'transport/callback_plugins/ccdc_results.py'
         spec = importlib.util.spec_from_file_location('results_callback', path)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)

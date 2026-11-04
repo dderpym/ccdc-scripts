@@ -42,13 +42,13 @@ class HostKeysTests(unittest.TestCase):
                 '[ "$*" = "-T 5 -p 22270 -- 127.0.0.1" ] || exit 2\n'
                 f"printf '%s\\n' '# 127.0.0.1:22270 SSH-2.0-fixture' '{endpoint} {current}'\n")
             scanner.chmod(0o700)
-            env = dict(os.environ, ANSIBLE_CONFIG=str(ROOT / 'ansible.cfg'),
+            env = dict(os.environ, ANSIBLE_CONFIG=str(ROOT / 'transport/ansible.cfg'),
                        PATH=str(scanner_dir) + os.pathsep + os.environ['PATH'],
                        HOME=str(root), ANSIBLE_LOCAL_TEMP=str(root / 'ansible-tmp'),
                        CCDC_RESULT_DIR='')
 
             def invoke(replace=True):
-                args = ['ansible-playbook', str(ROOT / 'playbooks/host-keys.yml'),
+                args = ['ansible-playbook', str(ROOT / 'transport/playbooks/host-keys.yml'),
                         '-i', str(inventory), '--limit', 'alpha']
                 if replace:
                     args += ['--extra-vars', 'replace_host_keys=true']

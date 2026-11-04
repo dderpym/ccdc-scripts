@@ -71,14 +71,14 @@ def run_with_vars(args, variables, capture=True, result_dir=None):
 
 
 def playbook(name, host="all", variables=None):
-    args = ["ansible-playbook", f"playbooks/{name}.yml", "--limit", host, *EXTRA]
+    args = ["ansible-playbook", f"transport/playbooks/{name}.yml", "--limit", host, *EXTRA]
     result = run(args, capture=False) if variables is None else run_with_vars(args, variables, capture=False)
     return result.returncode == 0
 
 
 def act(host, entry, args=(), connection=True, payload=None):
     """Run one mutating host script with live progress; True when it succeeded."""
-    result = run(["ansible-playbook", "playbooks/remote.yml", "--limit", host, *EXTRA,
+    result = run(["ansible-playbook", "transport/playbooks/remote.yml", "--limit", host, *EXTRA,
                   "--extra-vars", remote.request(entry, args, connection=connection, payload=payload)],
                  capture=False)
     return result.returncode == 0

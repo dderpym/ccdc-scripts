@@ -254,7 +254,7 @@ class SecurityControllerTests(unittest.TestCase):
     def test_lse_transport_uses_the_shared_runner_and_normal_mode(self):
         def run(args, result_dir=None, result_task=None):
             self.assertEqual(result_task, 'Run host script')
-            self.assertEqual(args[:2], ['ansible-playbook', 'playbooks/remote.yml'])
+            self.assertEqual(args[:2], ['ansible-playbook', 'transport/playbooks/remote.yml'])
             request = json.loads(args[args.index('--extra-vars') + 1])['ccdc_remote']
             self.assertEqual((request['entry'], request['args'], request['become']), ('discover_lse', [], True))
             (Path(result_dir) / 'a').write_text(json.dumps({'stdout': json.dumps(STATE), 'rc': 0}))

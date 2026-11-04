@@ -23,7 +23,7 @@ except ImportError:
 else:
     modules = {}
 
-path = Path(__file__).resolve().parents[1] / "callback_plugins/ccdc_progress.py"
+path = Path(__file__).resolve().parents[1] / "transport/callback_plugins/ccdc_progress.py"
 spec = importlib.util.spec_from_file_location("progress_callback", path)
 progress = importlib.util.module_from_spec(spec)
 with patch.dict(sys.modules, modules):

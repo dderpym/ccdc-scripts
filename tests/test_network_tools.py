@@ -9,7 +9,7 @@ import unittest
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
-TASKS = yaml.safe_load((ROOT / 'roles/network_tools/tasks/main.yml').read_text())
+TASKS = yaml.safe_load((ROOT / 'transport/roles/network_tools/tasks/main.yml').read_text())
 
 
 class NetworkToolsTests(unittest.TestCase):
@@ -46,7 +46,7 @@ class NetworkToolsTests(unittest.TestCase):
                     })
             playbook = base / 'probe.yml'
             playbook.write_text(yaml.safe_dump(plays, sort_keys=False))
-            env = dict(os.environ, ANSIBLE_CONFIG=str(ROOT / 'ansible.cfg'))
+            env = dict(os.environ, ANSIBLE_CONFIG=str(ROOT / 'transport/ansible.cfg'))
             env.pop('CCDC_RESULT_DIR', None)
             result = subprocess.run(['ansible-playbook', '-i', 'localhost,', '-c', 'local',
                                      str(playbook)], env=env, text=True, stdout=subprocess.PIPE,
@@ -54,10 +54,10 @@ class NetworkToolsTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_provisioning_runs_only_in_the_firewall_preparation_playbook_not_init(self):
-        init = yaml.safe_load((ROOT / 'roles/init/tasks/main.yml').read_text())
+        init = yaml.safe_load((ROOT / 'transport/roles/init/tasks/main.yml').read_text())
         self.assertFalse(any(task.get('ansible.builtin.include_role', {}).get('name') == 'network_tools'
                              for task in init))
-        play, = yaml.safe_load((ROOT / 'playbooks/network-tools.yml').read_text())
+        play, = yaml.safe_load((ROOT / 'transport/playbooks/network-tools.yml').read_text())
         self.assertEqual(play['roles'], ['network_tools'])
         apt = next(task['ansible.builtin.apt'] for task in TASKS if 'ansible.builtin.apt' in task)
         self.assertEqual(apt['policy_rc_d'], 101)

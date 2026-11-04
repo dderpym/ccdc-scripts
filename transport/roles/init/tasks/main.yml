@@ -3,8 +3,8 @@
   ansible.builtin.assert:
     that:
       - inventory_hostname is match('^[A-Za-z0-9_][A-Za-z0-9_.-]*$')
-      - lookup('ansible.builtin.file', playbook_dir ~ '/../files/oski.pub') | trim | length > 40
-      - lookup('ansible.builtin.file', playbook_dir ~ '/../files/oski.pub') | trim is match('^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) [A-Za-z0-9+/]+={0,3}( .*)?$')
+      - lookup('ansible.builtin.file', playbook_dir ~ '/../../files/oski.pub') | trim | length > 40
+      - lookup('ansible.builtin.file', playbook_dir ~ '/../../files/oski.pub') | trim is match('^(ssh-(ed25519|rsa)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh.com|sk-ecdsa-sha2-nistp256@openssh.com) [A-Za-z0-9+/]+={0,3}( .*)?$')
     fail_msg: Supply a real single public key in files/oski.pub before running init.
 
 - name: Install Python 3 and sudo only when missing
@@ -142,7 +142,7 @@
   ansible.builtin.lineinfile:
     path: /home/oski/.ssh/authorized_keys
     create: true
-    line: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../files/oski.pub') | trim }}"
+    line: "{{ lookup('ansible.builtin.file', playbook_dir ~ '/../../files/oski.pub') | trim }}"
     owner: oski
     group: oski
     mode: '0600'
@@ -176,7 +176,7 @@
 
     - name: Make controller credential directories private
       ansible.builtin.file:
-        path: "{{ playbook_dir }}/../{{ item }}"
+        path: "{{ playbook_dir }}/../../{{ item }}"
         state: directory
         mode: '0700'
       loop: [secrets, secrets/root]
@@ -195,7 +195,7 @@
 
     - name: Save the candidate password first and retain the previous recovery copy
       ansible.builtin.copy:
-        dest: "{{ playbook_dir }}/../secrets/root/{{ inventory_hostname }}.password"
+        dest: "{{ playbook_dir }}/../../secrets/root/{{ inventory_hostname }}.password"
         content: "{{ ccdc_root_password }}\n"
         mode: '0600'
         backup: true
@@ -219,7 +219,7 @@
                 os.fsync(directory)
             finally:
                 os.close(directory)
-          - "{{ playbook_dir }}/../secrets/root/{{ inventory_hostname }}.password"
+          - "{{ playbook_dir }}/../../secrets/root/{{ inventory_hostname }}.password"
           - "{{ init_root_password_copy.backup_file | default('') }}"
       delegate_to: localhost
       become: false
