@@ -18,10 +18,11 @@ import time
 ROOT = Path(__file__).resolve().parent
 STATE = ROOT / "state"
 sys.path.insert(0, str(ROOT / "src"))
-from ccdc import runner  # noqa: E402
+from ccdc import batch, runner  # noqa: E402
 from ccdc.runner import RemoteError  # noqa: E402
 from ccdc.target import PasswordAuth, SudoAuth, Target  # noqa: E402
 from scripts.firewall.apply import ApplyFirewall, RestoreFirewall  # noqa: E402
+from scripts.firewall.discover import DiscoverFirewall, DiscoverListeners, DiscoverSSH  # noqa: E402
 from scripts.firewall.tools import PrepareNetworkTools  # noqa: E402
 from scripts.init.bootstrap import HostKeys, Init  # noqa: E402
 
@@ -60,9 +61,12 @@ def select(target="all"):
     return hosts, variables
 
 
-def collect(kind, hosts, args=()):
-    """One Ansible batch; retain successful hosts even if another is unreachable."""
-    return runner.collect(hosts, "discover_" + kind, args, run=run)
+def collect(script, hosts, **arguments):
+    """One Ansible batch of an AnsibleScript (class or instance) over `hosts`.
+
+    Returns ({host: parsed result}, {host: error}); successful hosts are kept even if another is unreachable.
+    """
+    return batch.collect(script() if isinstance(script, type) else script, hosts, run=run, **arguments)
 
 
 def succeeded(script, target, **arguments):
@@ -244,8 +248,11 @@ def show_state(kind, state, title):
         print(json.dumps(state, indent=2, sort_keys=True))
 
 
+DISCOVERY = {"firewall": DiscoverFirewall, "listeners": DiscoverListeners, "ssh": DiscoverSSH}
+
+
 def status(kind, hosts, json_output=False):
-    states, errors = collect(kind, hosts)
+    states, errors = collect(DISCOVERY[kind], hosts)
     if json_output:
         print(json.dumps({"hosts": states, "errors": errors}, indent=2, sort_keys=True))
     else:
@@ -303,7 +310,7 @@ def listener_text(hosts, variables, states, errors):
 
 
 def listeners(hosts, variables):
-    states, errors = collect("listeners", hosts)
+    states, errors = collect(DiscoverListeners, hosts)
     structured = {"hosts": {host: {"address": variables.get(host, {}).get("ansible_host", host),
                                   "listeners": states.get(host, []), "error": errors.get(host)} for host in hosts}}
     save(STATE / "reports/listeners.json", structured)
@@ -348,8 +355,8 @@ def configure_firewall(hosts):
     print("Prior source restrictions are NOT retained. Approved ports open to all sources on IPv4 and IPv6.")
     remembered = {}
     while True:
-        states, errors = collect("listeners", hosts)
-        firewalls, fw_errors = collect("firewall", hosts)
+        states, errors = collect(DiscoverListeners, hosts)
+        firewalls, fw_errors = collect(DiscoverFirewall, hosts)
         errors.update(fw_errors)
         problems(errors)
         policies = {}
@@ -414,7 +421,7 @@ def configure_firewall(hosts):
     results = [(host, "FAILED - discovery" if host in errors else "SKIPPED - unchanged")
                for host in hosts if host not in policies]
     for host, policy in policies.items():
-        fresh, failure = collect("listeners", [host])
+        fresh, failure = collect(DiscoverListeners, [host])
         if failure or groups(fresh[host]) != groups(states[host]):
             problems(failure)
             results.append((host, "FAILED - listeners changed; review again"))
@@ -423,7 +430,7 @@ def configure_firewall(hosts):
             results.append((host, "FAILED - fresh oski access preflight"))
             continue
         # Verify the current SSH listener port, not only a controller/NAT port.
-        ssh, failure = collect("ssh", [host])
+        ssh, failure = collect(DiscoverSSH, [host])
         if failure:
             problems(failure)
             results.append((host, "FAILED - SSH safety discovery"))
@@ -434,7 +441,7 @@ def configure_firewall(hosts):
         if not all(int(port) in policy["tcp"] for port in ssh_ports):
             results.append((host, "FAILED - approve all active SSH ports before applying"))
             continue
-        snapshots, failure = collect("firewall", [host], ["--snapshot"])
+        snapshots, failure = collect(DiscoverFirewall, [host], snapshot=True)
         if failure:
             problems(failure)
             results.append((host, "FAILED - no rollback snapshot"))
@@ -442,7 +449,7 @@ def configure_firewall(hosts):
         path = STATE / "reports/rollback" / host / "firewall.json"
         save(path, snapshots[host])
         success = ApplyFirewall().run(Target(host), tcp=policy["tcp"], udp=policy["udp"])
-        observed, failure = collect("firewall", [host])
+        observed, failure = collect(DiscoverFirewall, [host])
         if failure:
             problems(failure)
             success = False
@@ -484,7 +491,7 @@ def rollback(hosts):
 def baseline(kind, hosts):
     if kind != "firewall":
         raise RuntimeError("Only the firewall has a trusted baseline")
-    states, errors = collect(kind, hosts)
+    states, errors = collect(DISCOVERY[kind], hosts)
     for host, state in states.items():
         try:
             save(STATE / "baselines" / host / f"{kind}.json", state)
@@ -530,8 +537,25 @@ def scanner_state(state):
     return state
 
 
+def legacy_scan_script(kind):
+    """The AnsibleScript behind the `lse`/`integrity` commands once it is converted to the new model.
+
+    ScanLSE/ScanIntegrity live in ccdc.scanners.<kind>; until they exist this returns None and the
+    command keeps using the old single-entry transport.
+    """
+    import importlib
+    try:
+        return getattr(importlib.import_module("ccdc.scanners." + kind), {"lse": "ScanLSE", "integrity": "ScanIntegrity"}[kind])
+    except (ImportError, AttributeError):
+        return None
+
+
 def scan(kind, hosts, deep=False):
-    states, errors = collect(kind, hosts, ["--deep"] if deep else [])
+    script = legacy_scan_script(kind)
+    if script is not None:
+        states, errors = collect(script, hosts, deep=deep)
+    else:  # old single-entry transport
+        states, errors = runner.collect(hosts, "discover_" + kind, ["--deep"] if deep else [], run=run)
     valid = {}
     for host, state in states.items():
         try:

@@ -1,16 +1,15 @@
 """Firewall phase: find what a host exposes, let a human approve it, record it in inventory.yml."""
-from ccdc.ansible import EntryScript
 from ccdc.inventory_edit import INVENTORY, set_services
 from ccdc.script import HostScript
 from ccdc.services import declared, exposed
+from scripts.firewall.discover import DiscoverListeners
 
 
-class DiscoverServices(EntryScript):
+class DiscoverServices(DiscoverListeners):
     """Non-loopback listeners (ss -tulpn as root, via discover_listeners) as {(proto, port): info}."""
-    entry = "discover_listeners"
 
-    def parse(self, document, **kwargs):
-        return exposed(document)
+    def parse(self, result, **kwargs):
+        return exposed(super().parse(result, **kwargs))
 
 
 class ApproveServices(HostScript):

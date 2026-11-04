@@ -9,7 +9,7 @@ import re
 import subprocess
 
 
-from host.discover_listeners import process_info, service_hints
+from procinfo import process_info, service_hints  # shipped beside this script
 PROC = Path("/proc")
 RUN = Path("/run")
 TIMEOUT = 30
