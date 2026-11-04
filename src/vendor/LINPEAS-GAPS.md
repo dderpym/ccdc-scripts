@@ -54,7 +54,7 @@ sockets already have selected LSE checks. Extra rules must not replace those.
 ## Integration and safety
 
 `ccdcctl lse` / `monitor lse` keep their existing command, report and result
-contract. `scripts/discover-lse` merges supplemental findings with LSE, retaining
+contract. `src/host/discover_lse.py` merges supplemental findings with LSE, retaining
 raw evidence in private reports and stable IDs for monitor deduplication.
 The playbook transfers helpers beside LSE and always removes its private scratch
 directory. Permission checks assess the actual effective login account, not

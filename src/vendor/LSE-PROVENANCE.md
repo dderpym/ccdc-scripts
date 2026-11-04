@@ -12,7 +12,7 @@
 
 ## Invocation and scope
 
-`scripts/discover-lse --script vendor/lse.sh [--deep]` uses Python 3 stdlib
+`src/host/discover_lse.py --script vendor/lse.sh [--deep]` uses Python 3 stdlib
 and `/bin/sh`. It runs the local file with **`-c -i -l 1 -p 0 -s SELECTION`**;
 `--deep` expands the selection, never requesting output level 2. These flags are verified
 against this pinned source's `lse_help` and `getopts`: color disabled,
@@ -70,8 +70,8 @@ results private.
 
 ## Passive supplemental checks
 
-Original Python helpers `scripts/lse_extras.py`, `scripts/lse_host_risks.py`
-and `scripts/kernel_risks.py` add a curated subset
+Original Python helpers `src/host/lse_extras.py`, `src/host/lse_host_risks.py`
+and `src/host/kernel_risks.py` add a curated subset
 of LinPEAS coverage gaps to the same result. LSE itself is
 still unmodified; its parser/allowlist contract below remains unchanged. See
 [LINPEAS-GAPS.md](LINPEAS-GAPS.md) for the pinned comparison, implemented checks,

@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Read-only SSH discovery. --context accepts sshd -C syntax; --config is diagnostic.
 
-Ansible: ansible.builtin.script: scripts/discover-ssh (stdout is one JSON object).
 No context means global defaults, NOT the policy for all possible Match blocks.
 """
 import argparse
