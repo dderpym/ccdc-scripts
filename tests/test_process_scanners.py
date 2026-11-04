@@ -5,6 +5,8 @@ import signal
 import sys
 import tempfile
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -73,10 +75,27 @@ class ProcScanTests(unittest.TestCase):
     def test_remote_agents(self):
         units = Path(self.tree.root, "units")
         units.mkdir()
-        (units / "xrdp.service").write_text("")
-        rows = scan_remote_agents.scan(self.tree.root, [str(units)], [str(units / "nope"), str(units)])
+        live = [("xrdp.service", "/lib/systemd/system/xrdp.service", ["/usr/sbin/xrdp"]),
+                ("innocent.service", "/etc/systemd/system/innocent.service", ["/usr/local/bin/meshagent"]),
+                ("fine.service", "/lib/systemd/system/fine.service", ["/usr/bin/true"])]
+        rows = scan_remote_agents.scan(self.tree.root, live, [str(units / "nope"), str(units)])
         self.assertEqual({(r["kind"], r["name"]) for r in rows["findings"]},
-                         {("process", "meshagent"), ("unit", "xrdp"), ("path", "units")})
+                         {("process", "meshagent"), ("unit", "xrdp"), ("unit", "meshagent"), ("path", "units")})
+
+    def test_remote_agent_units_come_from_systemd_show(self):
+        def run(argv, **kw):
+            args = argv[2:]
+            out = ("netbird.service enabled\n" if args[0] == "list-unit-files" else "" if args[0] == "list-units" else
+                   "Id=netbird.service\nFragmentPath=/etc/systemd/system/netbird.service\n"
+                   "ExecStart={ path=/usr/bin/netbird ; argv[]=/usr/bin/netbird up }\n")
+            return SimpleNamespace(stdout=out, stderr="", returncode=0)
+        self.assertEqual(scan_remote_agents.live_units(run),
+                         [("netbird.service", "/etc/systemd/system/netbird.service", ["/usr/bin/netbird"])])
+        failing = lambda argv, **kw: SimpleNamespace(stdout="", stderr="no bus", returncode=1)  # noqa: E731
+        original = scan_remote_agents.live_units
+        with patch.object(scan_remote_agents, "live_units", lambda: original(failing)):
+            result = scan_remote_agents.scan(self.tree.root, None, [])
+        self.assertTrue(result["errors"])  # not inspecting units is reported, never silently clean
 
     def test_kill_reverifies_pid(self):
         sent = []
@@ -108,6 +127,18 @@ class PathAndCapTests(unittest.TestCase):
             self.assertEqual([r["name"] for r in result["findings"]], ["ls", "setcap"])
             setcap = result["findings"][1]
             self.assertEqual(setcap["unowned"], [str(first / "setcap")])
+
+    def test_live_paths_include_login_shell_manager_and_running_processes(self):
+        with tempfile.TemporaryDirectory() as base:
+            Path(base, "5").mkdir()
+            Path(base, "5", "environ").write_bytes(b"HOME=/root\0PATH=/opt/evil/bin:/usr/bin\0")
+
+            def run(argv, **kw):
+                out = {"sh": "/sh/bin:/usr/bin\n", "bash": "/bash/bin\n",
+                       "systemctl": "LANG=C\nPATH=/mgr/bin\n"}[argv[0]]
+                return SimpleNamespace(stdout=out)
+            dirs = scan_path_shadow.live_paths(base, run)
+            self.assertEqual(set(dirs), {"/sh/bin", "/usr/bin", "/bash/bin", "/mgr/bin", "/opt/evil/bin"})
 
     def test_path_shadow_without_package_manager_is_incomplete(self):
         with tempfile.TemporaryDirectory() as base:
