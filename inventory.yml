@@ -25,6 +25,9 @@ all:
       clientaliveinterval: 300
       clientalivecountmax: 2
   hosts:
+    # `ccdcctl services` records each host's approved services here, e.g.
+    #   services:
+    #     - {port: 22, proto: tcp, name: sshd}
     hatchery:
       ansible_host: 127.0.0.1
       ansible_port: 22270

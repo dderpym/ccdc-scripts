@@ -699,6 +699,22 @@ def scan_command(args):
     return bad
 
 
+def approve_services(hosts, variables):
+    """Human approval of each host's exposed services; the answers land in inventory.yml."""
+    from scripts.firewall.services import ApproveServices
+    if not sys.stdin.isatty():
+        raise RuntimeError("services requires an interactive terminal")
+    failed = False
+    for index, host in enumerate(hosts, 1):
+        heading(host, index, len(hosts))
+        try:
+            ApproveServices().run(Target(host, vars=variables.get(host, {})))
+        except (RuntimeError, OSError, ValueError) as exc:
+            failed = True
+            print(f"{host}: FAILED - {terminal(exc)}")
+    return failed
+
+
 def argument_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--verbose", action="store_true", help="show full Ansible logs and discovered SSH/firewall documents")
@@ -717,6 +733,8 @@ def argument_parser():
         cmd.add_argument("action", choices=["status", "configure", "baseline", "rollback"])
         cmd.add_argument("target", nargs="?", default="all")
         cmd.add_argument("--json", action="store_true", help="status only: emit full host-keyed discovery documents and errors")
+    cmd = sub.add_parser("services", help="review what each host exposes; approved services are saved to inventory.yml")
+    cmd.add_argument("target", nargs="?", default="all")
     cmd = sub.add_parser("update", help="discover/review updates interactively; apply then offer individual service restarts")
     cmd.add_argument("action", choices=["plan", "apply"])
     cmd.add_argument("target", nargs="?", default="all")
@@ -859,6 +877,8 @@ def main():
                           not args.no_bootstrap_password, replace_host_keys=args.replace_host_keys)
     if args.command == "ping":
         return run(["ansible", "all", "--limit", ":".join(hosts), "-m", "ansible.builtin.ping", *EXTRA], False).returncode != 0
+    if args.command == "services":
+        return approve_services(hosts, variables)
     if args.command == "listeners":
         return listeners(hosts, variables)
     if args.action == "status":
