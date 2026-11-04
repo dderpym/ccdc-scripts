@@ -26,9 +26,52 @@ def st(mode=0o755, mtime=1000, ctime=1000):
 
 
 class Scan(unittest.TestCase):
-    def test_exec_target_strips_prefixes(self):
-        text = "[Service]\nExecStart=-/usr/sbin/a --x\nExecStartPre=@/opt/b b\nExecStart=relative\n"
-        self.assertEqual(scan_unowned.exec_target(text), ["/usr/sbin/a", "/opt/b"])
+    def test_exec_paths_from_systemctl_show(self):
+        value = ("{ path=/usr/sbin/a ; argv[]=/usr/sbin/a --x ${X} ; ignore_errors=yes ; start_time=[n/a] }"
+                 "{ path=/opt/b ; argv[]=/opt/b b ; ignore_errors=no }")
+        self.assertEqual(scan_unowned.exec_paths(value), ["/usr/sbin/a", "/opt/b"])
+        self.assertEqual(scan_unowned.exec_paths(""), [])
+
+    def systemd(self, units):
+        def run(argv, **kw):
+            args = argv[2:]
+            if args[0] == "list-unit-files":
+                out = "".join(f"{u} enabled\n" for u in units)
+            elif args[0] == "list-units":
+                out = ""
+            else:
+                asked = [a for a in args if a.endswith(".service")]
+                out = "\n".join("".join(f"{k}={v}\n" for k, v in units[u].items()) for u in asked if u in units)
+            return SimpleNamespace(stdout=out, stderr="", returncode=0)
+        return run
+
+    def test_loaded_units_use_managers_resolved_exec(self):
+        run = self.systemd({
+            "a.service": {"Id": "a.service", "LoadState": "loaded", "FragmentPath": "/etc/systemd/system/a.service",
+                          "ExecStart": "{ path=/usr/sbin/net-pathd ; argv[]=x }"},
+            "gone.service": {"Id": "gone.service", "LoadState": "not-found"},
+            "bad.service": {"Id": "bad.service", "LoadState": "bad-setting"},
+            "mute.service": {"Id": "mute.service"}})
+        units, errors = scan_unowned.loaded_units(run)
+        self.assertEqual(units, {"/etc/systemd/system/a.service": ["/usr/sbin/net-pathd"]})
+        self.assertEqual(len(errors), 2)  # bad-setting and no-answer fail closed, not silent
+        self.assertEqual(fix_quarantine.units_for(["/usr/sbin/net-pathd"], units), ["/etc/systemd/system/a.service"])
+
+    def test_scan_reports_unreachable_systemd(self):
+        def run(argv, **kw):
+            if argv[0] == "systemctl":
+                return SimpleNamespace(stdout="", stderr="no bus", returncode=1)
+            return SimpleNamespace(stdout="", stderr="", returncode=1)
+        with self.assertRaises(OSError):
+            scan_unowned.loaded_units(run)
+
+    def test_running_includes_script_path_from_cmdline(self):
+        with tempfile.TemporaryDirectory() as d:
+            os.makedirs(f"{d}/7")
+            os.symlink("/usr/bin/python3", f"{d}/7/exe")
+            Path(f"{d}/7/cmdline").write_bytes(b"python3\0/opt/evil.py\0")
+            running = scan_unowned.running_executables(d)
+            self.assertEqual(running["/opt/evil.py"], [7])
 
     def test_usrmerge_ownership_uses_realpath(self):
         with tempfile.TemporaryDirectory() as d:
@@ -55,15 +98,15 @@ class Scan(unittest.TestCase):
     def test_analyze_flags(self):
         stats = {"/usr/sbin/net-pathd": st(ctime=10**9, mtime=1000), "/usr/bin/ls": st(),
                  "/usr/local/bin/tool": st(), "/usr/bin/team": st(), "/etc/ssh/notes": st(mode=0o644)}
-        units = {"/etc/systemd/system/bad.service": "ExecStart=/usr/sbin/net-pathd\n",
-                 "/usr/lib/systemd/system/ok.service": "ExecStart=/usr/bin/ls\n",
-                 "/usr/lib/systemd/system/odd.service": "ExecStart=/usr/local/bin/tool\n",
-                 "/usr/lib/systemd/system/gone.service": "ExecStart=/nonexistent/zz\n"}
+        units = {"/etc/systemd/system/bad.service": ["/usr/sbin/net-pathd"],
+                 "/usr/lib/systemd/system/ok.service": ["/usr/bin/ls"],
+                 "/usr/lib/systemd/system/odd.service": ["/usr/local/bin/tool"],
+                 "/usr/lib/systemd/system/gone.service": ["/nonexistent/zz"]}
         rows = scan_unowned.analyze(
-            [*stats], list(units), {"/usr/bin/ls", "/usr/lib/systemd/system/ok.service",
+            [*stats], units, {"/usr/bin/ls", "/usr/lib/systemd/system/ok.service",
                                     "/usr/lib/systemd/system/odd.service", "/usr/lib/systemd/system/gone.service"},
             {"/usr/sbin/net-pathd": [42]}, ["/usr/bin/team"], lstat=stats.__getitem__,
-            read=units.__getitem__, opener=lambda p, m: open(os.devnull, m), exists=lambda p: p in stats)
+            opener=lambda p, m: open(os.devnull, m), exists=lambda p: p in stats)
         by = {(r["kind"], r["path"]): r for r in rows}
         net = by[("unowned-exec", "/usr/sbin/net-pathd")]
         self.assertEqual((net["severity"], net["pids"]), ("critical", [42]))

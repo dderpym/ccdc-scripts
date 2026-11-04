@@ -20,7 +20,6 @@ import sys
 DIRS = ["/usr/bin", "/usr/sbin", "/usr/libexec", "/usr/local/bin", "/usr/local/sbin", "/usr/local/libexec",
         "/bin", "/sbin", "/opt/*/bin", "/lib*/security", "/usr/lib*/security", "/etc/ssh", "/etc/sudoers.d",
         "/etc/cron.d"]
-UNIT_DIRS = ["/lib/systemd/system", "/usr/lib/systemd/system", "/etc/systemd/system"]
 MAX_ROWS = 100
 SKEW = 86400
 
@@ -106,16 +105,48 @@ def timestomped(stat_result):
     return stat_result.st_mtime < stat_result.st_ctime - SKEW
 
 
-def exec_target(unit_text):
-    """First word of each ExecStart*= line, minus systemd's -@+!: prefixes."""
-    targets = []
-    for line in unit_text.splitlines():
-        match = re.match(r"\s*ExecStart(?:Pre|Post)?\s*=\s*(.*)", line)
-        if match:
-            word = match[1].lstrip("-@+!:").split()
-            if word and word[0].startswith("/"):
-                targets.append(word[0])
-    return targets
+EXEC_PROPS = ("ExecStart", "ExecStartPre", "ExecStartPost")
+SHOW = ("Id", "LoadState", "FragmentPath", *EXEC_PROPS)
+
+
+def exec_paths(show_value):
+    """Binaries from systemctl's rendering `{ path=/bin/x ; argv[]=... ; ... }` (one block per command)."""
+    return [m[1] for m in re.finditer(r"\{ path=(\S+) ;", show_value)]
+
+
+def systemctl(*args, run=subprocess.run):
+    result = run(["systemctl", "--no-pager", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                 universal_newlines=True, timeout=60)
+    if result.returncode:
+        raise OSError("systemctl %s: %s" % (" ".join(args[:2]), result.stderr.strip() or result.returncode))
+    return result.stdout
+
+
+def loaded_units(run=subprocess.run, chunk=100):
+    """({fragment path: [binaries]}, errors) as the service manager has resolved them (drop-ins included)."""
+    names = set()
+    for args in (("list-unit-files", "--type=service", "--no-legend"),
+                 ("list-units", "--all", "--type=service", "--no-legend", "--plain")):
+        names.update(f[0] for f in (l.split() for l in systemctl(*args, run=run).splitlines())
+                     if f and f[0].endswith(".service") and not f[0].endswith("@.service"))
+    units, errors, answered = {}, [], set()
+    names = sorted(names)
+    for i in range(0, len(names), chunk):
+        out = systemctl("show", "-p", ",".join(SHOW), *names[i:i + chunk], run=run)
+        for block in out.strip("\n").split("\n\n"):
+            props = dict(line.partition("=")[::2] for line in block.splitlines() if "=" in line)
+            if not props.get("Id"):
+                continue
+            answered.add(props["Id"])
+            if props.get("LoadState") in ("not-found", "masked"):
+                continue
+            if props.get("LoadState") != "loaded" or not props.get("FragmentPath"):
+                errors.append("unit %s not inspected: LoadState=%s" % (props["Id"], props.get("LoadState") or "?"))
+                continue
+            units.setdefault(props["FragmentPath"], [])
+            units[props["FragmentPath"]] += [b for k in EXEC_PROPS for b in exec_paths(props.get(k, ""))]
+    errors += ["unit %s not inspected: systemd gave no answer" % n for n in names if n not in answered]
+    return units, errors
 
 
 def running_executables(proc="/proc"):
@@ -128,6 +159,14 @@ def running_executables(proc="/proc"):
             except OSError:
                 continue
             result.setdefault(exe.removesuffix(" (deleted)"), []).append(int(name))
+            # Scripts run as `interpreter /path/script`; the process is "running" that file too.
+            try:
+                with open(os.path.join(proc, name, "cmdline"), "rb") as handle:
+                    argv = handle.read().split(b"\0")
+            except OSError:
+                continue
+            if len(argv) > 1 and argv[1].startswith(b"/"):
+                result.setdefault(os.fsdecode(argv[1]), []).append(int(name))
     return result
 
 
@@ -142,9 +181,10 @@ def read_allowlist(path):
         return [line.strip() for line in handle if line.strip() and not line.startswith("#")]
 
 
-def analyze(files, units, owned, running, allowlist=(), lstat=os.lstat, read=None, opener=open, exists=os.path.exists):
-    """Rows for unowned executables/timestomped files/units. Pure given its inputs."""
-    read = read or (lambda p: open(p, errors="replace").read())
+def analyze(files, units, owned, running, allowlist=(), lstat=os.lstat, opener=open, exists=os.path.exists):
+    """Rows for unowned executables/timestomped files/units. Pure given its inputs.
+
+    units: {unit fragment path: [binaries systemd will execute]} from the live manager."""
     rows = []
     unit_set = set(units)
     for path in sorted(set(files) - unit_set):
@@ -171,10 +211,7 @@ def analyze(files, units, owned, running, allowlist=(), lstat=os.lstat, read=Non
         if allowed(path, allowlist):
             continue
         unit_owned = is_owned(path, owned)
-        try:
-            targets = exec_target(read(path))
-        except OSError:
-            continue
+        targets = list(dict.fromkeys(units[path]))
         before = len(rows)
         for binary in targets:
             base = {"path": path, "unit": path, "binary": binary, "unit_owned": unit_owned}
@@ -203,18 +240,18 @@ def scan(allowlist=(), run=subprocess.run):
     if backend is None:
         return {"findings": [], "errors": ["no dpkg or rpm database; ownership cannot be established"]}
     files = list(list_files(DIRS))
-    units = [p for p in list_files(UNIT_DIRS) if p.endswith(".service")]
+    try:
+        units, unit_errors = loaded_units(run)
+    except OSError as exc:  # no systemd (or no bus): say so rather than reporting units as clean
+        units, unit_errors = {}, ["units not inspected: %s" % exc]
     asked = set(files) | set(units)
-    for path in units:
-        try:
-            asked.update(t for t in exec_target(open(path, errors="replace").read()))
-        except OSError:
-            pass
+    for binaries in units.values():
+        asked.update(binaries)
     for path in list(asked):
         asked |= candidates(path)
     owned = owned_set(asked, backend, run)
     rows, errors = cap(analyze(files, units, owned, running_executables(), allowlist))
-    return {"findings": rows, "errors": errors}
+    return {"findings": rows, "errors": unit_errors + errors}
 
 
 def main(argv=None):

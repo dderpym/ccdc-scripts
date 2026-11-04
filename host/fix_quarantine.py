@@ -20,27 +20,16 @@ import time
 from host import scan_unowned
 
 EVIDENCE_ROOT = "/root/ir"
-UNIT_DIRS = scan_unowned.UNIT_DIRS
 QUIET = {"check": False, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
 
 
-def units_for(paths, unit_dirs=UNIT_DIRS, read=None):
-    """Unit files that are in `paths` or whose ExecStart is one of them."""
-    read = read or (lambda p: open(p, errors="replace").read())
+def units_for(paths, loaded=None):
+    """Unit files that are in `paths` or that systemd currently resolves to run one of them."""
     wanted = set(paths) | {os.path.realpath(p) for p in paths}
-    found = set()
-    for path in scan_unowned.list_files(unit_dirs):
-        if not path.endswith(".service"):
-            continue
-        if path in wanted:
-            found.add(path)
-            continue
-        try:
-            if any(t in wanted or os.path.realpath(t) in wanted for t in scan_unowned.exec_target(read(path))):
-                found.add(path)
-        except OSError:
-            pass
-    return sorted(found)
+    if loaded is None:
+        loaded, _ = scan_unowned.loaded_units()
+    return sorted(unit for unit, binaries in loaded.items()
+                  if unit in wanted or any(t in wanted or os.path.realpath(t) in wanted for t in binaries))
 
 
 def pids_for(paths, running=None):
