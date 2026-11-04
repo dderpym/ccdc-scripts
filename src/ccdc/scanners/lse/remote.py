@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the vendored LSE on this host; stdout is one JSON object, even on failure.
 
-The pinned lse.sh ships inside the bundle; --script overrides it with a local file, never a URL. --deep expands the allowlist.
+The pinned lse.sh ships beside this script in the archive; --script overrides it with a local file, never a URL. --deep expands the allowlist.
 Passive supplemental permission/kernel checks share the same finding contract.
 Findings are review candidates relative to the invoking user's permissions.
 The repository's expected oski passwordless sudo stays in raw evidence only.
@@ -9,7 +9,6 @@ raw retains complete scanner output; only normalized findings reach the terminal
 """
 import argparse
 import contextlib
-import importlib.resources
 import json
 import os
 from pathlib import Path
@@ -22,7 +21,9 @@ import shutil
 import subprocess
 import tempfile
 
-from host import kernel_risks, lse_extras, lse_host_risks
+import kernel_risks
+import lse_extras
+import lse_host_risks
 
 # Only these tests become findings. Dependencies run but are never inventory.
 # Values: minimum scan profile (0=normal, 1=deep), severity, stable summary.
@@ -348,7 +349,7 @@ def scan_lse(script, deep=False, only=None):
 
 
 def supplemental_scan(raw, deep=False, capability_status=None):
-    """Helpers ship in the same bundle; never import scanner code from the target PATH."""
+    """Helpers ship in the same archive; never import scanner code from the target PATH."""
     states = []
     for name, helper, args in (
             ('lse_extras', lse_extras.scan, (raw, capability_status)),
@@ -386,16 +387,17 @@ def scan(script, deep=False, only=None):
 
 @contextlib.contextmanager
 def bundled_script():
-    """The pinned lse.sh as a private file; /bin/sh runs it, so no exec bit is needed."""
+    """The pinned lse.sh shipped beside the helper modules, as a private file; /bin/sh runs it, so no exec bit is needed."""
+    source = Path(kernel_risks.__file__).resolve().with_name("lse.sh")
     with tempfile.TemporaryDirectory(prefix="ccdc-lse-pin-") as directory:
         path = Path(directory) / "lse.sh"
-        path.write_bytes(importlib.resources.files("host").joinpath("data/lse.sh").read_bytes())
+        path.write_bytes(source.read_bytes())
         yield path
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--script", help="path to a local lse.sh (default: the pinned copy in the bundle)")
+    parser.add_argument("--script", help="path to a local lse.sh (default: the pinned copy shipped with this script)")
     parser.add_argument("--deep", action="store_true", help="include actionable level-1 checks")
     parser.add_argument("--only", help="comma-separated finding ids; run just those checks")
     parser.add_argument("--user", help="unprivileged account to assess when started as root (default SUDO_USER)")

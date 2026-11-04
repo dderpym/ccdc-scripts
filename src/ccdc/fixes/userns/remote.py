@@ -3,13 +3,13 @@
 import json
 import sys
 
-from host import apply_fixes
+import sysctls
 
 
 def main(argv=None):
     names = sys.argv[1:] if argv is None else argv
     try:
-        apply_fixes.apply_sysctl({"kind": "sysctl", "settings": dict.fromkeys(names, "0")})
+        sysctls.apply_sysctl({"kind": "sysctl", "settings": dict.fromkeys(names, "0")})
     except (OSError, ValueError, KeyError) as exc:
         print(json.dumps({"error": str(exc)}))
         return 1

@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 import stat
 
-from host.kernel_risks import read_regular as _read_regular
+from kernel_risks import read_regular as _read_regular
 
 RUNTIME_PATHS = (
     "docker.sock", "docker.socket", "cri-dockerd.sock", "dockershim.sock",
