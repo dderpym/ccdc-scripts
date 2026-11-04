@@ -12,12 +12,21 @@ from ruamel.yaml.comments import CommentedMap, CommentedSeq
 
 from ccdc.runner import ROOT
 
-INVENTORY = ROOT / "inventory.yml"
 BACKUPS = ROOT / "state" / "backups"
 
 
 class InventoryError(RuntimeError):
     pass
+
+
+def inventory_path():
+    """The inventory file ccdcctl is using: ANSIBLE_INVENTORY if it names one file, else ./inventory.yml."""
+    chosen = os.environ.get("ANSIBLE_INVENTORY")
+    if not chosen:
+        return ROOT / "inventory.yml"
+    if "," in chosen or not Path(chosen).is_file():
+        raise InventoryError(f"cannot write approvals: ANSIBLE_INVENTORY={chosen!r} is not a single inventory file")
+    return Path(chosen).resolve()
 
 
 def _round_trip():
@@ -50,14 +59,14 @@ def _service(item):
     return flow
 
 
-def set_services(host, services, path=INVENTORY, backups=BACKUPS):
+def set_services(host, services, path=None, backups=BACKUPS):
     """Replace host's `services:` list with `services` ([{port, proto, name}, ...]).
 
     Every comment and the file's ordering survive. The new text is parsed again and must
     equal the old data apart from this one key, otherwise nothing is written.
     Returns True when the file changed.
     """
-    path = Path(path)
+    path = Path(path) if path else inventory_path()
     original = path.read_text()
     rt = _round_trip()
     document = rt.load(original)

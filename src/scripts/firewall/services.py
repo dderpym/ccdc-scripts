@@ -1,5 +1,5 @@
 """Firewall phase: find what a host exposes, let a human approve it, record it in inventory.yml."""
-from ccdc.inventory_edit import INVENTORY, set_services
+from ccdc.inventory_edit import set_services
 from ccdc.script import HostScript
 from ccdc.services import declared, exposed
 from scripts.firewall.discover import DiscoverListeners
@@ -13,7 +13,7 @@ class DiscoverServices(DiscoverListeners):
 
 
 class ApproveServices(HostScript):
-    """run(target, ask=input, out=print, inventory=INVENTORY): review each unapproved listener.
+    """run(target, ask=input, out=print, inventory=None): review each unapproved listener.
 
     Approved services are written back to inventory.yml under the host as
     `services: [{port, proto, name}]`; approved ones that no longer listen are offered for removal.
@@ -23,7 +23,7 @@ class ApproveServices(HostScript):
     def __init__(self, runner=None):
         self.discover = DiscoverServices(runner)
 
-    def run(self, target, ask=input, out=print, inventory=INVENTORY):
+    def run(self, target, ask=input, out=print, inventory=None):
         live = self.discover.run(target)
         current = declared(target.vars) or []
         approved = {(proto, port): name for proto, port, name in current}

@@ -24,7 +24,7 @@ def collect(script, hosts, run=None, payload=None, **kwargs):
     with tempfile.TemporaryDirectory(prefix="ccdc-archive-") as directory:
         path = Path(directory) / "bundle.pyz"
         archive.build([step], path, keep_going=True)
-        envelopes, errors = runner.collect(hosts, None, (), None, run=run or runner.run_ansible, archive=path,
+        envelopes, errors = runner.collect(hosts, path, run=run or runner.run_ansible,
                                            become=script.become, connection=script.connection, payload=payload)
     states = {}
     for host, envelope in envelopes.items():
