@@ -43,7 +43,12 @@ class ScanResult(list):
 
 
 class Scanner(Script):
-    """Claims not to affect the server, so it is safe to run as often as wanted."""
+    """Claims not to affect the server, so it is safe to run as often as wanted.
+
+    Set `cheap = True` on scanners that are fast and light enough to poll every few
+    seconds (respawn guard fast-poll runs only those).
+    """
+    cheap = False
 
     def scan(self, target):
         raise NotImplementedError

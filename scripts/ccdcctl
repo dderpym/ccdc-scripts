@@ -931,12 +931,12 @@ def scan_command(args):
     if args.fix:
         def approve(finding, text):
             return args.fix == "all" or ask(f"\n{finding.host}: {text}\n  Apply? [y/N]", ["y", "n"], "n") == "y"
+        fixed = {}
         for target, (findings, _) in results.items():
-            scanning.apply_fixes(findings, autofix, approve)
-        if args.wait:
-            time.sleep(args.wait)
-        print("\nRescanning to verify fixes" + (f" after {args.wait}s" if args.wait else "") + "...")
-        bad = scanning.report(scanning.scan_all(targets, scanners), autofix)
+            fixed[target] = [f for f, ok, _ in scanning.apply_fixes(findings, autofix, approve) if ok]
+        from ccdc import respawn
+        print(f"\nWaiting {respawn.settle_time([], args.wait)}s, then rescanning for respawned artifacts...")
+        bad = respawn.render(respawn.verify_all(results, scanners, fixed, wait=args.wait))
     return bad
 
 
