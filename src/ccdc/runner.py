@@ -8,6 +8,7 @@ import tempfile
 
 from controller import remote
 
+VERBOSE = False  # set by ccdcctl --verbose: full Ansible logs instead of the progress UI
 ROOT = Path(__file__).resolve().parents[2]
 ANSIBLE = Path(__file__).resolve().parent / "ansible"
 PLAYBOOKS = ANSIBLE / "playbooks"
@@ -17,7 +18,8 @@ def extra_args():
     return shlex.split(os.environ.get("ANSIBLE_ARGS", ""))
 
 
-def run_ansible(args, capture=True, result_dir=None, result_task=None, verbose=False):
+def run_ansible(args, capture=True, result_dir=None, result_task=None, verbose=None):
+    verbose = VERBOSE if verbose is None else verbose
     env = dict(os.environ, ANSIBLE_CONFIG=str(ANSIBLE / "ansible.cfg"), ANSIBLE_NOCOLOR="1")
     if not capture and not verbose:
         env.update(ANSIBLE_STDOUT_CALLBACK="ccdc_progress", ANSIBLE_LOAD_CALLBACK_PLUGINS="1",
@@ -90,17 +92,32 @@ class RemoteError(RuntimeError):
 
 
 class AnsibleRunner:
-    """Runs bundle entries and playbooks on one Target. Tests substitute a fake."""
+    """Runs bundle entries and playbooks on one Target. Tests substitute a fake.
+
+    Target.host is passed to --limit, so it may be a pattern such as 'all' or 'a:b'.
+    """
 
     def entry(self, target, entry, args=(), **request):
+        """Captured run of a bundle entry; returns its parsed JSON stdout."""
         states, errors = collect([target.host], entry, args, target.auth.variables(), **request)
         if target.host in errors:
             raise RemoteError(f"{target.host}: {errors[target.host]}")
         return states[target.host]
 
+    def act(self, target, entry, args=(), **request):
+        """Live (progress UI) run of a mutating bundle entry; True when Ansible succeeded."""
+        command = ["ansible-playbook", str(PLAYBOOKS / "remote.yml"), "--limit", target.host, *extra_args(),
+                   "--extra-vars", remote.request(entry, args, **request)]
+        return self._live(command, target.auth.variables()).returncode == 0
+
     def playbook(self, target, name, variables=None):
         command = ["ansible-playbook", str(PLAYBOOKS / f"{name}.yml"), "--limit", target.host, *extra_args()]
-        result = with_vars(command, {**target.auth.variables(), **(variables or {})}, capture=False)
-        if result.returncode:
-            raise RemoteError(f"{target.host}: playbook {name} failed")
-        return True
+        if not self._live(command, {**target.auth.variables(), **(variables or {})}).returncode:
+            return True
+        raise RemoteError(f"{target.host}: playbook {name} failed")
+
+    @staticmethod
+    def _live(command, variables):
+        if variables:
+            return with_vars(command, variables, capture=False)
+        return run_ansible(command, capture=False)

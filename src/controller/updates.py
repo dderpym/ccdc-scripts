@@ -32,8 +32,8 @@ def call_host(ctl, host, action, **fields):
             json.dump(document, out)
             out.flush()
             result = ctl.run(["ansible-playbook", str(ctl.runner.PLAYBOOKS / "remote.yml"), "--limit", host, *ctl.EXTRA,
-                              "--extra-vars", ctl.remote.request("manage_updates", payload=out.name)],
-                             result_dir=directory, result_task=ctl.remote.TASK)
+                              "--extra-vars", ctl.runner.remote.request("manage_updates", payload=out.name)],
+                             result_dir=directory, result_task=ctl.runner.remote.TASK)
         if getattr(ctl, "VERBOSE", False):
             print(ctl.terminal(result.stdout + result.stderr))
         try:

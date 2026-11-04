@@ -34,7 +34,18 @@ class PasswordAuth(Auth):
 
 
 @dataclass(frozen=True)
+class SudoAuth(Auth):
+    """Key login as `user`, then sudo to root with no passwords (a rerun after hardening)."""
+    user: str = "oski"
+
+    def variables(self):
+        return {"ansible_user": self.user, "ansible_become_method": "sudo", "ansible_become_user": "root",
+                "ansible_password": "", "ansible_ssh_pass": "", "ansible_become_password": ""}
+
+
+@dataclass(frozen=True)
 class Target:
+    """A host name, or any Ansible --limit pattern ('all', 'a:b') for scripts that fan out."""
     host: str
     auth: Auth = field(default_factory=AgentAuth)
 

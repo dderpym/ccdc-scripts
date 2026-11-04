@@ -21,6 +21,8 @@ class BundleScript(AnsibleScript):
     """Runs one entry of the host bundle (host/<entry>.py) and returns its parsed JSON."""
     entry = None
     become = True
+    live = False  # True: mutating entry run with the progress UI; run() returns success as a bool
+    connection = False  # hand the entry this login's SSH_CONNECTION (sudo hides it)
 
     def arguments(self, **kwargs):
         return []
@@ -28,8 +30,13 @@ class BundleScript(AnsibleScript):
     def parse(self, document, **kwargs):
         return document
 
-    def run(self, target, **kwargs):
-        document = self.runner.entry(target, self.entry, self.arguments(**kwargs), become=self.become)
+    def run(self, target, payload=None, **kwargs):
+        """payload: controller file delivered to the entry as stdin."""
+        args = self.arguments(**kwargs)
+        if self.live:
+            return self.runner.act(target, self.entry, args, become=self.become,
+                                   connection=self.connection, payload=payload)
+        document = self.runner.entry(target, self.entry, args, become=self.become, payload=payload)
         return self.parse(document, **kwargs)
 
 

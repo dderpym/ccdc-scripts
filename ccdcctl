@@ -19,14 +19,19 @@ ROOT = Path(__file__).resolve().parent
 STATE = ROOT / "state"
 sys.path.insert(0, str(ROOT / "src"))
 from ccdc import runner  # noqa: E402
-from controller import remote  # noqa: E402
+from ccdc.runner import RemoteError  # noqa: E402
+from ccdc.target import PasswordAuth, SudoAuth, Target  # noqa: E402
+from scripts.firewall.apply import ApplyFirewall, RestoreFirewall  # noqa: E402
+from scripts.firewall.tools import PrepareNetworkTools  # noqa: E402
+from scripts.init.bootstrap import HostKeys, Init  # noqa: E402
+from scripts.ssh.apply import ApplySSH  # noqa: E402
 
 EXTRA = shlex.split(os.environ.get("ANSIBLE_ARGS", ""))
 VERBOSE = False
 
 
 def run(args, capture=True, result_dir=None, result_task=None):
-    return runner.run_ansible(args, capture, result_dir, result_task, verbose=VERBOSE)
+    return runner.run_ansible(args, capture, result_dir, result_task)
 
 
 def inventory():
@@ -61,27 +66,13 @@ def collect(kind, hosts, args=()):
     return runner.collect(hosts, "discover_" + kind, args, run=run)
 
 
-def run_with_vars(args, variables, capture=True, result_dir=None):
-    # Passwords must never appear in argv, shell history, or Ansible console logs.
-    with tempfile.NamedTemporaryFile(mode="w", prefix="ccdc-vars-", suffix=".json") as out:
-        json.dump(variables, out)
-        out.flush()
-        os.fsync(out.fileno())
-        return run([*args, "--extra-vars", "@" + out.name], capture=capture, result_dir=result_dir)
-
-
-def playbook(name, host="all", variables=None):
-    args = ["ansible-playbook", f"{runner.PLAYBOOKS}/{name}.yml", "--limit", host, *EXTRA]
-    result = run(args, capture=False) if variables is None else run_with_vars(args, variables, capture=False)
-    return result.returncode == 0
-
-
-def act(host, entry, args=(), connection=True, payload=None):
-    """Run one mutating host script with live progress; True when it succeeded."""
-    result = run(["ansible-playbook", str(runner.PLAYBOOKS / "remote.yml"), "--limit", host, *EXTRA,
-                  "--extra-vars", remote.request(entry, args, connection=connection, payload=payload)],
-                 capture=False)
-    return result.returncode == 0
+def succeeded(script, target, **arguments):
+    """Run a playbook script on `target` (host name, --limit pattern or Target); True when it succeeded."""
+    try:
+        script.run(Target(target) if isinstance(target, str) else target, **arguments)
+        return True
+    except RemoteError:
+        return False
 
 
 def text_file(path, text):
@@ -116,19 +107,11 @@ def read_secret(path):
     return password
 
 
-def root_login_vars(password):
-    return {"ansible_user": "root", "ansible_become": False,
-            "ansible_password": password, "ansible_ssh_pass": password,
-            "ansible_ssh_args": "-o ControlMaster=no -o ControlPath=none "
-            "-o ForwardAgent=no -o PreferredAuthentications=password -o PubkeyAuthentication=no "
-            "-o KbdInteractiveAuthentication=no"}
-
-
 def probe_root(host, password):
     # Authentication only: no Python, sudo, package installation, or account changes.
     with tempfile.TemporaryDirectory(prefix="ccdc-auth-") as directory:
         args = ["ansible", "all", "--limit", host, "-m", "ansible.builtin.raw", "-a", "true", *EXTRA]
-        result = run_with_vars(args, root_login_vars(password), result_dir=directory)
+        result = runner.with_vars(args, PasswordAuth("root", password).variables(), run=run, result_dir=directory)
         try:
             response = json.loads((Path(directory) / host).read_text())
         except (OSError, ValueError):
@@ -147,10 +130,10 @@ def initialize(hosts, target, password_file=None, save_bootstrap=False, use_save
         raise RuntimeError('--no-bootstrap-password cannot be combined with a password-file/save option')
     if replace_host_keys:
         print('WARNING: replacing saved host keys for selected endpoints; trusting current keys without independent verification.')
-        if not playbook('host-keys', target, {'replace_host_keys': True}):
+        if not succeeded(HostKeys(), target, replace_host_keys=True):
             return True
     if not use_saved:
-        return not playbook('init', target)
+        return not succeeded(Init(), target)
     path = Path(password_file).expanduser().absolute() if password_file else ROOT / 'secrets/bootstrap.password'
     if save_bootstrap:
         if path.exists() and path.read_text().startswith('$ANSIBLE_VAULT;'):
@@ -164,7 +147,7 @@ def initialize(hosts, target, password_file=None, save_bootstrap=False, use_save
         print(f'Saved bootstrap credential: {path}')
     if not path.exists() and password_file is None:
         # Existing key/admin/-k workflows remain available without automatic retries.
-        return not playbook('init', target)
+        return not succeeded(Init(), target)
     if any(flag in EXTRA for flag in ('-k', '--ask-pass', '-K', '--ask-become-pass')):
         raise RuntimeError('Saved-root bootstrap handles prompts itself; remove Ansible password-prompt flags')
     key = run(['ssh-keygen', '-l', '-f', str(ROOT / 'secrets/oski.pub')])
@@ -183,9 +166,7 @@ def initialize(hosts, target, password_file=None, save_bootstrap=False, use_save
                 # Reinitialization after hardening must not depend on root SSH.
                 # Use the playbook's become: true, not a global extra-var:
                 # extra-vars would also force sudo on controller delegates.
-                variables = {"ansible_user": "oski", "ansible_become_method": "sudo",
-                             "ansible_become_user": "root", "ansible_password": "",
-                             "ansible_ssh_pass": "", "ansible_become_password": ""}
+                auth = SudoAuth()
             else:
                 # Explicit bootstrap options override stale recovery state;
                 # ordinary reruns retain one saved per-host password attempt.
@@ -204,8 +185,8 @@ def initialize(hosts, target, password_file=None, save_bootstrap=False, use_save
                 if not success:
                     results.append((host, 'FAILED - ' + error))
                     continue
-                variables = root_login_vars(password)
-            success = playbook('init', host, variables)
+                auth = PasswordAuth("root", password)
+            success = succeeded(Init(), Target(host, auth))
             results.append((host, 'OK - root credential saved' if success else 'FAILED - inspect playbook output; saved credential may be pending'))
         except (RuntimeError, OSError) as exc:
             results.append((host, 'FAILED - ' + str(exc)))
@@ -359,7 +340,7 @@ def configure_ssh(hosts):
         if not verify_admin_access(host):
             summary.append((host, "unchanged", "unchanged", "FAILED"))
             continue
-        success = act(host, "apply_ssh", ["yes" if enabled else "no"])
+        success = ApplySSH().run(Target(host), enabled=enabled)
         states, errors = collect("ssh", [host])
         if not errors:
             show_state("ssh", states[host], "Observed SSH after apply")
@@ -437,7 +418,7 @@ def policy_text(policies):
 
 def configure_firewall(hosts):
     print("Preparing missing networking tools with Ansible; no firewall policy is applied yet.")
-    if not playbook("network-tools", ":".join(hosts)):
+    if not succeeded(PrepareNetworkTools(), ":".join(hosts)):
         return True
     print("Default: ALLOW tcp/22, loopback, established/related and essential IPv6 ICMP; BLOCK other unsolicited inbound.")
     print("nft replaces ALL tables atomically (unsafe NAT/forward/output is refused); iptables overrides INPUT.")
@@ -537,8 +518,7 @@ def configure_firewall(hosts):
             continue
         path = STATE / "reports/rollback" / host / "firewall.json"
         save(path, snapshots[host])
-        success = act(host, "discover_firewall",
-                      ["--apply", json.dumps({"tcp": policy["tcp"], "udp": policy["udp"]})])
+        success = ApplyFirewall().run(Target(host), tcp=policy["tcp"], udp=policy["udp"])
         observed, failure = collect("firewall", [host])
         if failure:
             problems(failure)
@@ -571,7 +551,7 @@ def rollback(hosts):
             print(f"{host}: FAILED - no controller rollback snapshot")
             continue
         print(f"{host}: restoring {path.relative_to(ROOT)}")
-        results.append((host, act(host, "discover_firewall", ["--restore", "-"], payload=path)))
+        results.append((host, RestoreFirewall().run(Target(host), payload=path)))
     print("\nROLLBACK SUMMARY")
     for host, success in results:
         print(f"{host:20} {'OK' if success else 'FAILED'}")
@@ -731,7 +711,7 @@ def offer_fixes(host, state, auto=None):
     with tempfile.NamedTemporaryFile(mode="w", prefix="ccdc-fixes-", suffix=".json") as out:
         json.dump(approved, out)
         out.flush()
-        success = act(host, "apply_fixes", connection=False, payload=out.name)
+        success = runner.AnsibleRunner().act(Target(host), "apply_fixes", connection=False, payload=out.name)
     print(("Applied " if success else "Some fixes FAILED on ") + f"{host}; re-run the scan to verify.")
 
 
@@ -947,7 +927,7 @@ def main():
     global VERBOSE
     parser = argument_parser()
     args = parser.parse_args()
-    VERBOSE = args.verbose
+    VERBOSE = runner.VERBOSE = args.verbose
     if args.command in ("ssh", "firewall") and args.json and args.action != "status":
         parser.error("--json is only available for status")
     if args.command == "complete":
