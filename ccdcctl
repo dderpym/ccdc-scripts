@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Inventory-wide controller. Ansible owns transport; host scripts own state."""
 import argparse
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 import difflib
 import getpass
 import json
@@ -16,7 +15,7 @@ import sys
 import tempfile
 import time
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent
 STATE = ROOT / "state"
 sys.path.insert(0, str(ROOT / "src"))
 from ccdc import runner  # noqa: E402
@@ -549,7 +548,7 @@ def configure_firewall(hosts):
         if success:
             success = verify_admin_access(host)
         if success:
-            # The state just applied and verified becomes the monitor's baseline.
+            # The state just applied and verified becomes the baseline.
             try:
                 save(STATE / "baselines" / host / "firewall.json", observed[host])
                 print(f"{host}: accepted firewall baseline")
@@ -612,7 +611,6 @@ def drift(expected, observed):
 
 
 SCANNERS = ("integrity", "lse")
-POLL_INTERVALS = {"ssh": 10, "firewall": 10, "integrity": 60, "lse": 180}
 SEVERITIES = {"critical": 0, "warning": 1, "review": 2}
 
 
@@ -779,147 +777,6 @@ def security_status(kind, hosts, deep=False, auto=None):
     return active
 
 
-def monitor_poll(kind, hosts):
-    try:
-        return scan(kind, hosts) if kind in SCANNERS else collect(kind, hosts)
-    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError) as exc:
-        return {}, {host: str(exc) for host in hosts}
-
-
-def monitor_events(previous, kind, hosts, states, errors):
-    """Temporary alert deduplication; never trusted security state."""
-    events = []
-    for host in hosts:
-        key = (host, kind)
-        old = previous.get(key, {"findings": {}, "error": ""})
-        error = errors.get(host, "")
-        findings = {}
-        incomplete = set()
-        if not error:
-            state = states.get(host)
-            if state is None:
-                error = "No scanner result"
-            elif kind in SCANNERS:
-                error = "; ".join(state.get("errors", []))
-                incomplete = set(state.get("incomplete_ids", []))
-                for finding in state["findings"]:
-                    # LSE groups independent contexts under each stable test ID.
-                    identity = (finding["id"], finding.get("path", ""))
-                    findings[identity] = finding
-            else:
-                try:
-                    expected = json.loads((STATE / "baselines" / host / f"{kind}.json").read_text())
-                    if kind == "ssh":
-                        expected, state = ssh_policy(expected), ssh_policy(state)
-                    if state != expected:
-                        findings[("drift",)] = {"severity": "critical", "summary": "drift\n" + drift(expected, state)}
-                except (OSError, ValueError) as exc:
-                    error = "missing/invalid baseline: " + str(exc)
-        if error and error != old["error"]:
-            events.append(("WARNING", host, kind, "scanner/connectivity failure: " + error))
-        elif not error and old["error"]:
-            events.append(("RESOLVED", host, kind, "scanner/connectivity recovered"))
-        for identity, finding in findings.items():
-            if finding != old["findings"].get(identity):
-                change = "CHANGED" if identity in old["findings"] else "NEW"
-                label = finding.get("path") or finding.get("id", "")
-                details = "".join(f"\n    {field}: {terminal(finding[field])[:1000]}" for field in ("expected", "observed", "context") if field in finding)
-                events.append((finding["severity"].upper(), host, kind, f"{change}: {label} {finding['summary']}{details}"))
-        if not error:
-            for identity, finding in old["findings"].items():
-                if identity not in findings and finding.get("id") in incomplete:
-                    findings[identity] = finding
-                    continue
-                if identity not in findings:
-                    label = finding.get("path") or finding.get("id", "policy")
-                    resolution = (f"{label}: {finding['summary']} no longer detected" if kind in SCANNERS
-                                  else f"{label} policy matches expected state")
-                    events.append(("RESOLVED", host, kind, resolution))
-        else:
-            # Failed/partial scans cannot establish that a previous finding was fixed.
-            findings = {**old["findings"], **findings}
-        previous[key] = {"findings": findings, "error": error}
-    return events
-
-
-def emit_monitor_events(events):
-    batches = {}
-    for event in events:
-        batches.setdefault((event[1], event[2]), []).append(event)
-    for (host, kind), batch in batches.items():
-        batch.sort(key=lambda event: SEVERITIES.get(event[0].lower(), 3))
-        notices = [e for e in batch if "scanner/connectivity" in e[3] or e[0] == "RESOLVED"]
-        findings = [e for e in batch if e not in notices]
-        for severity, _, _, message in notices + findings[:40]:
-            rendered = terminal(message)
-            if kind in SCANNERS and len(rendered) > 4096:
-                rendered = rendered[:4096] + " ... (full evidence in report)"
-            print(f"[{time.strftime('%H:%M:%S')}] {severity} {host} {kind.upper()}\n" + rendered, flush=True)
-        if len(findings) > 40:
-            print(f"[{time.strftime('%H:%M:%S')}] WARNING {host} {kind.upper()}\n"
-                  f"{len(findings) - 40} additional finding events; inspect current status/reports.", flush=True)
-
-
-def polling_intervals(kinds, hosts, variables, override=None):
-    result = {}
-    for kind in kinds:
-        for host in hosts:
-            value = override if override is not None else variables.get(host, {}).get(kind + "_poll_interval", POLL_INTERVALS[kind])
-            seconds = float(value)
-            if not 5 <= seconds <= 86400:
-                raise ValueError(f"{host}: {kind}_poll_interval must be 5..86400 seconds")
-            result[(host, kind)] = seconds
-    return result
-
-
-def monitor(kinds, target, interval=None, once=False):
-    hosts, variables = select(target)
-    intervals = polling_intervals(kinds, hosts, variables, interval)
-    print(f"Monitoring {len(hosts)} hosts", flush=True)
-    for kind in kinds:
-        values = sorted({intervals[(host, kind)] for host in hosts})
-        print(f"{kind.upper():10} {','.join(f'{v:g}s' for v in values)}", flush=True)
-    previous, pending, due, completed = {}, {}, {}, set()
-    refresh = time.monotonic() + 10
-    executor = ThreadPoolExecutor(max_workers=len(kinds))
-    try:
-        while True:
-            now = time.monotonic()
-            if not once and now >= refresh:
-                hosts, variables = select(target)
-                intervals = polling_intervals(kinds, hosts, variables, interval)
-                refresh = now + 10
-                previous = {key: value for key, value in previous.items() if key[0] in hosts}
-            for kind in kinds:
-                if kind in pending or (once and kind in completed):
-                    continue
-                ready = [host for host in hosts if due.get((host, kind), 0) <= now]
-                if ready:
-                    pending[kind] = (executor.submit(monitor_poll, kind, ready), ready)
-                    for host in ready:
-                        due[(host, kind)] = now + intervals[(host, kind)]
-            if once and len(completed) == len(kinds):
-                return any(item["error"] or item["findings"] for item in previous.values())
-            wake = [refresh] if not once else []
-            wake += [due.get((host, kind), now) for kind in kinds if kind not in pending and not (once and kind in completed) for host in hosts]
-            timeout = max(0, min(wake) - time.monotonic()) if wake else None
-            futures = [future for future, _ in pending.values()]
-            if futures:
-                done, _ = wait(futures, timeout=timeout, return_when=FIRST_COMPLETED)
-            else:
-                time.sleep(timeout if timeout is not None else 1)
-                done = set()
-            for kind, (future, batch) in list(pending.items()):
-                if future not in done:
-                    continue
-                states, errors = future.result()
-                emit_monitor_events(monitor_events(previous, kind, batch, states, errors))
-                completed.add(kind)
-                del pending[kind]
-    finally:
-        executor.shutdown(wait=True, cancel_futures=True)
-
-
 def scan_command(args):
     from ccdc import registry, scan as scanning
     from ccdc.target import Target
@@ -967,7 +824,7 @@ def argument_parser():
         cmd = sub.add_parser(command, help="current security findings, no baseline; offers fixes for fixable findings on a terminal")
         cmd.add_argument("action_or_target", nargs="?", default="status", metavar="[status|HOST]")
         cmd.add_argument("target", nargs="?", help="inventory hostname (after status)")
-        cmd.add_argument("--deep", action="store_true", help="manual deeper scan; never used by monitor")
+        cmd.add_argument("--deep", action="store_true", help="manual deeper scan")
         cmd.add_argument("--auto-apply", choices=["simple", "all"],
                          help="apply fixes without prompting: simple = permission-mode only, all = also ownership; "
                               "without it, fixes are offered interactively on a terminal")
@@ -977,11 +834,6 @@ def argument_parser():
                      help="apply autofixes: ask per fix (default when given) or all without asking")
     cmd.add_argument("--wait", type=int, default=0, metavar="SECONDS",
                      help="after fixing, wait then rescan to catch re-planted artifacts")
-    cmd = sub.add_parser("monitor")
-    cmd.add_argument("kind", nargs="?", choices=list(POLL_INTERVALS))
-    cmd.add_argument("--host", default="all")
-    cmd.add_argument("--interval", type=int, default=None, help="override all selected module intervals; otherwise use inventory/defaults")
-    cmd.add_argument("--once", action="store_true", help="one poll, nonzero if alerts (debugging)")
     cmd = sub.add_parser("complete", help="emit candidates for Bash complete -C")
     cmd.add_argument("words", nargs=argparse.REMAINDER, help="Bash supplies command, current word, previous word")
     for command, child in sub.choices.items():
@@ -1012,14 +864,10 @@ def complete(parser, words):
         return
     before = before[before.index(invoked) + 1:]
     name = Path(invoked).name
-    if name in ("manage", "check-lab"):
+    if name in ("manage", "check"):
         # Load only known repository scripts, never a path from the command line.
-        path = ROOT / ("lab/manage" if name == "manage" else "scripts/check-lab")
+        path = ROOT / ("lab/manage" if name == "manage" else "lab/check")
         parser = runpy.run_path(str(path))["argument_parser"]()
-    elif name in ("ssh-monitor", "firewall-monitor"):
-        parser = next(action.choices["monitor"] for action in parser._actions
-                      if isinstance(action, argparse._SubParsersAction))
-        before.insert(0, name.removesuffix("-monitor"))
     commands = next((action.choices for action in parser._actions
                      if isinstance(action, argparse._SubParsersAction)), {})
     while before and any(before[0] in action.option_strings and action.nargs == 0
@@ -1035,9 +883,12 @@ def complete(parser, words):
     options = {option: action for action in actions for option in action.option_strings}
     if previous in options and options[previous].nargs != 0:
         # No output means Bash's -o default handles filenames itself.
-        if previous != "--host":
+        if previous == "--fix":
+            choices = ["ask", "all"]
+        elif previous != "--host":
             return
-        choices = ["hosts"]
+        else:
+            choices = ["hosts"]
     else:
         positional = []
         skip = False
@@ -1088,10 +939,6 @@ def main():
         return complete(parser, args.words)
     if args.command == "scan":
         return scan_command(args)
-    if args.command == "monitor":
-        if args.interval is not None and args.interval < 5:
-            parser.error("--interval must be at least 5 seconds")
-        return monitor([args.kind] if args.kind else list(POLL_INTERVALS), args.host, args.interval, args.once)
     if args.command in SCANNERS:
         if args.action_or_target == "baseline":
             parser.error(f"{args.command} has no baseline acceptance")
@@ -1102,7 +949,7 @@ def main():
         return security_status(args.command, hosts, args.deep, args.auto_apply)
     hosts, variables = select(args.target)
     if args.command == "update":
-        updates = runpy.run_path(str(ROOT / "scripts/update-controller.py"))["updates"]
+        updates = runpy.run_path(str(ROOT / "src/controller/updates.py"))["updates"]
         return updates(globals(), args.action, hosts, variables, args.yes)
     if args.command == "init":
         return initialize(hosts, args.target, args.bootstrap_password_file, args.save_bootstrap_password,
