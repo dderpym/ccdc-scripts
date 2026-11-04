@@ -164,6 +164,20 @@ def team_keys(path=TEAM_KEYS):
         return ()
 
 
+def declared_policy(variables):
+    """Inventory `ssh:` (defaults) overlaid with `ssh_overrides:` (per group/host).
+
+    Ansible replaces a whole mapping when a host redefines it, so overrides live in their
+    own variable and are merged here. An override of null stops checking that setting.
+    """
+    merged = {}
+    for name in ("ssh", "ssh_overrides"):
+        block = variables.get(name)
+        if isinstance(block, dict):
+            merged.update({str(k).lower(): v for k, v in block.items()})
+    return {k: v for k, v in merged.items() if v is not None}
+
+
 class SSHVectorScanner(BundleScanner):
     entry = "scan_ssh_vectors"
 
@@ -175,9 +189,9 @@ class SSHVectorScanner(BundleScanner):
     def arguments(self, target=None, **kwargs):
         allow = self.allowlist.get(getattr(target, "host", None), SSHAllow())
         args = []
-        policy = (getattr(target, "vars", None) or {}).get("ssh")
-        if isinstance(policy, dict) and policy:
-            args += ["--policy", json.dumps({str(k).lower(): yaml_text(v) for k, v in policy.items()}, sort_keys=True)]
+        policy = declared_policy(getattr(target, "vars", None) or {})
+        if policy:
+            args += ["--policy", json.dumps({k: yaml_text(v) for k, v in policy.items()}, sort_keys=True)]
         for key in (*self.keys, *allow.keys):
             args += ["--allow-key", key]
         for option in allow.options:

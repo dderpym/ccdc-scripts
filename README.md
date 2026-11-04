@@ -62,9 +62,9 @@ Aliases such as `web01` are how you target individual hosts. Use letters, number
 Do **not** set `ansible_user: root` for the normal workflow: bootstrap selects
 root itself, and subsequent commands use `oski`.
 
-The same file declares the **sshd policy** the scanner enforces, as an `ssh:` mapping
-of `sshd -T` option names (lowercase) to expected values, set under `all.vars` and
-overridable per group or host:
+The same file holds the **SSH scan settings**: `ssh:` under `all.vars` lists the
+defaults (`sshd -T` option names in lowercase, with the value each should have), and
+`ssh_overrides:` on a group or host changes just the lines it names:
 
 ```yaml
 all:
@@ -72,11 +72,14 @@ all:
     ssh: {permitrootlogin: "no", passwordauthentication: "no", maxauthtries: 3}
   hosts:
     web01:
-      ssh: {passwordauthentication: "yes"}   # scored service logs in with passwords
+      ssh_overrides:
+        passwordauthentication: "yes"   # scored service logs in with passwords
+        maxauthtries: null              # null = stop checking this setting here
 ```
 
-Quote `"yes"`/`"no"`. Nothing is a built-in policy: unlisted options are not checked,
-and a host with no `ssh:` policy is reported as unchecked.
+Quote `"yes"`/`"no"`. Nothing is built in: options you leave out are not checked, and a
+host with no `ssh:` settings at all is reported as unchecked. Use `ssh_overrides`, not
+a second `ssh:` on the host, which would replace all the defaults.
 
 Keep the team's **private key outside the repository**. Copy its matching public
 key into the one configured public-key source:

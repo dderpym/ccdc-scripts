@@ -1,11 +1,19 @@
 all:
   vars:
-    # Declared sshd policy, checked by `ccdcctl scan` against the EFFECTIVE `sshd -T` values
-    # (Match blocks included). Names are exactly what `sshd -T` prints, in lowercase.
-    # Exact match, except maxauthtries/logingracetime/clientalivecountmax (declared value
-    # is a maximum) and clientaliveinterval (deviates only if 0). Override per group/host,
-    # e.g. a scored host that must take passwords: ssh: {passwordauthentication: "yes"}.
-    # Omit an option to leave it unchecked; omit `ssh` entirely and scan reports it.
+    # SSH scan settings. `ccdcctl scan` compares each host's real SSH configuration to the
+    # values below and reports anything that differs (`scan --fix` can correct it).
+    # These are the defaults for every host. Leave a line out to stop checking that setting.
+    #
+    # Numbers are limits: maxauthtries, logingracetime and clientalivecountmax must be at
+    # or below the value; clientaliveinterval just must not be 0. Everything else must match.
+    #
+    # To change a setting for one host (say a scored host that must allow passwords), add
+    # `ssh_overrides` to that host. Only the lines you list change; the rest stay as below.
+    # Use null to stop checking a setting on that host:
+    #     daffy:
+    #       ssh_overrides:
+    #         passwordauthentication: "yes"
+    #         allowtcpforwarding: null
     ssh:
       permitrootlogin: "no"
       passwordauthentication: "no"
