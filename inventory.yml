@@ -1,9 +1,5 @@
 all:
   vars:
-    ssh_poll_interval: 10
-    firewall_poll_interval: 10
-    integrity_poll_interval: 60
-    lse_poll_interval: 180
     # Declared sshd policy, checked by `ccdcctl scan` against the EFFECTIVE `sshd -T` values
     # (Match blocks included). Names are exactly what `sshd -T` prints, in lowercase.
     # Exact match, except maxauthtries/logingracetime/clientalivecountmax (declared value
