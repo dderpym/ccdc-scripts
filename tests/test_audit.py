@@ -93,8 +93,15 @@ class HostRules(unittest.TestCase):
             self.assertEqual(install_audit_rules.install(path, run)["missing"], [])
 
     def test_scan_host(self):
-        out = scan_audit_rules.scan(lambda *a, **k: Done(0, rules_text()), lambda n: "/sbin/auditctl")
-        self.assertEqual(out["findings"], [])
+        def healthy(argv, **kw):
+            return Done(0, "enabled 1\nfailure 1\n" if argv[1] == "-s" else rules_text())
+        out = scan_audit_rules.scan(healthy, lambda n: "/sbin/auditctl")
+        self.assertEqual((out["findings"], out["errors"]), ([], []))
+        # watches loaded but auditing switched off, and a watch loaded without write/attribute perms
+        def run(argv, **kw):
+            return Done(0, "enabled 0\npid 0\n" if argv[1] == "-s" else rules_text())
+        self.assertEqual(scan_audit_rules.scan(run, lambda n: "x")["findings"], [{"disabled": True}])
+        self.assertEqual(missing_watches(rules_text().replace("-p wa", "-p r")), [p for p, _ in WATCHES])
         out = scan_audit_rules.scan(which=lambda n: None)
         self.assertEqual(len(out["findings"]), len(WATCHES))
         self.assertTrue(out["errors"])

@@ -13,8 +13,21 @@ class AuditWatchMissing(Finding):
         return f"auditd is not watching {self.path}"
 
 
+@dataclass(frozen=True)
+class AuditDisabled(Finding):
+    """Rules may be loaded, but the kernel is not auditing (`auditctl -s`: enabled 0)."""
+    code = "audit-disabled"
+    severity = "critical"
+
+    @property
+    def summary(self):
+        return "kernel auditing is disabled; loaded watches record nothing"
+
+
 class AuditRulesScanner(BundleScanner):
     entry = "scan_audit_rules"
 
     def findings(self, target, row):
+        if row.get("disabled"):
+            return [AuditDisabled(target)]
         return [AuditWatchMissing(target, row["watch"])]
