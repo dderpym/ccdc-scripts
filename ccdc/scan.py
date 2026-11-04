@@ -8,13 +8,19 @@ from ccdc.findings import SEVERITIES
 def scan_target(target, scanners):
     findings, errors = [], []
     for scanner in scanners:
-        try:
-            result = scanner.run(target)
-        except Exception as exc:  # one broken scanner must not hide the others
-            errors.append(f"{scanner.name}: {exc}")
-            continue
-        findings.extend(result)
-        errors.extend(f"{scanner.name}: {e}" for e in result.errors)
+        getattr(scanner, "begin_round", lambda t: None)(target)  # duck-typed scanners may lack rounds
+    try:
+        for scanner in scanners:
+            try:
+                result = scanner.run(target)
+            except Exception as exc:  # one broken scanner must not hide the others
+                errors.append(f"{scanner.name}: {exc}")
+                continue
+            findings.extend(result)
+            errors.extend(f"{scanner.name}: {e}" for e in result.errors)
+    finally:
+        for scanner in scanners:
+            getattr(scanner, "end_round", lambda t: None)(target)
     return list(dict.fromkeys(findings)), errors  # identical findings from overlapping scanners collapse
 
 

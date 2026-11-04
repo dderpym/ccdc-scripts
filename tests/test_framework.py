@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from ccdc import registry, scan  # noqa: E402
-from ccdc.findings import AutoFix, GlobalAutofix, Finding  # noqa: E402
+from ccdc.findings import AutoFix, GlobalAutofix, Finding, Scanner  # noqa: E402
 from ccdc.fixes.suid import FixSUIDBinary  # noqa: E402
 from ccdc.osinfo import DetectOS  # noqa: E402
 from ccdc.packages import InstallNftables, UnsupportedOS  # noqa: E402
@@ -144,7 +144,7 @@ class ScannerAutofix(unittest.TestCase):
     def test_scan_collects_and_dedupes(self):
         finding = WritableSUIDBinary(TARGET, "/a", "-rwsrwxrwx")
 
-        class S:
+        class S(Scanner):
             name = "S"
 
             def run(self, target):
@@ -155,7 +155,7 @@ class ScannerAutofix(unittest.TestCase):
         self.assertEqual(errors, ["S: gap", "S: gap"])
 
     def test_broken_scanner_is_reported_not_fatal(self):
-        class Broken:
+        class Broken(Scanner):
             name = "Broken"
 
             def run(self, target):

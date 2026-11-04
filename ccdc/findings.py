@@ -51,6 +51,14 @@ class Scanner(Script):
     def run(self, target):
         return self.scan(target)
 
+    # A round is one scan_target pass. Scanners that can share work inside a round
+    # (see LSEScanner) must forget it at end_round, so a later round never sees old data.
+    def begin_round(self, target):
+        pass
+
+    def end_round(self, target):
+        pass
+
 
 class BundleScanner(Scanner, BundleScript):
     """A scanner whose detection runs on the host as a bundle entry printing

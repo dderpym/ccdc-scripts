@@ -33,6 +33,68 @@ INTEGRITY_ROW = {"id": "policy-1", "path": "/etc/cron.d/x", "severity": "critica
                  "fix": dict(FIX)}
 
 
+class SharedLSERun(unittest.TestCase):
+    ACCOUNT_ROW = {"id": "sys040", "severity": "critical", "summary": "x",
+                   "context": [{"summary": "s", "evidence": ["toor:x:0:0:r:/root:/bin/sh"]}]}
+
+    def lse_scanners(self, runner):
+        return [s for s in registry.scanners(runner) if isinstance(s, LSEScanner)]
+
+    def test_one_lse_run_per_target_per_round(self):
+        runner = FakeRunner(discover_lse={"findings": [LSE_ROW, self.ACCOUNT_ROW], "errors": []})
+        scanners = self.lse_scanners(runner)
+        self.assertGreater(len(scanners), 5)
+        findings, errors = scan.scan_target(T, scanners)
+        lse_calls = [c for c in runner.calls if c[1] == "discover_lse"]
+        self.assertEqual(len(lse_calls), 1)
+        only = set(lse_calls[0][2][1].split(","))
+        self.assertTrue(set().union(*(s.tests for s in scanners)) <= only)
+        # each scanner still reports only its own tests, once
+        self.assertEqual(sum(isinstance(f, WritableCriticalPath) for f in findings), 1)
+        self.assertEqual(sum(isinstance(f, ExtraUidZeroAccount) for f in findings), 1)
+        self.assertEqual(errors, [])
+
+    def test_second_round_reruns_lse(self):
+        runner = FakeRunner(discover_lse={"findings": [], "errors": []})
+        scanners = self.lse_scanners(runner)
+        scan.scan_target(T, scanners)
+        scan.scan_target(T, scanners)
+        self.assertEqual(len([c for c in runner.calls if c[1] == "discover_lse"]), 2)
+
+    def test_rounds_do_not_return_old_findings(self):
+        runner = FakeRunner(discover_lse={"findings": [self.ACCOUNT_ROW], "errors": []})
+        scanners = self.lse_scanners(runner)
+        before, _ = scan.scan_target(T, scanners)
+        runner.entries["discover_lse"] = {"findings": [], "errors": []}
+        after, _ = scan.scan_target(T, scanners)
+        self.assertTrue(before)
+        self.assertEqual(after, [])
+
+    def test_outside_a_round_nothing_is_cached(self):
+        runner = FakeRunner(discover_lse={"findings": [], "errors": []})
+        scanner = AccountScanner(runner)
+        scanner.run(T)
+        scanner.run(T)
+        self.assertEqual(len(runner.calls), 2)
+        self.assertEqual(runner.calls[0][2], ["--only", ",".join(scanner.tests)])
+
+    def test_failed_shared_run_is_tried_once_per_round(self):
+        def boom(args):
+            raise RuntimeError("ssh down")
+        runner = FakeRunner(discover_lse=boom)
+        findings, errors = scan.scan_target(T, self.lse_scanners(runner))
+        self.assertEqual(len(runner.calls), 1)
+        self.assertEqual(findings, [])
+        self.assertTrue(errors and all("ssh down" in e for e in errors))
+
+    def test_parallel_targets_each_run_once(self):
+        runner = FakeRunner(discover_lse={"findings": [], "errors": []})
+        scanners = self.lse_scanners(runner)
+        targets = [Target(f"h{i}") for i in range(4)]
+        scan.scan_all(targets, scanners)
+        self.assertEqual(sorted(c[0] for c in runner.calls), sorted(t.host for t in targets))
+
+
 class LSEScanners(unittest.TestCase):
     def test_writable_path_and_drift(self):
         runner = FakeRunner(discover_lse={"findings": [LSE_ROW], "errors": []})
