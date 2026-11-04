@@ -65,15 +65,12 @@ class RescanGuard(Script):
     """run(target, first=None): scan (or take `first` as the earlier scan), sleep, scan again.
 
     delay is a floor: if the first findings carry `restart_sec` hints the wait is at
-    least that long. With poll_interval/poll_duration, scanners marked `cheap = True`
-    are then polled for a while and anything they see feeds `appeared`/`seen_later`.
+    least that long.
     """
 
-    def __init__(self, scanners, delay=0, poll_interval=0, poll_duration=0,
-                 sleep=time.sleep, clock=time.monotonic):
+    def __init__(self, scanners, delay=0, sleep=time.sleep):
         self.scanners, self.delay = scanners, delay
-        self.poll_interval, self.poll_duration = poll_interval, poll_duration
-        self.sleep, self.clock = sleep, clock
+        self.sleep = sleep
 
     def wait_for(self, first):
         hints = [getattr(f, "restart_sec", 0) or 0 for f in first]
@@ -86,13 +83,6 @@ class RescanGuard(Script):
         last, last_errors = _scan(target, self.scanners)
         seen_later = list(last)
         scans += 1
-        cheap = [s for s in self.scanners if getattr(s, "cheap", False)]
-        if self.poll_interval > 0 and self.poll_duration > 0 and cheap:
-            deadline = self.clock() + self.poll_duration
-            while self.clock() < deadline:
-                self.sleep(self.poll_interval)
-                seen_later.extend(_scan(target, cheap)[0])
-                scans += 1
         stable, vanished = compare(last, found)[0], compare(last, found)[1]
         seen_later = _unique(seen_later)
         return GuardReport(

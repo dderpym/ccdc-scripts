@@ -44,7 +44,6 @@ class UnownedMappedLibrary(Finding):
 
 
 class LibraryInjectionScanner(BundleScanner):
-    cheap = True  # live and quick: eligible for the rescan guard\'s fast poll
     entry = "scan_ld_preload"
 
     def findings(self, target, row):

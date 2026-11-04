@@ -786,7 +786,6 @@ def scan_command(args):
     scanners = registry.scanners()
     results = scanning.scan_all(targets, scanners)
     bad = scanning.report(results, autofix)
-    polling = {"poll_interval": args.poll_interval, "poll_duration": args.poll_duration}
     if args.recheck and args.fix:
         raise RuntimeError("--recheck is for scans without --fix; use --wait with --fix")
     if args.fix:
@@ -800,11 +799,11 @@ def scan_command(args):
             return bad
         from ccdc import respawn
         print(f"\nWaiting for restart delays, then rescanning for respawned artifacts...")
-        bad = respawn.render(respawn.verify_all(results, scanners, fixed, wait=args.wait, **polling))
+        bad = respawn.render(respawn.verify_all(results, scanners, fixed, wait=args.wait))
     elif args.recheck:
         from ccdc import respawn
         print(f"\nWaiting {args.recheck}s, then scanning again...")
-        bad = respawn.render_guard(respawn.guard_all(targets, scanners, results, delay=args.recheck, **polling))
+        bad = respawn.render_guard(respawn.guard_all(targets, scanners, results, delay=args.recheck))
     return bad
 
 
@@ -846,10 +845,6 @@ def argument_parser():
                      help="after fixing, wait then rescan to catch re-planted artifacts")
     cmd.add_argument("--recheck", type=int, default=0, metavar="SECONDS",
                      help="scan, wait, scan again and report what vanished or appeared (no fixes)")
-    cmd.add_argument("--poll-interval", type=int, default=0, metavar="SECONDS",
-                     help="after the rescan, poll cheap scanners at this interval...")
-    cmd.add_argument("--poll-duration", type=int, default=0, metavar="SECONDS",
-                     help="...for this long (needs --poll-interval)")
     cmd = sub.add_parser("harden", help="apply sshd hardening and disable unneeded daemons")
     cmd.add_argument("target", nargs="?", default="all")
     cmd.add_argument("--allow", action="append", default=[], metavar="UNIT", help="keep this service (repeatable)")

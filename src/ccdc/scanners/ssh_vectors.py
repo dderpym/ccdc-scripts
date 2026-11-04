@@ -140,7 +140,6 @@ def team_keys(path=TEAM_KEYS):
 
 
 class SSHVectorScanner(BundleScanner):
-    cheap = True  # live and quick: eligible for the rescan guard\'s fast poll
     entry = "scan_ssh_vectors"
 
     def __init__(self, runner=None, allowlist=None, keys=None):
