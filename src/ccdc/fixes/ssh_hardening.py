@@ -1,5 +1,7 @@
 """SSH phase: harden sshd without risking a lock-out."""
 from ccdc.ansible import AnsibleScript
+from ccdc.findings import AutoFix
+from ccdc.scanners.ssh_vectors import WeakSSHSetting
 from ccdc.target import Auth, Target
 
 
@@ -37,3 +39,16 @@ class HardenSSHD(AnsibleScript):
         self.runner.entry(target, "fix_sshd_hardening", ["confirm"])
         return applied
 
+
+class HardenSSHSettings(AutoFix):
+    """Apply the hardening drop-in once; a fresh key login must still work or the host reverts it itself."""
+
+    def can_fix(self, finding):
+        return isinstance(finding, WeakSSHSetting)
+
+    def get_fix(self, finding):
+        return HardenSSHD().bind(target=finding.host)
+
+    def describe(self, finding):
+        return (f"set sshd {finding.option} to {finding.wanted} via 00-hardening.conf "
+                "(sshd -t validated; auto-revert unless a fresh key login succeeds)")

@@ -1,6 +1,6 @@
 from ccdc.findings import AutoFix
 from ccdc.scanners.suid import WritableSUIDBinary
-from scripts.fix.permissions import SetPermissions
+from ccdc.fixes.permissions import SetPermissions
 
 
 class FixSUIDBinary(AutoFix):

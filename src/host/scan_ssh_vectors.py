@@ -144,13 +144,30 @@ def effective_by_user(binary, accounts, run=subprocess.run):
     return per_user, base, errors
 
 
+# option -> hardened value. Numeric limits: above the value is weak (clientaliveinterval: 0 = disabled).
+WEAK_LIMITS = (("maxauthtries", "3"), ("logingracetime", "30"), ("x11forwarding", "no"),
+               ("allowagentforwarding", "no"), ("allowtcpforwarding", "no"),
+               ("clientaliveinterval", "300"), ("clientalivecountmax", "2"))
+MAX_LIMITS = {"maxauthtries", "logingracetime", "clientalivecountmax"}
+
+
+def weaker(option, value, wanted):
+    value = value.lower()
+    if option in MAX_LIMITS:
+        return value.isdigit() and int(value) > int(wanted)
+    if option == "clientaliveinterval":
+        return value == "0"
+    return value != wanted
+
+
 def option_rows(effective, allow=()):
     """Rule-based findings on one effective configuration. allow: set of 'option=value'."""
     rows = []
 
-    def add(option, value, severity, why):
+    def add(option, value, severity, why, kind="sshd-option", wanted=""):
         if "%s=%s" % (option, value) not in allow:
-            rows.append({"kind": "sshd-option", "option": option, "value": value, "severity": severity, "why": why})
+            rows.append({"kind": kind, "option": option, "value": value, "severity": severity, "why": why,
+                         "wanted": wanted})
 
     for value in effective.get("authorizedkeysfile", []):
         for item in value.split():
@@ -175,20 +192,29 @@ def option_rows(effective, allow=()):
     for value in effective.get("passwordauthentication", []):
         if value.lower() != "no":
             add("passwordauthentication", value, "warning", "passwords accepted; the team standard is key-only")
+    # Hardening targets (what fix_sshd_hardening writes): effective values weaker than these are findings.
+    for option, wanted in WEAK_LIMITS:
+        for value in effective.get(option, []):
+            if weaker(option, value, wanted):
+                add(option, value, "warning", "weaker than the hardened value %s" % wanted, "sshd-weak", wanted)
     return rows
+
+
+def identity(row):
+    return (row["kind"], row["option"], row["value"], row["severity"], row["why"], row.get("wanted", ""))
 
 
 def effective_option_rows(per_user, base, allow=()):
     """Every distinct option finding with the contexts it is effective for."""
     found = {}
     for row in option_rows(base, allow):
-        found.setdefault((row["option"], row["value"], row["severity"], row["why"]), set()).add("default")
+        found.setdefault(identity(row), set()).add("default")
     for user, contexts in per_user.items():
         for addr, effective in contexts:
             for row in option_rows(effective, allow):
-                found.setdefault((row["option"], row["value"], row["severity"], row["why"]), set()).add("%s@%s" % (user, addr))
-    return [{"kind": "sshd-option", "option": o, "value": v, "severity": s, "why": w, "contexts": sorted(c)}
-            for (o, v, s, w), c in sorted(found.items())]
+                found.setdefault(identity(row), set()).add("%s@%s" % (user, addr))
+    return [{"kind": k, "option": o, "value": v, "severity": s, "why": w, "wanted": wanted, "contexts": sorted(c)}
+            for (k, o, v, s, w, wanted), c in sorted(found.items())]
 
 
 # ---- keys, rc files and referenced files: only what the effective config makes live ----

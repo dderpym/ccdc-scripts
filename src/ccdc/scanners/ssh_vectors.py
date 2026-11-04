@@ -44,6 +44,22 @@ class UnexpectedSSHOption(Finding):
 
 
 @dataclass(frozen=True)
+class WeakSSHSetting(Finding):
+    """An effective sshd value weaker than the hardened one; ccdc.fixes.ssh_hardening writes the drop-in."""
+    option: str
+    value: str
+    wanted: str
+    contexts: tuple = ()
+    code = "weak-ssh-setting"
+    severity = "warning"
+
+    @property
+    def summary(self):
+        who = " for " + ", ".join(self.contexts[:4]) + (" ..." if len(self.contexts) > 4 else "") if self.contexts else ""
+        return f"sshd {self.option} is {self.value}{who}; hardened value is {self.wanted}"
+
+
+@dataclass(frozen=True)
 class RogueAuthorizedKey(Finding):
     file: str
     user: str
@@ -168,6 +184,8 @@ class SSHVectorScanner(BundleScanner):
         if kind == "sshd-option":
             return [UnexpectedSSHOption(target, row["option"], row["value"], row["why"], row["severity"],
                                         tuple(row.get("contexts", ())))]
+        if kind == "sshd-weak":
+            return [WeakSSHSetting(target, row["option"], row["value"], row["wanted"], tuple(row.get("contexts", ())))]
         if kind == "authorized-key":
             return [RogueAuthorizedKey(target, row["file"], row["user"], row["line"], row["fingerprint"], row["comment"])]
         if kind == "ssh-startup":

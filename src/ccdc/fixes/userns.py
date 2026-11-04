@@ -1,6 +1,14 @@
+from ccdc.ansible import BundleScript
 from ccdc.findings import AutoFix
 from ccdc.scanners.userns import UnprivilegedUserNamespaces
-from scripts.fix.permissions import DisableSysctls
+
+
+class DisableSysctls(BundleScript):
+    """Set allow-listed sysctls to 0, live and persisted."""
+    entry = "fix_sysctl"
+
+    def arguments(self, names=(), **kwargs):
+        return list(names)
 
 
 class DisableUserNamespaces(AutoFix):
