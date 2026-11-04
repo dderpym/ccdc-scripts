@@ -1,7 +1,8 @@
 """PAM as active on the host: effective per-service stacks, loaded modules, package integrity."""
 from dataclasses import dataclass
 
-from ccdc.findings import EntryScanner, Finding
+from ccdc.ansible import AnsibleScript
+from ccdc.findings import Finding, Scanner
 
 
 def runs_for(services, file):
@@ -81,8 +82,14 @@ class PamModuleModified(Finding):
         return f"{self.path} fails package verification ({self.detail})"
 
 
-class PamScanner(EntryScanner):
-    entry = "scan_pam"
+class ScanPam(AnsibleScript):
+    """Prints {"findings": [pam-* rows], "errors": [...]}: effective stacks, mapped modules, package verify."""
+    source = "remote.py"
+
+
+class PamScanner(Scanner):
+    def remote_step(self, target):
+        return ScanPam(self.runner)
 
     def findings(self, target, row):
         kind = row["kind"]

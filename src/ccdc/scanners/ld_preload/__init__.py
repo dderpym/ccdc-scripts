@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
-from ccdc.findings import EntryScanner, Finding
+from ccdc.ansible import AnsibleScript
+from ccdc.findings import Finding, Scanner
 
 
 @dataclass(frozen=True)
@@ -43,8 +44,15 @@ class UnownedMappedLibrary(Finding):
         return f"unowned library {self.library} mapped by {', '.join(self.processes)}"
 
 
-class LibraryInjectionScanner(EntryScanner):
-    entry = "scan_ld_preload"
+class ScanLibraryInjection(AnsibleScript):
+    """Prints {"findings": [unit-env/profile-env/ld-so-preload/unreadable/mapped-unowned rows], "errors": [...]}."""
+    source = "remote.py"
+    support = ("ldpreload.py",)
+
+
+class LibraryInjectionScanner(Scanner):
+    def remote_step(self, target):
+        return ScanLibraryInjection(self.runner)
 
     def findings(self, target, row):
         kind = row["kind"]

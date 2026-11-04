@@ -15,7 +15,7 @@ import subprocess
 import sys
 import time
 
-from host import scan_ld_preload as scan
+import ldpreload
 
 ALLOWED = ("/etc/", "/usr/lib/systemd/", "/lib/systemd/", "/run/systemd/")
 EVIDENCE = "/root/ir"
@@ -46,7 +46,7 @@ def strip_variable(text, variable):
 
 
 def only_boilerplate(text):
-    return not [line for line in scan.logical_lines(text) if line != "[Service]"]
+    return not [line for line in ldpreload.logical_lines(text) if line != "[Service]"]
 
 
 def backup(path, root=EVIDENCE):
@@ -81,7 +81,7 @@ def edit(path, variable, evidence=EVIDENCE, allowed=ALLOWED):
 
 def still_mapped(values, proc="/proc"):
     names = {os.path.basename(lib) for value in values for lib in value.replace(":", " ").split()}
-    return sorted(lib for lib in scan.mapped_libraries(proc) if os.path.basename(lib) in names)
+    return sorted(lib for lib in ldpreload.mapped_libraries(proc) if os.path.basename(lib) in names)
 
 
 def main(argv=None):

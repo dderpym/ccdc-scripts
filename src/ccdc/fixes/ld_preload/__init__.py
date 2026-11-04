@@ -1,19 +1,27 @@
-from ccdc.ansible import EntryScript
+import json
+
+from ccdc.ansible import AnsibleScript
 from ccdc.findings import AutoFix
+from ccdc.runner import RemoteError
 from ccdc.scanners.ld_preload import LibraryInjection
 
 
-class RemoveLibraryInjection(EntryScript):
+class RemoveLibraryInjection(AnsibleScript):
     """Remove an injected variable (or file), restart the unit, confirm the library is unmapped."""
-    entry = "fix_ld_preload"
+    source = "remote.py"
+    support = ("ldpreload.py",)
 
     def arguments(self, path, unit="", variable="", **kwargs):
         return [path, *(["--unit", unit] if unit else []), *(["--var", variable] if variable else [])]
 
-    def parse(self, document, **kwargs):
+    def parse(self, result, **kwargs):
+        try:
+            document = json.loads(result["stdout"])
+        except ValueError:
+            return super().parse(result, **kwargs)
         if document.get("still_mapped"):
-            raise RuntimeError("library still mapped after restart: " + ", ".join(document["still_mapped"]))
-        return document
+            raise RemoteError("library still mapped after restart: " + ", ".join(document["still_mapped"]))
+        return super().parse(result, **kwargs)
 
 
 class FixLibraryInjection(AutoFix):

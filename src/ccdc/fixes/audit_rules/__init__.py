@@ -1,12 +1,14 @@
-from ccdc.ansible import EntryScript
+from ccdc.ansible import AnsibleScript
 from ccdc.findings import AutoFix
 from ccdc.packages import InstallAuditd
 from ccdc.scanners.audit_rules import AuditWatchMissing
 from ccdc.script import ComposedScript, Step
 
 
-class InstallAuditRules(EntryScript):
-    entry = "install_audit_rules"
+class InstallAuditRules(AnsibleScript):
+    """Writes /etc/audit/rules.d/99-ccdc.rules when it differs, loads it, verifies with auditctl -l."""
+    source = "remote.py"
+    support = ("audit_watches.py",)
 
 
 class EnableAuditWatches(ComposedScript):

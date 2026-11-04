@@ -9,7 +9,7 @@ import os
 import subprocess
 import sys
 
-from host.audit_watches import missing_watches, rules_text
+from audit_watches import missing_watches, rules_text
 
 RULES_FILE = "/etc/audit/rules.d/99-ccdc.rules"
 

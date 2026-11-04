@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 
-from ccdc.findings import EntryScanner, Finding
+from ccdc.ansible import AnsibleScript
+from ccdc.findings import Finding, Scanner
 
 
 @dataclass(frozen=True)
@@ -24,8 +25,15 @@ class AuditDisabled(Finding):
         return "kernel auditing is disabled; loaded watches record nothing"
 
 
-class AuditRulesScanner(EntryScanner):
-    entry = "scan_audit_rules"
+class ScanAuditRules(AnsibleScript):
+    """Prints {"findings": [{"watch"} | {"disabled"}], "errors": [...]} from the LOADED rules (auditctl -l / -s)."""
+    source = "remote.py"
+    support = ("audit_watches.py",)
+
+
+class AuditRulesScanner(Scanner):
+    def remote_step(self, target):
+        return ScanAuditRules(self.runner)
 
     def findings(self, target, row):
         if row.get("disabled"):

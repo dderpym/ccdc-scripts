@@ -1,5 +1,5 @@
 """Remediation: remove PAM hooks and restore the distribution modules."""
-from ccdc.ansible import EntryScript
+from ccdc.ansible import AnsibleScript
 from ccdc.findings import AutoFix
 from ccdc.osinfo import DetectOS
 from ccdc.scanners.pam import PamExecHook, PamForeignModule, PamModuleModified, PamStrayFile
@@ -10,24 +10,27 @@ from scripts.init.pam_gate import PamGate
 MANAGERS = {"debian": "apt", "rhel": "dnf", "suse": "zypper"}
 
 
+class PamRepair(AnsibleScript):
+    """One remote.py with three actions (remove-line, remove-file, reinstall); each backs up first."""
+    source = "remote.py"
 
-class RemovePamLine(EntryScript):
+
+class RemovePamLine(PamRepair):
     """Delete a rule (and optionally its payload file) from a /etc/pam.d file, with backup."""
-    entry = "fix_pam"
 
-    def arguments(self, file, line, payload="", **kwargs):
-        return ["remove-line", file, line, *(["--payload", payload] if payload else [])]
+    def arguments(self, file, line, payload_path="", **kwargs):
+        return ["remove-line", file, line, *(["--payload", payload_path] if payload_path else [])]
 
 
-class RemovePamFile(EntryScript):
-    entry = "fix_pam"
+class RemovePamFile(PamRepair):
+    """Quarantine a stray file under /etc/pam.d or a security dir."""
 
     def arguments(self, path, **kwargs):
         return ["remove-file", path]
 
 
-class _Reinstall(EntryScript):
-    entry = "fix_pam"
+class _Reinstall(PamRepair):
+    """Reinstall the PAM packages with the given manager (apt|dnf|yum|zypper)."""
 
     def arguments(self, manager, **kwargs):
         return ["reinstall", manager]
@@ -60,7 +63,7 @@ class FixPam(AutoFix):
         tail = [Step(ReinstallPam(), target=target), Step(PamGate(), target=target)]
         if isinstance(finding, PamExecHook):
             return ComposedScript(Step(RemovePamLine(), target=target, file=finding.file, line=finding.line,
-                                       payload=finding.payload), *tail)
+                                       payload_path=finding.payload), *tail)
         if isinstance(finding, PamForeignModule):
             return ComposedScript(Step(RemovePamLine(), target=target, file=finding.file, line=finding.line), *tail)
         if isinstance(finding, PamStrayFile):

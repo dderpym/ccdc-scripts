@@ -1,11 +1,11 @@
-from ccdc.ansible import EntryScript
+from ccdc.ansible import AnsibleScript
 from ccdc.findings import AutoFix
 from ccdc.scanners.sudoers import SudoGrant
 
 
-class RemoveSudoersGrant(EntryScript):
+class RemoveSudoersGrant(AnsibleScript):
     """Remove the sudoers line(s) behind a live `sudo -l` grant, validated by visudo, original kept in /root/ir."""
-    entry = "fix_sudoers"
+    source = "remote.py"
 
     def arguments(self, user, rule, file="", line=0, **kwargs):
         return ["--locate", user, rule, "--file", file, "--line", str(line)]

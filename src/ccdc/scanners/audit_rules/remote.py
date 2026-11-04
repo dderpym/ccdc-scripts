@@ -5,7 +5,7 @@ import json
 import shutil
 import subprocess
 
-from host.audit_watches import WATCHES, missing_watches
+from audit_watches import WATCHES, missing_watches
 
 
 def status_enabled(output):

@@ -1,7 +1,8 @@
 """Sudo as active on the host: what `sudo -l` grants each account, and whether the config is valid."""
 from dataclasses import dataclass
 
-from ccdc.findings import EntryScanner, Finding
+from ccdc.ansible import AnsibleScript
+from ccdc.findings import Finding, Scanner
 
 
 @dataclass(frozen=True)
@@ -57,8 +58,15 @@ class SudoersInvalid(Finding):
         return "visudo -c rejects the active sudo configuration: " + self.detail.replace("\n", "; ")[:200]
 
 
-class SudoersScanner(EntryScanner):
-    entry = "scan_sudoers"
+class ScanSudoers(AnsibleScript):
+    """Prints {"findings": [grant/world/invalid rows], "errors": [...]}: visudo -c plus sudo -l -U per account."""
+    source = "remote.py"
+
+
+class SudoersScanner(Scanner):
+    def remote_step(self, target):
+        return ScanSudoers(self.runner)
+
     KINDS = {"world": SudoGrantsEveryone, "grant": UnexpectedSudoGrant}
 
     def findings(self, target, row):
