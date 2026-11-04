@@ -1,7 +1,8 @@
 from ccdc.findings import AutoFix
 from ccdc.scanners.pam import PamExecHook, PamForeignModule, PamModuleModified, PamStrayFile
 from ccdc.script import ComposedScript, Step
-from ccdc.scripts.pam import PamGate, RemovePamFile, RemovePamLine, ReinstallPam
+from scripts.fix.pam import ReinstallPam, RemovePamFile, RemovePamLine
+from scripts.init.pam_gate import PamGate
 
 
 class FixPam(AutoFix):

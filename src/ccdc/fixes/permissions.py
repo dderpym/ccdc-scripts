@@ -1,6 +1,6 @@
 from ccdc.findings import AutoFix
 from ccdc.scanners.permissions import PermissionDrift
-from ccdc.scripts.permissions import SetPermissions
+from scripts.fix.permissions import SetPermissions
 
 
 class RestorePermissions(AutoFix):

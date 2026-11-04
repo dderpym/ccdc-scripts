@@ -1,6 +1,6 @@
 from ccdc.findings import AutoFix
 from ccdc.scanners.ld_preload import LibraryInjection
-from ccdc.scripts.ld_preload import RemoveLibraryInjection
+from scripts.fix.ld_preload import RemoveLibraryInjection
 
 
 class FixLibraryInjection(AutoFix):

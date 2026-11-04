@@ -1,7 +1,7 @@
 """sshd_config problems are reported only: editing it can lock the team out."""
 from ccdc.findings import AutoFix
 from ccdc.scanners.ssh_vectors import RogueAuthorizedKey, SSHStartupScript, team_keys
-from ccdc.scripts.ssh_vectors import RemoveAuthorizedKey, RemoveSSHStartupFile
+from scripts.fix.ssh_vectors import RemoveAuthorizedKey, RemoveSSHStartupFile
 
 
 class FixSSHStartupScript(AutoFix):

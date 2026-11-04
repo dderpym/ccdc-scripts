@@ -1,23 +1,6 @@
-"""Hardening scripts: free fixes from the incident review (sections 4.1, 4.2, 4.9)."""
-from ccdc.ansible import AnsibleScript, BundleScript
-from ccdc.script import ComposedScript, Step
+"""SSH phase: harden sshd without risking a lock-out."""
+from ccdc.ansible import AnsibleScript
 from ccdc.target import Auth, Target
-
-# Desktop/hardware daemons a server does not need. gdm, NetworkManager, sssd,
-# docker, atd and snapd are left alone on purpose.
-UNNEEDED_SERVICES = (
-    "ModemManager.service", "wpa_supplicant.service", "avahi-daemon.service", "avahi-daemon.socket",
-    "cups.service", "cups.socket", "cups-browsed.service", "udisks2.service", "upower.service",
-    "packagekit.service", "libstoragemgmt.service", "mcelog.service", "colord.service", "bluetooth.service",
-)
-
-
-class DisableUnneededServices(BundleScript):
-    """Disable the unneeded daemons except `allow` (units a scored service on this host needs)."""
-    entry = "fix_services"
-
-    def arguments(self, allow=(), services=UNNEEDED_SERVICES, **kwargs):
-        return ["disable", *(s for s in services if s not in set(allow))]
 
 
 class FreshLogin(Auth):
@@ -54,9 +37,3 @@ class HardenSSHD(AnsibleScript):
         self.runner.entry(target, "fix_sshd_hardening", ["confirm"])
         return applied
 
-
-class Harden(ComposedScript):
-    """SSH hardening first (it self-verifies), then the service clean-up."""
-
-    def __init__(self, runner=None, allow=()):
-        super().__init__(Step(HardenSSHD(runner)), Step(DisableUnneededServices(runner), allow=tuple(allow)))

@@ -1,6 +1,6 @@
 from ccdc.findings import AutoFix
 from ccdc.scanners.unowned import TimestompedFile, UnitRunsUnownedBinary, UnownedExecutable
-from ccdc.scripts.quarantine import Quarantine
+from scripts.fix.quarantine import Quarantine
 
 
 def paths(finding):

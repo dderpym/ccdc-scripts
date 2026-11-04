@@ -1,6 +1,6 @@
 from ccdc.findings import AutoFix
 from ccdc.scanners.sudoers import SudoGrant
-from ccdc.scripts.sudoers import RemoveSudoersGrant
+from scripts.fix.sudoers import RemoveSudoersGrant
 
 
 class FixSudoGrant(AutoFix):

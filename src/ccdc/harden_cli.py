@@ -1,5 +1,6 @@
 """`ccdcctl harden [HOST] [--allow UNIT ...]`: show -> confirm -> apply per host."""
-from ccdc.scripts.harden import Harden, UNNEEDED_SERVICES
+from scripts.harden.full import Harden
+from scripts.harden.services import UNNEEDED_SERVICES
 from ccdc.target import Target
 
 

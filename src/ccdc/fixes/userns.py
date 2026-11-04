@@ -1,6 +1,6 @@
 from ccdc.findings import AutoFix
 from ccdc.scanners.userns import UnprivilegedUserNamespaces
-from ccdc.scripts.permissions import DisableSysctls
+from scripts.fix.permissions import DisableSysctls
 
 
 class DisableUserNamespaces(AutoFix):

@@ -1,6 +1,6 @@
 from ccdc.findings import AutoFix
 from ccdc.scanners.audit_rules import AuditWatchMissing
-from ccdc.scripts.audit import EnableAuditWatches
+from scripts.harden.audit import EnableAuditWatches
 
 
 class FixAuditWatches(AutoFix):
