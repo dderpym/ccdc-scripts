@@ -2,10 +2,9 @@ __pycache__/
 *.py[cod]
 .venv/
 *.retry
-/baselines/*
-!/baselines/.gitkeep
-/reports/*
-!/reports/.gitkeep
+# Generated controller state and credentials; keep the directories, not the contents.
+/state/*
+!/state/.gitkeep
 /secrets/
 /lab/inventory.yml
 /lab/secrets/
