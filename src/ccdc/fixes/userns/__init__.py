@@ -1,11 +1,12 @@
-from ccdc.ansible import EntryScript
+from ccdc.ansible import AnsibleScript
 from ccdc.findings import AutoFix
 from ccdc.scanners.userns import UnprivilegedUserNamespaces
 
 
-class DisableSysctls(EntryScript):
+class DisableSysctls(AnsibleScript):
     """Set allow-listed sysctls to 0, live and persisted."""
-    entry = "fix_sysctl"
+    source = "remote.py"
+    support = ("sysctls.py",)
 
     def arguments(self, names=(), **kwargs):
         return list(names)

@@ -17,8 +17,8 @@ import stat
 import subprocess
 import time
 
-from host.kernel_risks import read_regular
-from host.lse_extras import _access
+from kernel_risks import read_regular
+from lse_extras import _access
 EXEC = ('ExecStart', 'ExecStartPre', 'ExecStartPost', 'ExecReload', 'ExecStop', 'ExecStopPost')
 PROPERTIES = ('User', 'DynamicUser', 'RootDirectory', 'RootImage', *EXEC,
               'FragmentPath', 'DropInPaths', 'WorkingDirectory')

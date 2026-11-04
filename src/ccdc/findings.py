@@ -75,14 +75,6 @@ class Scanner(HostScript):
     def run(self, target):
         return self.scan(target)
 
-    # A round is one scan_target pass. Scanners that can share work inside a round
-    # (see LSEScanner) must forget it at end_round, so a later round never sees old data.
-    def begin_round(self, target):
-        pass
-
-    def end_round(self, target):
-        pass
-
 
 class EntryScanner(Scanner, EntryScript):
     """DEPRECATED with EntryScript: detection is an entry of the global host bundle."""
