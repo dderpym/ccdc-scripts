@@ -1,4 +1,6 @@
-"""SSH side doors: odd sshd settings, unknown authorized keys, sshrc, unowned files in /etc/ssh."""
+"""SSH side doors, judged on what the running sshd does: per-user effective settings (Match blocks),
+the key files sshd would read, sshrc it would run, files its config references, config edited after
+the daemon started, live LD_* environment and libraries, and sockets its config does not explain."""
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -26,6 +28,7 @@ class UnexpectedSSHOption(Finding):
     value: str
     why: str
     level: str = "warning"
+    contexts: tuple = ()  # "default" or "user@address" the setting is effective for
     code = "sshd-option"
 
     @property
@@ -34,7 +37,10 @@ class UnexpectedSSHOption(Finding):
 
     @property
     def summary(self):
-        return f"sshd {self.option} {self.value}: {self.why}"
+        who = ""
+        if self.contexts:
+            who = " for " + ", ".join(self.contexts[:4]) + (" ..." if len(self.contexts) > 4 else "")
+        return f"sshd {self.option} {self.value}{who}: {self.why}"
 
 
 @dataclass(frozen=True)
@@ -71,7 +77,59 @@ class UnownedSSHFile(Finding):
 
     @property
     def summary(self):
-        return f"{self.path} is not owned by any package"
+        return f"{self.path} is referenced by the effective sshd config but hidden or not owned by any package"
+
+
+@dataclass(frozen=True)
+class StaleSSHConfig(Finding):
+    path: str
+    edited: int
+    started: int
+    code = "ssh-config-not-reloaded"
+    severity = "critical"
+
+    @property
+    def summary(self):
+        return f"{self.path} changed after sshd started; the running daemon may not match its config"
+
+
+@dataclass(frozen=True)
+class SSHLiveEnvironment(Finding):
+    pid: int
+    name: str
+    value: str
+    code = "ssh-live-environment"
+    severity = "critical"
+
+    @property
+    def summary(self):
+        return f"sshd pid {self.pid} runs with {self.name}={self.value}"
+
+
+@dataclass(frozen=True)
+class SSHLiveLibrary(Finding):
+    pid: int
+    path: str
+    why: str
+    code = "ssh-live-library"
+    severity = "critical"
+
+    @property
+    def summary(self):
+        return f"sshd pid {self.pid} has {self.path} mapped: {self.why}"
+
+
+@dataclass(frozen=True)
+class OddSSHListener(Finding):
+    address: str
+    port: int
+    why: str
+    code = "ssh-odd-listener"
+    severity = "critical"
+
+    @property
+    def summary(self):
+        return f"sshd listens on {self.address}:{self.port}: {self.why}"
 
 
 def team_keys(path=TEAM_KEYS):
@@ -108,11 +166,20 @@ class SSHVectorScanner(BundleScanner):
     def findings(self, target, row):
         kind = row["kind"]
         if kind == "sshd-option":
-            return [UnexpectedSSHOption(target, row["option"], row["value"], row["why"], row["severity"])]
+            return [UnexpectedSSHOption(target, row["option"], row["value"], row["why"], row["severity"],
+                                        tuple(row.get("contexts", ())))]
         if kind == "authorized-key":
             return [RogueAuthorizedKey(target, row["file"], row["user"], row["line"], row["fingerprint"], row["comment"])]
         if kind == "ssh-startup":
             return [SSHStartupScript(target, row["path"], row["what"])]
         if kind == "unowned-ssh-file":
             return [UnownedSSHFile(target, row["path"])]
+        if kind == "stale-config":
+            return [StaleSSHConfig(target, row["path"], row["edited"], row["started"])]
+        if kind == "live-env":
+            return [SSHLiveEnvironment(target, row["pid"], row["name"], row["value"])]
+        if kind == "live-library":
+            return [SSHLiveLibrary(target, row["pid"], row["path"], row["why"])]
+        if kind == "odd-listener":
+            return [OddSSHListener(target, row["address"], row["port"], row["why"])]
         return []

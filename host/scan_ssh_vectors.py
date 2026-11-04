@@ -1,18 +1,27 @@
 #!/usr/bin/env python3
 """scan_ssh_vectors [--allow-key LINE]... [--allow OPTION=VALUE]... [--allow-path PATH]...
 
-Read-only. Prints {"findings": [row...], "errors": [...]}; rows have a "kind":
-  sshd-option      option, value, severity, why
-  authorized-key   file, user, line, fingerprint, comment      (key not in the allowlist)
-  ssh-startup      path, what                                  (sshrc, ~/.ssh/rc)
-  unowned-ssh-file path                                        (not package-owned, under /etc/ssh)
-sshd settings come from `sshd -T` of the RUNNING daemon (resolved via /proc), so a
-relocated sshd (e.g. /usr/local/sbin/sshd) is still the one inspected.
+Judges what the RUNNING sshd does, not what its files say. Read-only. Prints
+{"findings": [row...], "errors": [...]}; rows have a "kind":
+  sshd-option      option, value, severity, why, contexts    (`sshd -T -C` per login user and address, so Match
+                                                              blocks count; contexts like "deploy@192.0.2.1")
+  authorized-key   file, user, line, fingerprint, comment    (key file the effective AuthorizedKeysFile gives that
+                                                              user, key not in the allowlist)
+  ssh-startup      path, what                                (sshrc that sshd would really run at login)
+  unowned-ssh-file path                                      (file the effective config references, hidden or unowned)
+  stale-config     path, edited, started                     (config changed after the daemon started)
+  live-env         pid, name, value                          (LD_PRELOAD & co. in a live sshd process)
+  live-library     pid, path, why                            (mapped library that is deleted or unowned)
+  odd-listener     address, port, why                        (sshd socket that `sshd -T` does not explain)
+The sshd inspected is the running one (resolved via /proc), so a relocated sshd still works.
+Fail closed: anything that cannot be inspected goes into "errors", never silence.
 """
 import argparse
 import base64
 import binascii
+import glob
 import hashlib
+import ipaddress
 import json
 import os
 import pwd
@@ -21,11 +30,16 @@ import shutil
 import subprocess
 import sys
 
-DEFAULT_KEY_FILES = {".ssh/authorized_keys", ".ssh/authorized_keys2"}
 KEY_TYPE = re.compile(r"^(ssh-[a-z0-9]+|ecdsa-sha2-nistp\d+|sk-[a-z0-9@.-]+)$")
-KNOWN_ETC_SSH = re.compile(r"^(ssh_config|sshd_config|moduli|ssh_known_hosts2?|ssh_import_id|"
-                           r"ssh_host_[a-z0-9_]+_key(\.pub)?|ssh_config\.d|sshd_config\.d|"
-                           r"sshd_config\.rpmnew|sshd_config\.dpkg-\w+|ssh_config\.dpkg-\w+)$")
+DEFAULT_KEY_FILES = {".ssh/authorized_keys", ".ssh/authorized_keys2"}
+SSHD_COMMS = {"sshd", "sshd-session", "sshd-auth"}
+LIVE_ENV = ("LD_PRELOAD", "LD_LIBRARY_PATH", "LD_AUDIT")
+ADDRESSES = (("localhost", "127.0.0.1"), ("remote.invalid", "192.0.2.1"))
+NOLOGIN = ("nologin", "false")
+LISTEN = "0A"
+# Options whose value names a file or program sshd reads or runs.
+REFERENCED = ("authorizedkeyscommand", "authorizedprincipalscommand", "trustedusercakeys", "revokedkeys",
+              "banner", "authorizedprincipalsfile")
 
 
 def fingerprint(blob):
@@ -48,31 +62,39 @@ def parse_key_line(line):
     return None
 
 
-def running_sshd(proc="/proc"):
-    """Executable of the listening sshd: comm 'sshd' whose parent is init."""
+# ---- the running daemon and its effective configuration ------------------------------
+
+def sshd_pids(proc="/proc"):
+    """(master pid or None, all sshd-family pids). The master is the sshd whose parent is init."""
+    master, family = None, []
     try:
-        pids = sorted(int(p) for p in os.listdir(proc) if p.isdigit())
+        names = sorted(int(p) for p in os.listdir(proc) if p.isdigit())
     except OSError:
-        pids = []
-    for pid in pids:
+        return None, []
+    for pid in names:
         try:
             with open("%s/%d/comm" % (proc, pid)) as handle:
-                if handle.read().strip() != "sshd":
+                if handle.read().strip() not in SSHD_COMMS:
                     continue
             with open("%s/%d/stat" % (proc, pid)) as handle:
                 ppid = int(handle.read().rpartition(")")[2].split()[1])
-            if ppid != 1:
-                continue
-            return os.readlink("%s/%d/exe" % (proc, pid)).replace(" (deleted)", "")
         except (OSError, ValueError, IndexError):
             continue
-    return None
+        family.append(pid)
+        if ppid == 1 and master is None:
+            master = pid
+    return master, family
 
 
-def sshd_binary():
-    path = running_sshd()
-    if path and os.access(path, os.X_OK):
-        return path
+def sshd_binary(proc="/proc"):
+    master, _ = sshd_pids(proc)
+    if master is not None:
+        try:
+            path = os.readlink("%s/%d/exe" % (proc, master)).replace(" (deleted)", "")
+            if os.access(path, os.X_OK):
+                return path
+        except OSError:
+            pass
     for candidate in ("/usr/sbin/sshd", "/usr/local/sbin/sshd", "/usr/bin/sshd", "/sbin/sshd", shutil.which("sshd")):
         if candidate and os.access(candidate, os.X_OK):
             return candidate
@@ -88,8 +110,42 @@ def parse_effective(output):
     return result
 
 
+def sshd_T(binary, context=None, run=subprocess.run):
+    argv = [binary, "-T"] + (["-C", context] if context else [])
+    result = run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True, timeout=30)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or "sshd -T failed")
+    return parse_effective(result.stdout)
+
+
+def login_accounts(entries=None):
+    """[(name, home)] of root and every account whose shell allows a login."""
+    entries = pwd.getpwall() if entries is None else entries
+    accounts = {("root", next((e.pw_dir for e in entries if e.pw_name == "root"), "/root"))}
+    accounts.update((e.pw_name, e.pw_dir) for e in entries
+                    if e.pw_shell and os.path.basename(e.pw_shell) not in NOLOGIN and e.pw_dir.startswith("/"))
+    return sorted(accounts)
+
+
+def effective_by_user(binary, accounts, run=subprocess.run):
+    """({user: [(address, effective)]}, base effective, errors). One sshd -T per user and address."""
+    errors, per_user = [], {}
+    try:
+        base = sshd_T(binary, None, run)
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+        return {}, {}, ["sshd -T unavailable: %s" % exc]
+    for user, _ in accounts:
+        for host, addr in ADDRESSES:
+            context = "user=%s,host=%s,addr=%s" % (user, host, addr)
+            try:
+                per_user.setdefault(user, []).append((addr, sshd_T(binary, context, run)))
+            except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+                errors.append("sshd -T -C %s failed: %s" % (context, exc))
+    return per_user, base, errors
+
+
 def option_rows(effective, allow=()):
-    """Rule-based sshd findings, independent of any saved baseline. allow: set of 'option=value'."""
+    """Rule-based findings on one effective configuration. allow: set of 'option=value'."""
     rows = []
 
     def add(option, value, severity, why):
@@ -113,8 +169,29 @@ def option_rows(effective, allow=()):
     for value in effective.get("permituserenvironment", []):
         if value.lower() != "no":
             add("permituserenvironment", value, "critical", "users can set environment (LD_PRELOAD) for sshd sessions")
+    for value in effective.get("permitemptypasswords", []):
+        if value.lower() != "no":
+            add("permitemptypasswords", value, "critical", "accounts with empty passwords may log in")
+    for value in effective.get("passwordauthentication", []):
+        if value.lower() != "no":
+            add("passwordauthentication", value, "warning", "passwords accepted; the team standard is key-only")
     return rows
 
+
+def effective_option_rows(per_user, base, allow=()):
+    """Every distinct option finding with the contexts it is effective for."""
+    found = {}
+    for row in option_rows(base, allow):
+        found.setdefault((row["option"], row["value"], row["severity"], row["why"]), set()).add("default")
+    for user, contexts in per_user.items():
+        for addr, effective in contexts:
+            for row in option_rows(effective, allow):
+                found.setdefault((row["option"], row["value"], row["severity"], row["why"]), set()).add("%s@%s" % (user, addr))
+    return [{"kind": "sshd-option", "option": o, "value": v, "severity": s, "why": w, "contexts": sorted(c)}
+            for (o, v, s, w), c in sorted(found.items())]
+
+
+# ---- keys, rc files and referenced files: only what the effective config makes live ----
 
 def expand(pattern, home, user):
     """AuthorizedKeysFile tokens: %h home, %u user, %% percent; relative paths are under the home."""
@@ -122,14 +199,15 @@ def expand(pattern, home, user):
     return path if os.path.isabs(path) else os.path.join(home, path)
 
 
-def key_files(effective, people):
-    """{file: user} for every candidate authorized-keys file."""
-    patterns = {item for value in effective.get("authorizedkeysfile", []) for item in value.split()
-                if item.lower() != "none"} | DEFAULT_KEY_FILES
+def key_files(per_user, accounts):
+    """{file: user}: what sshd would read for each login user, from that user's effective AuthorizedKeysFile."""
+    homes = dict(accounts)
     files = {}
-    for user, home in people:
+    for user, contexts in per_user.items():
+        patterns = {item for _, effective in contexts for value in effective.get("authorizedkeysfile", [])
+                    for item in value.split() if item.lower() != "none"}
         for pattern in sorted(patterns):
-            files.setdefault(expand(pattern, home, user), user)
+            files.setdefault(expand(pattern, homes[user], user), user)
     return files
 
 
@@ -152,13 +230,19 @@ def key_rows(files, allowed, read=None):
     return rows, errors
 
 
-def startup_rows(people, exists=os.path.lexists):
+def startup_rows(per_user, accounts, exists=os.path.lexists):
+    """sshrc files sshd runs at login. ~/.ssh/rc counts only where the user's effective
+    PermitUserRC is not 'no'; /etc/ssh/sshrc is run by sshd itself for any login."""
     rows = []
-    candidates = [("/etc/ssh/sshrc", "system sshrc")]
-    candidates += [(os.path.join(home, ".ssh", "rc"), "user ssh rc") for _, home in people]
-    for path, what in dict.fromkeys(candidates):
-        if exists(path):
-            rows.append({"kind": "ssh-startup", "path": path, "what": what})
+    if per_user and exists("/etc/ssh/sshrc"):
+        rows.append({"kind": "ssh-startup", "path": "/etc/ssh/sshrc", "what": "system sshrc"})
+    homes = dict(accounts)
+    for user, contexts in sorted(per_user.items()):
+        live = any(value.lower() != "no" for _, effective in contexts
+                   for value in effective.get("permituserrc", ["yes"]))
+        path = os.path.join(homes[user], ".ssh", "rc")
+        if live and exists(path):
+            rows.append({"kind": "ssh-startup", "path": path, "what": "user ssh rc"})
     return rows
 
 
@@ -174,58 +258,263 @@ def owned(path, run=subprocess.run):
     return False
 
 
-def unowned_rows(allow_paths=(), directory="/etc/ssh", owner=owned):
+def referenced_paths(per_user, base):
+    """Absolute files or programs the effective configuration tells sshd to read or run."""
+    paths = set()
+    for effective in [base, *(e for contexts in per_user.values() for _, e in contexts)]:
+        for option in REFERENCED:
+            for value in effective.get(option, []):
+                token = value.split()[0] if value.split() else ""
+                if token.startswith("/"):
+                    paths.add(token)
+    return sorted(paths)
+
+
+def unowned_rows(paths, allow_paths=(), owner=owned, exists=os.path.lexists):
     rows, errors = [], []
-    try:
-        names = sorted(os.listdir(directory))
-    except OSError as exc:
-        return rows, ["cannot list %s: %s" % (directory, exc)]
-    for name in names:
-        path = os.path.join(directory, name)
-        if path in allow_paths or name == "sshrc":  # sshrc is reported as a startup script
+    for path in paths:
+        if path in allow_paths or not exists(path):
             continue
-        # Hidden entries (/etc/ssh/.ssh) are never part of a package; others need an owner.
-        if name.startswith("."):
+        if any(part.startswith(".") for part in path.split("/") if part):
             rows.append({"kind": "unowned-ssh-file", "path": path})
-        elif not KNOWN_ETC_SSH.match(name):
-            verdict = owner(path)
-            if verdict is None:
-                errors.append("no package database; cannot tell whether %s is owned" % path)
-            elif not verdict:
-                rows.append({"kind": "unowned-ssh-file", "path": path})
+            continue
+        verdict = owner(path)
+        if verdict is None:
+            errors.append("no package database; cannot tell whether %s is owned" % path)
+        elif not verdict:
+            rows.append({"kind": "unowned-ssh-file", "path": path})
     return rows, sorted(set(errors))
 
 
-def accounts():
-    return sorted({(entry.pw_name, entry.pw_dir) for entry in pwd.getpwall() if entry.pw_dir.startswith("/")})
+# ---- daemon age vs config age --------------------------------------------------------
+
+def start_time(pid, proc="/proc", clock_ticks=None):
+    """Epoch seconds the process started (stat field 22 + btime)."""
+    ticks = clock_ticks or os.sysconf("SC_CLK_TCK")
+    with open("%s/%d/stat" % (proc, pid)) as handle:
+        started = int(handle.read().rpartition(")")[2].split()[19])
+    with open("%s/stat" % proc) as handle:
+        boot = next(int(line.split()[1]) for line in handle if line.startswith("btime "))
+    return boot + started / ticks
 
 
-def scan(allow_keys=(), allow_options=(), allow_paths=()):
+def config_files(main="/etc/ssh/sshd_config", read=None, expand_glob=glob.glob, depth=0):
+    """The main file, every file it Includes, and the directories the globs live in
+    (a deleted drop-in only shows as a changed directory)."""
+    read = read or (lambda p: open(p).read())
+    found = [main]
+    if depth > 8:
+        return found
+    try:
+        text = read(main)
+    except OSError:
+        return found
+    for line in text.splitlines():
+        tokens = line.split("#", 1)[0].split()
+        if len(tokens) > 1 and tokens[0].lower() == "include":
+            for pattern in tokens[1:]:
+                pattern = pattern if os.path.isabs(pattern) else os.path.join(os.path.dirname(main), pattern)
+                found.append(os.path.dirname(pattern))
+                for path in sorted(expand_glob(pattern)):
+                    found.extend(config_files(path, read, expand_glob, depth + 1))
+    return list(dict.fromkeys(found))
+
+
+def stale_rows(started, paths, stat=os.stat):
+    """ctime cannot be backdated, so it wins over mtime."""
+    rows, errors = [], []
+    for path in paths:
+        try:
+            info = stat(path)
+        except OSError as exc:
+            errors.append("cannot stat %s: %s" % (path, exc))
+            continue
+        edited = max(info.st_mtime, info.st_ctime)
+        if edited > started + 1:
+            rows.append({"kind": "stale-config", "path": path, "edited": int(edited), "started": int(started)})
+    return rows, errors
+
+
+# ---- live processes -------------------------------------------------------------------
+
+def environment_rows(pids, proc="/proc"):
+    rows, errors = [], []
+    for pid in pids:
+        try:
+            with open("%s/%d/environ" % (proc, pid), "rb") as handle:
+                data = handle.read()
+        except FileNotFoundError:
+            continue  # exited meanwhile
+        except OSError as exc:
+            errors.append("cannot read environ of sshd pid %d: %s" % (pid, exc))
+            continue
+        for item in data.split(b"\0"):
+            name, _, value = item.decode("utf-8", "replace").partition("=")
+            if name in LIVE_ENV and value:
+                rows.append({"kind": "live-env", "pid": pid, "name": name, "value": value})
+    return rows, errors
+
+
+def mapped_libraries(pid, proc="/proc"):
+    """{path: deleted?} of file-backed shared objects mapped by the process."""
+    libraries = {}
+    with open("%s/%d/maps" % (proc, pid)) as handle:
+        for line in handle:
+            fields = line.rstrip("\n").split(None, 5)
+            if len(fields) < 6 or not fields[5].startswith("/"):
+                continue
+            path = fields[5]
+            deleted = path.endswith(" (deleted)")
+            path = path.removesuffix(" (deleted)")
+            if re.search(r"\.so(\.|$)", os.path.basename(path)):
+                libraries[path] = libraries.get(path, False) or deleted
+    return libraries
+
+
+def library_rows(pids, proc="/proc", owner=owned, allow_paths=()):
+    rows, errors, verdicts = [], [], {}
+    for pid in pids:
+        try:
+            libraries = mapped_libraries(pid, proc)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            errors.append("cannot read maps of sshd pid %d: %s" % (pid, exc))
+            continue
+        for path, deleted in sorted(libraries.items()):
+            if path in allow_paths:
+                continue
+            if deleted:
+                rows.append({"kind": "live-library", "pid": pid, "path": path, "why": "mapped file was deleted"})
+                continue
+            if path not in verdicts:
+                verdicts[path] = owner(path)
+            if verdicts[path] is None:
+                errors.append("no package database; cannot tell whether %s is owned" % path)
+            elif not verdicts[path]:
+                rows.append({"kind": "live-library", "pid": pid, "path": path, "why": "not owned by any package"})
+    return rows, sorted(set(errors))
+
+
+# ---- listening sockets ----------------------------------------------------------------
+
+def decode_address(text):
+    """/proc/net/tcp hex address:port -> (ip string, port)."""
+    host, _, port = text.partition(":")
+    raw = bytes.fromhex(host)
+    if len(raw) == 4:
+        address = ipaddress.IPv4Address(raw[::-1])
+    else:  # four little-endian 32-bit words
+        address = ipaddress.IPv6Address(b"".join(raw[i:i + 4][::-1] for i in range(0, 16, 4)))
+    return str(address), int(port, 16)
+
+
+def listening(proc="/proc"):
+    """{inode: (ip, port)} of listening TCP sockets."""
+    sockets = {}
+    for name in ("tcp", "tcp6"):
+        try:
+            with open("%s/net/%s" % (proc, name)) as handle:
+                next(handle, None)
+                for line in handle:
+                    fields = line.split()
+                    if len(fields) > 9 and fields[3] == LISTEN:
+                        sockets[int(fields[9])] = decode_address(fields[1])
+        except FileNotFoundError:
+            continue
+    return sockets
+
+
+def socket_inodes(pid, proc="/proc"):
+    inodes = set()
+    directory = "%s/%d/fd" % (proc, pid)
+    for entry in os.listdir(directory):
+        try:
+            target = os.readlink(os.path.join(directory, entry))
+        except OSError:
+            continue
+        match = re.fullmatch(r"socket:\[(\d+)\]", target)
+        if match:
+            inodes.add(int(match[1]))
+    return inodes
+
+
+def expected_listeners(effective):
+    """(set of (ip, port), set of ports, exact?) from sshd -T `listenaddress`/`port`."""
+    ports = {int(p) for p in effective.get("port", [])}
+    pairs, exact = set(), True
+    for value in effective.get("listenaddress", []):
+        match = re.fullmatch(r"\[([^\]]+)\]:(\d+)|([^:]+):(\d+)", value)
+        try:
+            host, port = (match[1], match[2]) if match[1] else (match[3], match[4])
+            pairs.add((str(ipaddress.ip_address(host)), int(port)))
+            ports.add(int(port))
+        except (TypeError, ValueError):
+            exact = False  # hostname or odd syntax: compare ports only
+    return pairs, ports, exact
+
+
+def listener_rows(master, effective, proc="/proc"):
+    rows = []
+    try:
+        inodes = socket_inodes(master, proc)
+        sockets = listening(proc)
+    except OSError as exc:
+        return rows, ["cannot inspect sshd sockets: %s" % exc]
+    pairs, ports, exact = expected_listeners(effective)
+    if not ports:
+        return rows, ["sshd -T gave no port; cannot judge listeners"]
+    for inode in sorted(inodes & set(sockets)):
+        address, port = sockets[inode]
+        if port not in ports:
+            rows.append({"kind": "odd-listener", "address": address, "port": port, "why": "port not in sshd configuration"})
+        elif exact and pairs and (address, port) not in pairs:
+            rows.append({"kind": "odd-listener", "address": address, "port": port, "why": "address not in ListenAddress"})
+    return rows, []
+
+
+def scan(allow_keys=(), allow_options=(), allow_paths=(), proc="/proc", run=subprocess.run, accounts=None,
+         config=None):
     rows, errors = [], []
     allowed = {parsed[0] for parsed in map(parse_key_line, allow_keys) if parsed}
     if not allowed:
         errors.append("no key allowlist supplied; every authorized key is reported")
-    people = accounts()
     try:
-        output = subprocess.run([sshd_binary(), "-T"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                universal_newlines=True, timeout=30)
-        if output.returncode:
-            raise RuntimeError(output.stderr.strip() or "sshd -T failed")
-        effective = parse_effective(output.stdout)
-        rows += option_rows(effective, set(allow_options))
-    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        errors.append("sshd settings unavailable: %s" % exc)
-        effective = {}
-    found, problems = key_rows(key_files(effective, people), allowed)
+        binary = sshd_binary(proc)
+    except RuntimeError as exc:
+        return {"findings": [], "errors": errors + [str(exc)]}
+    accounts = login_accounts() if accounts is None else accounts
+    per_user, base, problems = effective_by_user(binary, accounts, run)
+    errors += problems
+    if not base:
+        return {"findings": [], "errors": errors}
+    rows += effective_option_rows(per_user, base, set(allow_options))
+    found, problems = key_rows(key_files(per_user, accounts), allowed)
     rows += found
     errors += problems
-    rows += startup_rows(people)
-    found, problems = unowned_rows(set(allow_paths))
+    rows += startup_rows(per_user, accounts)
+    found, problems = unowned_rows(referenced_paths(per_user, base), set(allow_paths))
     rows += found
     errors += problems
+    master, family = sshd_pids(proc)
+    if master is None:
+        errors.append("no running sshd found; live checks skipped")
+    else:
+        try:
+            found, problems = stale_rows(start_time(master, proc), config_files() if config is None else config)
+            rows += found
+            errors += problems
+        except (OSError, ValueError, StopIteration) as exc:
+            errors.append("cannot compute sshd start time: %s" % exc)
+        for part in (environment_rows(family, proc), library_rows(family, proc, allow_paths=set(allow_paths))):
+            rows += part[0]
+            errors += part[1]
+        found, problems = listener_rows(master, base, proc)
+        rows += found
+        errors += problems
     skip = set(allow_paths)
     rows = [row for row in rows if row.get("path", row.get("file")) not in skip]
-    return {"findings": rows, "errors": errors}
+    return {"findings": rows, "errors": sorted(set(errors))}
 
 
 def main(argv=None):
