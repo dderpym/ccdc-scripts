@@ -47,7 +47,7 @@ class ReinstallPam(Script):
 
 
 class PamGate(Script):
-    """Refuse to continue while the PAM stack is dirty.
+    """Refuse to continue while the ACTIVE PAM stack (as resolved on the host, plus loaded modules) is dirty.
 
     Password changes (chpasswd) run through PAM, so a pam_exec expose_authtok hook sees
     every rotated password. Anything rotated before the stack was clean must be rotated again.
@@ -58,10 +58,13 @@ class PamGate(Script):
 
     def run(self, target):
         result = self.scanner.run(target)
-        if result:
+        # A stack that cannot be resolved (missing include, loop) is unknown, not clean.
+        unknown = [e for e in result.errors if "PAM include" in e or "cannot read PAM" in e]
+        if result or unknown:
             raise PamDirty(f"{target}: PAM stack is not clean; refusing to proceed. Passwords set while "
                            "a hook was live are exposed and must be rotated again after cleanup.\n"
-                           + "\n".join("  " + f.summary for f in result))
+                           + "\n".join("  " + f.summary for f in result)
+                           + "".join("\n  unresolved: " + e for e in unknown))
         return result
 
 
