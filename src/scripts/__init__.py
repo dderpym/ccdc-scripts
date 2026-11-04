@@ -1,1 +1,1 @@
-"""Scripts that change hosts, grouped by the phase they are used in: init, ssh, firewall, harden (optional hardening), fix (remediation run by autofixes)."""
+"""Scripts that run on hosts, one package per phase: init, ssh, firewall."""
