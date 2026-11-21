@@ -1,5 +1,8 @@
 all:
   vars:
+    # Offer ONLY the team key (from the agent). With several agent keys, MaxAuthTries 3 would
+    # disconnect us before the team key is tried.
+    ansible_ssh_common_args: "-o IdentitiesOnly=yes -o IdentityFile={{ inventory_dir }}/secrets/oski.pub"
     # SSH scan settings. `ccdcctl scan` compares each host's real SSH configuration to the
     # values below and reports anything that differs (`scan --fix` can correct it).
     # These are the defaults for every host. Leave a line out to stop checking that setting.
@@ -15,22 +18,77 @@ all:
     #         passwordauthentication: "yes"
     #         allowtcpforwarding: null
     ssh:
-      permitrootlogin: "no"
+      # Scored ssh-cert hosts are certificate-only, so passwords and root passwords stay off.
+      # prohibit-password (not "no") keeps root certificate/key login working for the scorer.
+      permitrootlogin: prohibit-password
       passwordauthentication: "no"
-      maxauthtries: 3
-      logingracetime: 30
+      kbdinteractiveauthentication: "no"
+      permitemptypasswords: "no"
+      pubkeyauthentication: "yes"
+      hostbasedauthentication: "no"
+      permituserenvironment: "no"
       x11forwarding: "no"
       allowagentforwarding: "no"
       allowtcpforwarding: "no"
+      gatewayports: "no"
+      permittunnel: "no"
+      maxauthtries: 3
+      logingracetime: 30
       clientaliveinterval: 300
       clientalivecountmax: 2
+      authorizedkeysfile: .ssh/authorized_keys
+    # Things that are legitimate and must not be reported or "fixed" (ssh_allow).
+    # options: 'name=value' exactly as `sshd -T` prints them; paths: files sshd may reference;
+    # keys: extra authorized public-key lines. Declare it on a host, or here for everyone.
+    #     thorska:
+    #       ssh_allow:
+    #         options: ["trustedusercakeys=/etc/ssh/ssh_user_ca_key.pub"]
+    #         paths: ["/etc/ssh/ssh_user_ca_key.pub"]
   hosts:
     # `ccdcctl services` records each host's approved services here, e.g.
     #   services:
     #     - {port: 22, proto: tcp, name: sshd}
-    hatchery:
-      ansible_host: 127.0.0.1
-      ansible_port: 22270
-    tarpit:
-      ansible_host: 127.0.0.1
-      ansible_port: 22170
+    kolla:  # Alpine Linux, Fileshare
+      ansible_host: 10.100.114.30
+      ssh_allow:
+        keys:  # organizers' vault CA (cert-authority line in root's authorized_keys)
+          - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCbPlLEk1ROabzZuQgVDMTbLBHcXHUpXj3CXoeDRsasow6i/1QqcriAjK6aCMVaMbSsNpk+bvFa4Nu6En6KU7YtkR6MtMa7UriLQvM6CmQgJDiGz1iV3E9Y3Z93rAYBEu1Yn8r5QacqTkv8OiS4cdcg/JjxQFkHkvUCkT7peX0drfzUPq1vPkOneXg773U099QhguQNZjlttQezam+FmYlsUyGUqClMp1X9++v8cTspuzpWdEBhfZMIlRXsqLIOG8kiT/Nvgw3F12hJ/lHUk+mOn5esE3VewLbXSw8PgMQQily7RPzZfv+FCmuGaMMGVYmB9B+ZIBskLwdvzX5xU+m6R38gavh8h3qLgLUPc2w8kqtkIDZ6I+3dHOPWepUXGfnVSrJkmoDZuSGQNMYElUSNAgcQgBhvLv8/aDP9SlW3dU817UREFXLIXJC1+/6lK/Dhbw7Bnv5rxgpgikLkC9CvXCwIM/NNSZ6Gd9bkP1r759+oqmZNSZQZSnde/IecB1AuhGVTZp957QCBJJe7vtd2Ke3qA0YYfxc2wHLk2zIW0noUfqIhMi8A1m+XmOhIsCGeWQH5SY5KsizS1MW/y1IF69EFmjKF0Tr7xawng3FwSM4AmcOpuK6hypQ9BwadXRZrZMauW6UaIjnbYmK9gZGA1/4uCxT+RaWlokw/qvVrrQ== organizer-vault-ca"
+    gufu:  # Rocky Linux, Gitea
+      ansible_host: 10.100.114.100
+      ssh_allow:
+        keys:  # organizers' vault CA (cert-authority line in root's authorized_keys)
+          - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCbPlLEk1ROabzZuQgVDMTbLBHcXHUpXj3CXoeDRsasow6i/1QqcriAjK6aCMVaMbSsNpk+bvFa4Nu6En6KU7YtkR6MtMa7UriLQvM6CmQgJDiGz1iV3E9Y3Z93rAYBEu1Yn8r5QacqTkv8OiS4cdcg/JjxQFkHkvUCkT7peX0drfzUPq1vPkOneXg773U099QhguQNZjlttQezam+FmYlsUyGUqClMp1X9++v8cTspuzpWdEBhfZMIlRXsqLIOG8kiT/Nvgw3F12hJ/lHUk+mOn5esE3VewLbXSw8PgMQQily7RPzZfv+FCmuGaMMGVYmB9B+ZIBskLwdvzX5xU+m6R38gavh8h3qLgLUPc2w8kqtkIDZ6I+3dHOPWepUXGfnVSrJkmoDZuSGQNMYElUSNAgcQgBhvLv8/aDP9SlW3dU817UREFXLIXJC1+/6lK/Dhbw7Bnv5rxgpgikLkC9CvXCwIM/NNSZ6Gd9bkP1r759+oqmZNSZQZSnde/IecB1AuhGVTZp957QCBJJe7vtd2Ke3qA0YYfxc2wHLk2zIW0noUfqIhMi8A1m+XmOhIsCGeWQH5SY5KsizS1MW/y1IF69EFmjKF0Tr7xawng3FwSM4AmcOpuK6hypQ9BwadXRZrZMauW6UaIjnbYmK9gZGA1/4uCxT+RaWlokw/qvVrrQ== organizer-vault-ca"
+    kvigindis:  # Ubuntu 24.04, Furniture Help Site
+      ansible_host: 10.100.114.44
+      ssh_allow:
+        keys:  # organizers' vault CA (cert-authority line in root's authorized_keys)
+          - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCbPlLEk1ROabzZuQgVDMTbLBHcXHUpXj3CXoeDRsasow6i/1QqcriAjK6aCMVaMbSsNpk+bvFa4Nu6En6KU7YtkR6MtMa7UriLQvM6CmQgJDiGz1iV3E9Y3Z93rAYBEu1Yn8r5QacqTkv8OiS4cdcg/JjxQFkHkvUCkT7peX0drfzUPq1vPkOneXg773U099QhguQNZjlttQezam+FmYlsUyGUqClMp1X9++v8cTspuzpWdEBhfZMIlRXsqLIOG8kiT/Nvgw3F12hJ/lHUk+mOn5esE3VewLbXSw8PgMQQily7RPzZfv+FCmuGaMMGVYmB9B+ZIBskLwdvzX5xU+m6R38gavh8h3qLgLUPc2w8kqtkIDZ6I+3dHOPWepUXGfnVSrJkmoDZuSGQNMYElUSNAgcQgBhvLv8/aDP9SlW3dU817UREFXLIXJC1+/6lK/Dhbw7Bnv5rxgpgikLkC9CvXCwIM/NNSZ6Gd9bkP1r759+oqmZNSZQZSnde/IecB1AuhGVTZp957QCBJJe7vtd2Ke3qA0YYfxc2wHLk2zIW0noUfqIhMi8A1m+XmOhIsCGeWQH5SY5KsizS1MW/y1IF69EFmjKF0Tr7xawng3FwSM4AmcOpuK6hypQ9BwadXRZrZMauW6UaIjnbYmK9gZGA1/4uCxT+RaWlokw/qvVrrQ== organizer-vault-ca"
+    thorska:  # Fedora 44, Home Manager
+      ansible_host: 10.100.114.231
+      ssh_allow:  # ssh-cert (scored): keep the certificate authority trust
+        options: ["trustedusercakeys=/etc/ssh/ssh_user_ca_key.pub"]
+        paths: ["/etc/ssh/ssh_user_ca_key.pub"]
+        keys:  # organizers' vault CA (cert-authority line in root's authorized_keys)
+          - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCbPlLEk1ROabzZuQgVDMTbLBHcXHUpXj3CXoeDRsasow6i/1QqcriAjK6aCMVaMbSsNpk+bvFa4Nu6En6KU7YtkR6MtMa7UriLQvM6CmQgJDiGz1iV3E9Y3Z93rAYBEu1Yn8r5QacqTkv8OiS4cdcg/JjxQFkHkvUCkT7peX0drfzUPq1vPkOneXg773U099QhguQNZjlttQezam+FmYlsUyGUqClMp1X9++v8cTspuzpWdEBhfZMIlRXsqLIOG8kiT/Nvgw3F12hJ/lHUk+mOn5esE3VewLbXSw8PgMQQily7RPzZfv+FCmuGaMMGVYmB9B+ZIBskLwdvzX5xU+m6R38gavh8h3qLgLUPc2w8kqtkIDZ6I+3dHOPWepUXGfnVSrJkmoDZuSGQNMYElUSNAgcQgBhvLv8/aDP9SlW3dU817UREFXLIXJC1+/6lK/Dhbw7Bnv5rxgpgikLkC9CvXCwIM/NNSZ6Gd9bkP1r759+oqmZNSZQZSnde/IecB1AuhGVTZp957QCBJJe7vtd2Ke3qA0YYfxc2wHLk2zIW0noUfqIhMi8A1m+XmOhIsCGeWQH5SY5KsizS1MW/y1IF69EFmjKF0Tr7xawng3FwSM4AmcOpuK6hypQ9BwadXRZrZMauW6UaIjnbYmK9gZGA1/4uCxT+RaWlokw/qvVrrQ== organizer-vault-ca"
+      services:
+        - {port: 22, proto: tcp, name: sshd.service}
+        - {port: 53, proto: tcp, name: aardvark-dns}
+        - {port: 80, proto: tcp, name: caddy.service}
+        - {port: 443, proto: tcp, name: caddy.service}
+        - {port: 8080, proto: tcp, name: step-ca-api.service}
+        - {port: 9000, proto: tcp, name: step-ca.service}
+        - {port: 53, proto: udp, name: aardvark-dns}
+    djupi:  # Linux Mint 22.3, Point of Sale
+      ansible_host: 10.100.114.222
+      ssh_allow:  # ssh-cert (scored): keep the certificate authority trust
+        options: ["trustedusercakeys=/etc/ssh/ssh_user_ca_key.pub"]
+        paths: ["/etc/ssh/ssh_user_ca_key.pub"]
+        keys:  # organizers' vault CA (cert-authority line in root's authorized_keys)
+          - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCbPlLEk1ROabzZuQgVDMTbLBHcXHUpXj3CXoeDRsasow6i/1QqcriAjK6aCMVaMbSsNpk+bvFa4Nu6En6KU7YtkR6MtMa7UriLQvM6CmQgJDiGz1iV3E9Y3Z93rAYBEu1Yn8r5QacqTkv8OiS4cdcg/JjxQFkHkvUCkT7peX0drfzUPq1vPkOneXg773U099QhguQNZjlttQezam+FmYlsUyGUqClMp1X9++v8cTspuzpWdEBhfZMIlRXsqLIOG8kiT/Nvgw3F12hJ/lHUk+mOn5esE3VewLbXSw8PgMQQily7RPzZfv+FCmuGaMMGVYmB9B+ZIBskLwdvzX5xU+m6R38gavh8h3qLgLUPc2w8kqtkIDZ6I+3dHOPWepUXGfnVSrJkmoDZuSGQNMYElUSNAgcQgBhvLv8/aDP9SlW3dU817UREFXLIXJC1+/6lK/Dhbw7Bnv5rxgpgikLkC9CvXCwIM/NNSZ6Gd9bkP1r759+oqmZNSZQZSnde/IecB1AuhGVTZp957QCBJJe7vtd2Ke3qA0YYfxc2wHLk2zIW0noUfqIhMi8A1m+XmOhIsCGeWQH5SY5KsizS1MW/y1IF69EFmjKF0Tr7xawng3FwSM4AmcOpuK6hypQ9BwadXRZrZMauW6UaIjnbYmK9gZGA1/4uCxT+RaWlokw/qvVrrQ== organizer-vault-ca"
+    skerja:  # Alpine 3.23, Employee + Customer Tickets
+      ansible_host: 10.100.114.97
+      ssh_allow:  # ssh-cert (scored): keep the certificate authority trust
+        options: ["trustedusercakeys=/etc/ssh/ssh_user_ca_key.pub"]
+        paths: ["/etc/ssh/ssh_user_ca_key.pub"]
+        keys:  # organizers' vault CA (cert-authority line in root's authorized_keys)
+          - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAACAQCbPlLEk1ROabzZuQgVDMTbLBHcXHUpXj3CXoeDRsasow6i/1QqcriAjK6aCMVaMbSsNpk+bvFa4Nu6En6KU7YtkR6MtMa7UriLQvM6CmQgJDiGz1iV3E9Y3Z93rAYBEu1Yn8r5QacqTkv8OiS4cdcg/JjxQFkHkvUCkT7peX0drfzUPq1vPkOneXg773U099QhguQNZjlttQezam+FmYlsUyGUqClMp1X9++v8cTspuzpWdEBhfZMIlRXsqLIOG8kiT/Nvgw3F12hJ/lHUk+mOn5esE3VewLbXSw8PgMQQily7RPzZfv+FCmuGaMMGVYmB9B+ZIBskLwdvzX5xU+m6R38gavh8h3qLgLUPc2w8kqtkIDZ6I+3dHOPWepUXGfnVSrJkmoDZuSGQNMYElUSNAgcQgBhvLv8/aDP9SlW3dU817UREFXLIXJC1+/6lK/Dhbw7Bnv5rxgpgikLkC9CvXCwIM/NNSZ6Gd9bkP1r759+oqmZNSZQZSnde/IecB1AuhGVTZp957QCBJJe7vtd2Ke3qA0YYfxc2wHLk2zIW0noUfqIhMi8A1m+XmOhIsCGeWQH5SY5KsizS1MW/y1IF69EFmjKF0Tr7xawng3FwSM4AmcOpuK6hypQ9BwadXRZrZMauW6UaIjnbYmK9gZGA1/4uCxT+RaWlokw/qvVrrQ== organizer-vault-ca"

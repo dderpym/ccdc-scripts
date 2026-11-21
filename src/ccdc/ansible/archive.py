@@ -6,6 +6,15 @@ import zipfile
 
 DRIVER = Path(__file__).resolve().parent / "driver.py"
 STAMP = (2020, 1, 1, 0, 0, 0)  # fixed, so identical content gives identical bytes
+# A zip may carry any prefix: this sh header re-runs the archive under the first Python >= 3.9
+# (EL8's python3 is 3.6; its python3.12 is a separate package installed by init).
+HEADER = b"""#!/bin/sh
+for py in python3 python3.14 python3.13 python3.12 python3.11 python3.10 python3.9; do
+  command -v "$py" >/dev/null 2>&1 && "$py" -c 'import sys; sys.exit(sys.version_info < (3, 9))' 2>/dev/null && exec "$py" "$0" "$@"
+done
+echo "ccdc: no python >= 3.9 on this host (run ccdcctl init)" >&2
+exit 127
+"""
 
 
 def build(steps, destination, keep_going=True):
@@ -25,7 +34,7 @@ def build(steps, destination, keep_going=True):
         {"name": step["name"], "file": "steps/%s/%s" % (step["name"], Path(step["source"]).name),
          "args": list(step["args"]), "stdin": bool(step["stdin"]), "timeout": step["timeout"]} for step in steps]}
     with open(destination, "wb") as out:
-        out.write(b"#!/usr/bin/env python3\n")
+        out.write(HEADER)
         with zipfile.ZipFile(out, "w") as archive:
             add(archive, "__main__.py", DRIVER.read_bytes())
             add(archive, "manifest.json", json.dumps(manifest, sort_keys=True))

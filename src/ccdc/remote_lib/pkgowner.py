@@ -51,8 +51,15 @@ def checker(run=subprocess.run, which=shutil.which, root="/"):
     if name is None:
         return lambda path: None
 
+    cache = {}  # the same libraries are mapped by every process: ask the database once per spelling
+
+    def ask(form):
+        if form not in cache:
+            cache[form] = _single(name, form, run)
+        return cache[form]
+
     def owned(path):
-        return any(_single(name, form, run) for form in aliases(path, root))
+        return any(ask(form) for form in aliases(path, root))
     return owned
 
 

@@ -20,7 +20,7 @@ class SSHAllow:
     keys: tuple = ()      # extra authorized public-key lines
 
 
-# host name -> SSHAllow. Fill in per competition; the scanner also accepts one in its constructor.
+# host name -> SSHAllow, in code. Normally leave empty: declare `ssh_allow:` in inventory.yml instead.
 ALLOWLIST = {}
 
 
@@ -158,6 +158,18 @@ def yaml_text(value):
     return {True: "yes", False: "no"}.get(value, str(value)) if isinstance(value, bool) else str(value)
 
 
+def declared_allow(variables):
+    """Inventory `ssh_allow:` (options / paths / keys), merged across group and host by Ansible's
+    own variable precedence. Options are 'name=value' as `sshd -T` prints them."""
+    block = variables.get("ssh_allow")
+    block = block if isinstance(block, dict) else {}
+
+    def items(name):
+        value = block.get(name) or ()
+        return tuple(str(v) for v in ([value] if isinstance(value, str) else value))
+    return SSHAllow(options=items("options"), paths=items("paths"), keys=items("keys"))
+
+
 def team_keys(path=TEAM_KEYS):
     try:
         return tuple(line.strip() for line in path.read_text().splitlines() if line.strip() and not line.startswith("#"))
@@ -207,9 +219,11 @@ class SSHVectorScanner(Scanner):
         self.keys = team_keys() if keys is None else tuple(keys)
 
     def remote_step(self, target):
-        allow = self.allowlist.get(getattr(target, "host", None), SSHAllow())
-        return ScanSSHVectors(self.runner, policy=declared_policy(getattr(target, "vars", None) or {}),
-                              keys=(*self.keys, *allow.keys), options=tuple(allow.options), paths=tuple(allow.paths))
+        variables = getattr(target, "vars", None) or {}
+        code, declared = self.allowlist.get(getattr(target, "host", None), SSHAllow()), declared_allow(variables)
+        return ScanSSHVectors(self.runner, policy=declared_policy(variables),
+                              keys=(*self.keys, *code.keys, *declared.keys),
+                              options=(*code.options, *declared.options), paths=(*code.paths, *declared.paths))
 
     def findings(self, target, row):
         kind = row["kind"]

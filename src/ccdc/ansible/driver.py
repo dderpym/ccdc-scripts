@@ -18,7 +18,10 @@ def interpreter(path):
     """The shebang's command, so a noexec scratch directory cannot stop a step; sh otherwise."""
     with open(path, "rb") as handle:
         first = handle.readline(256).decode("utf-8", "replace")
-    return first[2:].split() if first.startswith("#!") and first[2:].split() else ["/bin/sh"]
+    command = first[2:].split() if first.startswith("#!") else []
+    if any(os.path.basename(part).startswith("python") for part in command[:2]):
+        return [sys.executable]  # the Python the header chose, not whatever python3 is on PATH
+    return command or ["/bin/sh"]
 
 
 def text(data):

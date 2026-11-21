@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import shlex
 import subprocess
+import sys
 import tempfile
 
 
@@ -67,28 +68,32 @@ def archive_request(archive, become=True, connection=False, payload=None):
         "payload": str(payload) if payload else ""}})
 
 
-def collect(hosts, archive, variables=None, run=run_ansible, **request):
+def collect(hosts, archive, variables=None, run=run_ansible, live=False, **request):
     """One Ansible batch running a BundleScript archive; (states, errors) keyed by host.
 
     Successful hosts are kept even when another is unreachable. `variables` are
     connection overrides (see ccdc.target.Auth); `request` is become/connection/payload.
+    live: show Ansible's progress on the terminal instead of capturing it (results still come from files).
     """
     with tempfile.TemporaryDirectory(prefix="ccdc-results-") as directory:
         command = ["ansible-playbook", str(PLAYBOOKS / "remote.yml"), "--limit", ":".join(hosts), *extra_args(),
                    "--extra-vars", archive_request(archive, **request)]
+        show = {"capture": False} if live else {}
         if variables:
-            result = with_vars(command, variables, run, result_dir=directory, result_task=TASK)
+            result = with_vars(command, variables, run, result_dir=directory, result_task=TASK, **show)
         else:
-            result = run(command, result_dir=directory, result_task=TASK)
+            result = run(command, result_dir=directory, result_task=TASK, **show)
         states, errors = {}, {}
         for host in hosts:
             try:
                 response = json.loads((Path(directory) / host).read_text())
                 if response.get("unreachable") or response.get("failed") or response.get("rc", 0):
                     raise ValueError(_failure(response, result))
-                states[host] = json.loads(response["stdout"])
+                # The driver prints one JSON line; over the PTY, hosts may append terminal junk after it
+                # (e.g. systemd 257+'s OSC 3008 context marker from /etc/profile.d on Fedora).
+                states[host] = json.JSONDecoder().raw_decode(response["stdout"].lstrip())[0]
             except FileNotFoundError:
-                errors[host] = result.stderr.strip() or result.stdout.strip() or "No Ansible result"
+                errors[host] = (result.stderr or "").strip() or (result.stdout or "").strip() or "No Ansible result"
             except (OSError, ValueError, KeyError) as exc:
                 errors[host] = str(exc)
         return states, errors
@@ -119,7 +124,7 @@ class AnsibleRunner:
 
     def archive(self, target, path, **request):
         """Run a BundleScript archive; returns its envelope {"steps": [{name, rc, stdout, stderr}]}."""
-        states, errors = collect([target.host], path, target.auth.variables(), **request)
+        states, errors = collect([target.host], path, target.auth.variables(), live=sys.stdout.isatty(), **request)
         if target.host in errors:
             raise RemoteError(f"{target.host}: {errors[target.host]}")
         return states[target.host]

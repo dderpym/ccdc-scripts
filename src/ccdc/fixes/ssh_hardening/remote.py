@@ -88,12 +88,21 @@ def set_before_include(text, names):
                    if line.strip() and not line.lstrip().startswith("#") and line.split()[0].lower() in names})
 
 
+# sshd -T spells some values with an older alias (Ubuntu prints prohibit-password as without-password).
+ALIASES = {"without-password": "prohibit-password"}
+
+
+def canonical(value):
+    value = str(value).strip().lower()
+    return ALIASES.get(value, value)
+
+
 def parse_effective(output):
     values = {}
     for line in output.splitlines():
         key, _, value = line.partition(" ")
         if key:
-            values.setdefault(key.lower(), value.strip().lower())
+            values.setdefault(key.lower(), canonical(value))
     return values
 
 
@@ -101,7 +110,7 @@ def mismatches(settings, effective_by_user):
     """[(user, option, wanted, got)] where the effective value differs from the declared one."""
     return [(user, option, wanted, effective.get(option))
             for user, effective in effective_by_user.items()
-            for option, wanted in settings.items() if effective.get(option) != wanted.lower()]
+            for option, wanted in settings.items() if effective.get(option) != canonical(wanted)]
 
 
 # ---- system access, kept in small functions so they are easy to replace ----
@@ -133,19 +142,23 @@ def login_users():
     return users
 
 
+# systemd, then OpenRC (Alpine), then SIGHUP to the master sshd from its pidfile.
+RELOAD_SHELL = ("systemctl reload sshd 2>/dev/null || systemctl reload ssh 2>/dev/null"
+                " || rc-service sshd reload 2>/dev/null"
+                " || kill -HUP \"$(cat /run/sshd.pid /var/run/sshd.pid 2>/dev/null | head -n1)\" 2>/dev/null")
+
+
 def reload_sshd():
-    for unit in ("sshd", "ssh"):
-        if subprocess.run(["systemctl", "reload", unit], stderr=subprocess.DEVNULL).returncode == 0:
-            return True
-    return False
+    return subprocess.run(["sh", "-c", RELOAD_SHELL], stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL).returncode == 0
 
 
 def watchdog_command(token, timeout=TIMEOUT):
     prev, ok = PREV_PREFIX + token, PREV_PREFIX + token + ".ok"
-    return ("sleep %d; if [ -f %s ]; then rm -rf %s %s; exit 0; fi; "
-            "[ -f %s/main ] && cp -p %s/main %s; "
-            "if [ -f %s/dropin ]; then cp -p %s/dropin %s; else rm -f %s; fi; rm -rf %s; "
-            "systemctl reload sshd 2>/dev/null || systemctl reload ssh"
+    return (("sleep %d; if [ -f %s ]; then rm -rf %s %s; exit 0; fi; "
+             "[ -f %s/main ] && cp -p %s/main %s; "
+             "if [ -f %s/dropin ]; then cp -p %s/dropin %s; else rm -f %s; fi; rm -rf %s; "
+             + RELOAD_SHELL.replace("%", "%%"))
             % (timeout, ok, prev, ok, prev, prev, MAIN, prev, prev, DROPIN, DROPIN, prev))
 
 

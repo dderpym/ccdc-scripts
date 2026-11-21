@@ -140,7 +140,8 @@ def deviates(option, value, expected):
     maxauthtries/logingracetime/clientalivecountmax is a maximum, and
     clientaliveinterval only deviates when it is 0 (keepalives off).
     """
-    value, expected = str(value).lower(), str(expected).lower()
+    aliases = {"without-password": "prohibit-password"}  # sshd -T's older spelling
+    value, expected = (aliases.get(str(v).lower(), str(v).lower()) for v in (value, expected))
     if option in MAX_LIMITS:
         return value.isdigit() and expected.isdigit() and int(value) > int(expected)
     if option == "clientaliveinterval":

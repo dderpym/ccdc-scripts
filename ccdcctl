@@ -689,6 +689,12 @@ def scan_command(args):
     targets = [Target(host, vars=hostvars.get(host, {})) for host in hosts]
     autofix = registry.global_autofix()
     scanners = registry.scanners()
+    if args.scanner:
+        wanted = [w.lower() for w in args.scanner]
+        scanners = [s for s in scanners if any(w in type(s).__name__.lower() for w in wanted)]
+        if not scanners:
+            raise RuntimeError("no scanner matches --scanner " + " ".join(args.scanner))
+        print("Scanners: " + ", ".join(type(s).__name__ for s in scanners), file=sys.stderr)
     results = scanning.scan_all(targets, scanners)
     if args.json and args.recheck:
         raise RuntimeError("--json does not combine with --recheck")
@@ -786,6 +792,8 @@ def argument_parser():
                      help="scan, wait, scan again and report what vanished or appeared (no fixes)")
     cmd.add_argument("--json", action="store_true",
                      help="print machine-readable findings (after --fix: the rescan) instead of the report")
+    cmd.add_argument("--scanner", action="append", default=[], metavar="NAME",
+                     help="run only scanners whose class name contains NAME (e.g. ssh); repeatable")
     cmd.add_argument("--only", action="append", default=[], metavar="CODE[=TEXT]",
                      help="with --fix: fix only findings with this code (whose summary contains TEXT); repeatable")
     cmd = sub.add_parser("complete", help="emit candidates for Bash complete -C")
