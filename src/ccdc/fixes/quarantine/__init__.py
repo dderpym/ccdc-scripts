@@ -1,0 +1,37 @@
+from ccdc.ansible import AnsibleScript
+from ccdc.findings import AutoFix
+from ccdc.scanners.unowned import TimestompedFile, UnitRunsUnownedBinary, UnownedExecutable
+
+
+class Quarantine(AnsibleScript):
+    """Evidence copy, freeze, kill and delete of binaries/units (remote.py)."""
+    source = "remote.py"
+    support = ("unowned.py", "pkgowner.py")
+
+    def arguments(self, paths=(), **kwargs):
+        return list(paths)
+
+
+def paths(finding):
+    if isinstance(finding, UnitRunsUnownedBinary):
+        return [finding.unit, finding.binary]
+    return [finding.file]
+
+
+class QuarantineUnowned(AutoFix):
+    """Critical findings only; a package-owned unit is never deleted."""
+
+    def can_fix(self, finding):
+        # Off unless the host opts in (`quarantine_autofix: true` in inventory.yml): "no package owns it"
+        # also matches organizer-installed services (step-ca-api, act_runner) and backdated configs.
+        if not (getattr(finding.host, "vars", None) or {}).get("quarantine_autofix", False):
+            return False
+        if isinstance(finding, UnitRunsUnownedBinary):
+            return not finding.unit_owned and finding.severity == "critical"
+        return isinstance(finding, (UnownedExecutable, TimestompedFile)) and finding.severity == "critical"
+
+    def get_fix(self, finding):
+        return Quarantine().bind(target=finding.host, paths=paths(finding))
+
+    def describe(self, finding):
+        return "quarantine (evidence copy, kill, delete): " + ", ".join(paths(finding))

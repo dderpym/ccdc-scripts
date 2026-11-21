@@ -1,0 +1,162 @@
+name: ccdc-mirror
+# Six disposable hosts mirroring the real boxes (same distros, same last-octet IPs). Lab only.
+x-host: &host
+  cap_add: [NET_ADMIN, SYS_ADMIN, SYS_PTRACE]   # firewall namespace, private-cgroup remount, /proc/PID/exe
+  cgroup: private
+  tmpfs: [/run, /run/lock, "/tmp:rw,exec,nosuid,nodev,mode=1777"]   # real hosts do not mount /tmp noexec; scanners run helpers from it
+  cpus: 1
+  mem_limit: 512m
+  pids_limit: 256
+  dns: ["${CCDC_LAB_DNS:-1.1.1.1}", 8.8.8.8]    # do not inherit host VPN-only resolvers
+  dns_search: ["."]
+  healthcheck:
+    test: [CMD, /usr/local/bin/ccdc-lab-health]
+    interval: 3s
+    timeout: 8s
+    retries: 40
+services:
+  daffy:
+    <<: *host
+    build:
+      context: .
+      target: deb
+      network: host   # image builds download packages; runtime uses a NATed bridge
+      args: {BASE: "debian:trixie"}
+    image: ccdc-mirror-debian13
+    hostname: daffy
+    container_name: ccdc-mirror-daffy
+    environment:
+      container: docker
+      LAB_SOCKET_OWNER: "${CCDC_LAB_UID:?Run lab/mirror/manage up}"
+    labels:
+      ccdc.lab.ssh_port: "22011"
+      ccdc.lab.http_port: "8011"
+      ccdc.lab.app_port: "9011"
+    volumes:
+      - ./secrets/id_ed25519.pub:/run/lab-key.pub:ro
+      - ./secrets/sockets/daffy:/run/lab-sockets
+    networks:
+      isolated:
+        ipv4_address: 172.31.133.11
+  elmer:
+    <<: *host
+    build:
+      context: .
+      target: deb
+      network: host   # image builds download packages; runtime uses a NATed bridge
+      args: {BASE: "ubuntu:22.04"}
+    image: ccdc-mirror-ubuntu2204
+    hostname: elmer
+    container_name: ccdc-mirror-elmer
+    environment:
+      container: docker
+      LAB_SOCKET_OWNER: "${CCDC_LAB_UID:?Run lab/mirror/manage up}"
+    labels:
+      ccdc.lab.ssh_port: "22077"
+      ccdc.lab.http_port: "8077"
+      ccdc.lab.app_port: "9077"
+    volumes:
+      - ./secrets/id_ed25519.pub:/run/lab-key.pub:ro
+      - ./secrets/sockets/elmer:/run/lab-sockets
+    networks:
+      isolated:
+        ipv4_address: 172.31.133.77
+  foghorn:
+    <<: *host
+    build:
+      context: .
+      target: rpm
+      network: host   # image builds download packages; runtime uses a NATed bridge
+      args: {BASE: "rockylinux:9"}
+    image: ccdc-mirror-rocky9
+    hostname: foghorn
+    container_name: ccdc-mirror-foghorn
+    environment:
+      container: docker
+      LAB_SOCKET_OWNER: "${CCDC_LAB_UID:?Run lab/mirror/manage up}"
+    labels:
+      ccdc.lab.ssh_port: "22013"
+      ccdc.lab.http_port: "8013"
+      ccdc.lab.app_port: "9013"
+    volumes:
+      - ./secrets/id_ed25519.pub:/run/lab-key.pub:ro
+      - ./secrets/sockets/foghorn:/run/lab-sockets
+    networks:
+      isolated:
+        ipv4_address: 172.31.133.13
+  sylvester:
+    <<: *host
+    build:
+      context: .
+      target: rpm
+      network: host   # image builds download packages; runtime uses a NATed bridge
+      args: {BASE: "rockylinux:9"}
+    image: ccdc-mirror-rocky9
+    hostname: sylvester
+    container_name: ccdc-mirror-sylvester
+    environment:
+      container: docker
+      LAB_SOCKET_OWNER: "${CCDC_LAB_UID:?Run lab/mirror/manage up}"
+    labels:
+      ccdc.lab.ssh_port: "22069"
+      ccdc.lab.http_port: "8069"
+      ccdc.lab.app_port: "9069"
+    volumes:
+      - ./secrets/id_ed25519.pub:/run/lab-key.pub:ro
+      - ./secrets/sockets/sylvester:/run/lab-sockets
+    networks:
+      isolated:
+        ipv4_address: 172.31.133.69
+  marvin:
+    <<: *host
+    build:
+      context: .
+      target: deb
+      network: host   # image builds download packages; runtime uses a NATed bridge
+      args: {BASE: "ubuntu:24.04"}
+    image: ccdc-mirror-ubuntu2404
+    hostname: marvin
+    container_name: ccdc-mirror-marvin
+    environment:
+      container: docker
+      LAB_SOCKET_OWNER: "${CCDC_LAB_UID:?Run lab/mirror/manage up}"
+    labels:
+      ccdc.lab.ssh_port: "22199"
+      ccdc.lab.http_port: "8199"
+      ccdc.lab.app_port: "9199"
+    volumes:
+      - ./secrets/id_ed25519.pub:/run/lab-key.pub:ro
+      - ./secrets/sockets/marvin:/run/lab-sockets
+    networks:
+      isolated:
+        ipv4_address: 172.31.133.199
+  taz:
+    <<: *host
+    build:
+      context: .
+      target: deb
+      network: host   # image builds download packages; runtime uses a NATed bridge
+      args: {BASE: "debian:trixie"}
+    image: ccdc-mirror-debian13
+    hostname: taz
+    container_name: ccdc-mirror-taz
+    environment:
+      container: docker
+      LAB_SOCKET_OWNER: "${CCDC_LAB_UID:?Run lab/mirror/manage up}"
+    labels:
+      ccdc.lab.ssh_port: "22169"
+      ccdc.lab.http_port: "8169"
+      ccdc.lab.app_port: "9169"
+    volumes:
+      - ./secrets/id_ed25519.pub:/run/lab-key.pub:ro
+      - ./secrets/sockets/taz:/run/lab-sockets
+    networks:
+      isolated:
+        ipv4_address: 172.31.133.169
+networks:
+  isolated:
+    name: ccdc-mirror-internal
+    internal: false   # NATed bridge so package downloads work; no service ports are published
+    ipam:
+      config:
+        - subnet: 172.31.133.0/24

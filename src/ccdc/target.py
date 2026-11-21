@@ -1,0 +1,55 @@
+"""Where a script runs and how it authenticates there."""
+from dataclasses import dataclass, field
+
+
+class Auth:
+    """Ansible connection variables for one way of logging in."""
+
+    def variables(self):
+        return {}
+
+
+@dataclass(frozen=True)
+class AgentAuth(Auth):
+    """The configured user (ansible.cfg: oski) with the key in the controller's ssh-agent."""
+    user: str = ""
+
+    def variables(self):
+        return {"ansible_user": self.user} if self.user else {}
+
+
+@dataclass(frozen=True)
+class PasswordAuth(Auth):
+    """A known password, e.g. the bootstrap root password. Never appears in argv or repr."""
+    user: str = "root"
+    password: str = field(default="", repr=False)
+
+    def variables(self):
+        ssh = ("-o ControlMaster=no -o ControlPath=none -o ForwardAgent=no "
+               "-o PreferredAuthentications=password -o PubkeyAuthentication=no "
+               "-o KbdInteractiveAuthentication=no")
+        return {"ansible_user": self.user, "ansible_become": self.user != "root",
+                "ansible_password": self.password, "ansible_ssh_pass": self.password,
+                "ansible_ssh_args": ssh}
+
+
+@dataclass(frozen=True)
+class SudoAuth(Auth):
+    """Key login as `user`, then sudo to root with no passwords (a rerun after hardening)."""
+    user: str = "oski"
+
+    def variables(self):
+        return {"ansible_user": self.user, "ansible_become_method": "sudo", "ansible_become_user": "root",
+                "ansible_password": "", "ansible_ssh_pass": "", "ansible_become_password": ""}
+
+
+@dataclass(frozen=True)
+class Target:
+    """A host name, or any Ansible --limit pattern ('all', 'a:b') for scripts that fan out."""
+    host: str
+    auth: Auth = field(default_factory=AgentAuth)
+    # Inventory hostvars (e.g. the `ssh:` policy). Declarative input for scanners: not identity, never printed.
+    vars: dict = field(default_factory=dict, compare=False, repr=False)
+
+    def __str__(self):
+        return self.host

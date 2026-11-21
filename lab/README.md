@@ -46,27 +46,25 @@ source ./setup                     # Bash: activate .venv and all CLI completion
 # ./lab/manage up --password-file lab/secrets/root.password
 export ANSIBLE_INVENTORY=lab/inventory.yml
 
-./scripts/ccdcctl ping
-./scripts/ccdcctl ssh status
-./scripts/ccdcctl firewall status
-./scripts/ccdcctl listeners
-./scripts/ccdcctl integrity
-./scripts/ccdcctl lse
-./scripts/ccdcctl monitor integrity --once
-./scripts/ccdcctl monitor lse --once
+./ccdcctl ping
+./ccdcctl scan
+./ccdcctl firewall status
+./ccdcctl listeners
+./ccdcctl integrity
+./ccdcctl lse
 
-./scripts/check-lab                 # opt-in live, read-only smoke suite
+./lab/check                 # opt-in live, read-only smoke suite
 ```
 
-The repository's `scripts/check-lab` validates native init and running managed
+The repository's `lab/check` validates native init and running managed
 services, package-repository DNS resolution, HTTP/SSH, existing discovery commands, persistent native integrity
-findings, LSE test IDs, and the combined monitor. It writes private evidence to `reports/lab/check.json` and uses the
+findings, and LSE test IDs. It writes private evidence to `reports/lab/check.json` and uses the
 normal repository report paths. It checks root password login too if
 `lab/secrets/root.password` exists. No tests run against real inventory hosts.
 
 Scanners return nonzero for these intentional findings; that is expected.
 Integrity/LSE findings must not be accepted as baselines.
-SSH/firewall monitoring still needs an explicitly reviewed policy baseline;
+SSH/firewall drift checks still need an explicitly reviewed policy baseline;
 there is no implicit baseline during lab startup. Firewall configure uses
 Ansible to provision missing networking tools from distribution repositories;
 init only bootstraps access. To apply changed DNS settings to existing containers,
@@ -108,8 +106,8 @@ For a lab stored elsewhere:
 ```sh
 python3 /path/to/lab/manage up --password-file /path/to/lab/secrets/root.password
 export ANSIBLE_INVENTORY=/path/to/lab/inventory.yml
-./scripts/ccdcctl ping
-./scripts/check-lab --inventory /path/to/lab/inventory.yml
+./ccdcctl ping
+./lab/check --inventory /path/to/lab/inventory.yml
 ```
 
 Setup requires Docker Compose, Python with PyYAML, and `ssh-keygen`.
@@ -125,7 +123,7 @@ is not a test of `ccdcctl init`, which rotates root credentials and needs a real
 team public key. Run init only explicitly if you want to test that workflow.
 The entrypoint provisions fixtures, then execs the normal distro init. SSH is
 managed by the vendor `sshd` OpenRC service on Alpine and `ssh.service` on Debian;
-`ccdcctl ssh configure` can validate and reload it normally. The fixture app and
+`ccdcctl scan --fix` can validate and reload it normally. The fixture app and
 private socket relays have their own services too. For example:
 
 ```sh
@@ -154,6 +152,37 @@ Private keys and optional password files are under gitignored `lab/secrets/`.
 The Docker build context includes only the Dockerfile, entrypoint, and service
 definitions, never credentials or generated reports.
 
+## One test per finding
+
+`lab/findings` plants one condition in a running lab container, scans, and checks that the
+scanner reports it (and, with `--fix`, that the autofix removes it):
+
+```sh
+./lab/findings                        # every scenario on every host it applies to
+./lab/findings --host tarpit --fix writable-suid-binary memfd-process
+```
+
+Each line is `PASS`, `FAIL`, `SKIP` or `LEAK` plus the finding code, host and why. `LEAK`
+means the scenario's `clean` step did not bring the host back to its baseline. The exit
+status is nonzero for `FAIL` or `LEAK`. The clean lab already has many findings (some are
+intentional, some are scanner noise), so the runner never asserts on a whole list: it scans
+before and after the plant and only looks at what is new. Runs are serialised with
+`lab/.findings.lock`, so two people (or agents) cannot plant at once.
+
+A scenario is `lab/scenarios/<finding-code>.sh`, run inside the container as
+`sh -s -- plant` and `sh -s -- clean` (plain `sh`: Alpine has no bash). Header lines:
+
+| Header | Meaning |
+| --- | --- |
+| `# hosts: tarpit hatchery` | where it applies (default: both) |
+| `# match: TEXT` | text the new finding must contain (in its summary or any field); `plant` prints this as its **first output line** |
+| `# fix: yes\|no` | whether an autofix exists and `--fix` should see the finding disappear |
+| `# skip: REASON` | cannot be planted in these containers (for example no kernel audit); reported as `SKIP` with the reason, never as a pass |
+
+`plant` must leave the condition in place and `clean` must undo it completely, even after
+an autofix already changed things. `ccdcctl scan --json [--fix all --only CODE=TEXT]` is the
+machine-readable interface the runner uses.
+
 ## Intentional faults
 
 - Modified package-owned `/usr/bin/ssh` contents (inert appended bytes) and mode
@@ -177,8 +206,8 @@ lab containers**, for example:
 
 ```sh
 docker exec ccdc-lab-hatchery chmod 0644 /etc/passwd
-./scripts/ccdcctl integrity hatchery
-./scripts/ccdcctl lse hatchery
+./ccdcctl integrity hatchery
+./ccdcctl lse hatchery
 ```
 
 This fixes only that mode; package tampering and other vulnerabilities remain.

@@ -1,0 +1,150 @@
+"""The only place that spawns Ansible. Everything else asks this module."""
+import json
+import os
+from pathlib import Path
+import shlex
+import subprocess
+import sys
+import tempfile
+
+
+VERBOSE = False  # set by ccdcctl --verbose: full Ansible logs instead of the progress UI
+TASK = "Run host script"  # the task whose result the results callback saves
+ROOT = Path(__file__).resolve().parents[2]
+ANSIBLE = Path(__file__).resolve().parent / "ansible"
+PLAYBOOKS = ANSIBLE / "playbooks"
+
+
+def extra_args():
+    return shlex.split(os.environ.get("ANSIBLE_ARGS", ""))
+
+
+def run_ansible(args, capture=True, result_dir=None, result_task=None, verbose=None):
+    verbose = VERBOSE if verbose is None else verbose
+    env = dict(os.environ, ANSIBLE_CONFIG=str(ANSIBLE / "ansible.cfg"), ANSIBLE_NOCOLOR="1")
+    if not capture and not verbose:
+        env.update(ANSIBLE_STDOUT_CALLBACK="ccdc_progress", ANSIBLE_LOAD_CALLBACK_PLUGINS="1",
+                   ANSIBLE_CALLBACKS_ENABLED="ccdc_results")
+    if result_dir:
+        env.update(CCDC_RESULT_DIR=result_dir, ANSIBLE_LOAD_CALLBACK_PLUGINS="1",
+                   ANSIBLE_CALLBACKS_ENABLED="ccdc_results")
+    else:
+        env.pop("CCDC_RESULT_DIR", None)
+    if result_task:
+        env["CCDC_RESULT_TASK"] = result_task
+    else:
+        env.pop("CCDC_RESULT_TASK", None)
+    return subprocess.run(args, cwd=ROOT, env=env, text=True,
+                          stdout=subprocess.PIPE if capture else None,
+                          stderr=subprocess.PIPE if capture else None, check=False)
+
+
+def with_vars(args, variables, run=run_ansible, **kwargs):
+    """Secrets travel in a private 0600 file, never argv or the console log."""
+    with tempfile.NamedTemporaryFile(mode="w", prefix="ccdc-vars-", suffix=".json") as out:
+        json.dump(variables, out)
+        out.flush()
+        os.fsync(out.fileno())
+        return run([*args, "--extra-vars", "@" + out.name], **kwargs)
+
+
+def _failure(response, result):
+    # SSH script tasks use a PTY: the script's stderr can land in stdout.
+    for stream in ("stdout", "stderr"):
+        try:
+            document = json.loads(response.get(stream) or "")
+        except ValueError:
+            continue
+        if isinstance(document, dict) and isinstance(document.get("error"), str):
+            return document["error"]
+    return ("\n".join(response[key].strip() for key in ("stdout", "stderr") if response.get(key))
+            or response.get("msg") or "remote command failed")
+
+
+def archive_request(archive, become=True, connection=False, payload=None):
+    """Extra-vars for remote.yml: run one BundleScript archive (its driver takes no arguments)."""
+    return json.dumps({"ccdc_remote": {
+        "archive": str(archive), "become": become, "connection": connection,
+        "payload": str(payload) if payload else ""}})
+
+
+def collect(hosts, archive, variables=None, run=run_ansible, live=False, **request):
+    """One Ansible batch running a BundleScript archive; (states, errors) keyed by host.
+
+    Successful hosts are kept even when another is unreachable. `variables` are
+    connection overrides (see ccdc.target.Auth); `request` is become/connection/payload.
+    live: show Ansible's progress on the terminal instead of capturing it (results still come from files).
+    """
+    with tempfile.TemporaryDirectory(prefix="ccdc-results-") as directory:
+        command = ["ansible-playbook", str(PLAYBOOKS / "remote.yml"), "--limit", ":".join(hosts), *extra_args(),
+                   "--extra-vars", archive_request(archive, **request)]
+        show = {"capture": False} if live else {}
+        if variables:
+            result = with_vars(command, variables, run, result_dir=directory, result_task=TASK, **show)
+        else:
+            result = run(command, result_dir=directory, result_task=TASK, **show)
+        states, errors = {}, {}
+        for host in hosts:
+            try:
+                response = json.loads((Path(directory) / host).read_text())
+                if response.get("unreachable") or response.get("failed") or response.get("rc", 0):
+                    raise ValueError(_failure(response, result))
+                # The driver prints one JSON line; over the PTY, hosts may append terminal junk after it
+                # (e.g. systemd 257+'s OSC 3008 context marker from /etc/profile.d on Fedora).
+                states[host] = json.JSONDecoder().raw_decode(response["stdout"].lstrip())[0]
+            except FileNotFoundError:
+                errors[host] = (result.stderr or "").strip() or (result.stdout or "").strip() or "No Ansible result"
+            except (OSError, ValueError, KeyError) as exc:
+                errors[host] = str(exc)
+        return states, errors
+
+
+class RemoteError(RuntimeError):
+    pass
+
+
+def failure_message(result):
+    """Best explanation of a failed step: the {"error": ...} a script printed, else its stderr/stdout."""
+    for stream in ("stdout", "stderr"):
+        try:
+            document = json.loads(result.get(stream) or "")
+        except ValueError:
+            continue
+        if isinstance(document, dict) and isinstance(document.get("error"), str):
+            return document["error"]
+    return (result.get("stderr", "").strip() or result.get("stdout", "").strip()
+            or "exit status %s" % result.get("rc"))
+
+
+class AnsibleRunner:
+    """Runs BundleScript archives and playbooks on one Target. Tests substitute a fake.
+
+    Target.host is passed to --limit, so it may be a pattern such as 'all' or 'a:b'.
+    """
+
+    def archive(self, target, path, **request):
+        """Run a BundleScript archive; returns its envelope {"steps": [{name, rc, stdout, stderr}]}."""
+        states, errors = collect([target.host], path, target.auth.variables(), live=sys.stdout.isatty(), **request)
+        if target.host in errors:
+            raise RemoteError(f"{target.host}: {errors[target.host]}")
+        return states[target.host]
+
+    def act_archive(self, target, path, **request):
+        """Live (progress UI) run of a BundleScript archive; True when Ansible succeeded."""
+        command = ["ansible-playbook", str(PLAYBOOKS / "remote.yml"), "--limit", target.host, *extra_args(),
+                   "--extra-vars", archive_request(path, **request)]
+        return self._live(command, target.auth.variables()).returncode == 0
+
+    def playbook(self, target, name, variables=None):
+        """`name` is a playbook under ansible/playbooks, or a path to a .yml file."""
+        path = name if isinstance(name, Path) else PLAYBOOKS / f"{name}.yml"
+        command = ["ansible-playbook", str(path), "--limit", target.host, *extra_args()]
+        if not self._live(command, {**target.auth.variables(), **(variables or {})}).returncode:
+            return True
+        raise RemoteError(f"{target.host}: playbook {name} failed")
+
+    @staticmethod
+    def _live(command, variables):
+        if variables:
+            return with_vars(command, variables, capture=False)
+        return run_ansible(command, capture=False)

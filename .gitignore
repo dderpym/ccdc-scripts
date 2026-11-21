@@ -2,13 +2,15 @@ __pycache__/
 *.py[cod]
 .venv/
 *.retry
-/baselines/*
-!/baselines/.gitkeep
-/reports/*
-!/reports/.gitkeep
+# Generated controller state and credentials; keep the directories, not the contents.
+/state/*
+!/state/.gitkeep
 /secrets/
 /lab/inventory.yml
 /lab/secrets/
+/lab/mirror/inventory.yml
+/lab/mirror/secrets/
 # Never commit private keys or plaintext credentials.
 *.pem
 *.key
+lab/.findings.lock

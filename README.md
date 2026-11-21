@@ -5,6 +5,7 @@ services, enforce inbound firewall rules, verify packaged system state, and tria
 security findings across one Ansible inventory. **Commands target the whole inventory by default.**
 
 - [Quickstart guide](#quickstart-guide)
+- [Architecture](#architecture)
 - [Command reference and internals](#command-reference-and-internals)
 - [Disposable local hatchery/tarpit lab](lab/README.md) — intentional package and permission faults, host-loopback services only
 
@@ -37,7 +38,7 @@ missing networking tools (`ip`, `ss`, `nft`, and dual-stack iptables save/restor
 tools) through Ansible before discovery (native package modules, or the apk/xbps
 CLI with ansible-core). Direct firewall apply also prepares them before snapshots;
 init only bootstraps access and does not install firewall tools.
-Package installation requires working repositories; status/monitor commands stay
+Package installation requires working repositories; status commands stay
 read-only. Some older Ansible password transports need controller `sshpass`.
 
 ### 2. Set up the inventory and team key
@@ -61,6 +62,36 @@ Aliases such as `web01` are how you target individual hosts. Use letters, number
 Do **not** set `ansible_user: root` for the normal workflow: bootstrap selects
 root itself, and subsequent commands use `oski`.
 
+The same file holds the **SSH scan settings**: `ssh:` under `all.vars` lists the
+defaults (`sshd -T` option names in lowercase, with the value each should have), and
+`ssh_overrides:` on a group or host changes just the lines it names:
+
+```yaml
+all:
+  vars:
+    ssh: {permitrootlogin: "no", passwordauthentication: "no", maxauthtries: 3}
+  hosts:
+    web01:
+      ssh_overrides:
+        passwordauthentication: "yes"   # scored service logs in with passwords
+        maxauthtries: null              # null = stop checking this setting here
+```
+
+Quote `"yes"`/`"no"`. Nothing is built in: options you leave out are not checked, and a
+host with no `ssh:` settings at all is reported as unchecked. Use `ssh_overrides`, not
+a second `ssh:` on the host, which would replace all the defaults.
+
+Each host's **approved services** live there too, as `services:` entries. Do not
+write them by hand: `./ccdcctl services` discovers what each host exposes and records
+your answers (see [`services`](#services-hostall-approve-what-each-host-exposes)).
+
+```yaml
+    web01:
+      services:
+        - {port: 22, proto: tcp, name: sshd}
+        - {port: 443, proto: tcp, name: nginx}
+```
+
 Keep the team's **private key outside the repository**. Copy its matching public
 key into the one configured public-key source:
 
@@ -68,9 +99,9 @@ key into the one configured public-key source:
 # Use your existing team key. Only if you need a new one, generate it once:
 # ssh-keygen -t ed25519 -f ~/.ssh/team_ccdc_key -C ccdc-team
 
-cp ~/.ssh/team_ccdc_key.pub files/oski.pub
+cp ~/.ssh/team_ccdc_key.pub secrets/oski.pub
 # If you only have the private key, derive the public key instead:
-# ssh-keygen -y -f ~/.ssh/team_ccdc_key > files/oski.pub
+# ssh-keygen -y -f ~/.ssh/team_ccdc_key > secrets/oski.pub
 
 # Start an agent if you do not already have a working one:
 eval "$(ssh-agent -s)"
@@ -79,7 +110,7 @@ ssh-add -l                     # confirm the team key is loaded
 ```
 
 The **private key goes into the SSH agent**; the public key goes into
-`files/oski.pub`, not the agent. Enter the private key's passphrase when asked.
+`secrets/oski.pub`, not the agent. Enter the private key's passphrase when asked.
 Do not leave the placeholder public key in place.
 
 Verify each host's SSH fingerprint through a trusted console/competition source
@@ -105,7 +136,7 @@ When a new CCDC environment reuses old IP addresses, explicitly reset trust
 **only during init**:
 
 ```sh
-./scripts/ccdcctl init all --replace-host-keys --save-bootstrap-password
+./ccdcctl init all --replace-host-keys --save-bootstrap-password
 ```
 
 This replaces the selected endpoints' saved keys with keys obtained using
@@ -128,7 +159,7 @@ in that shell and run bootstrap:
 
 ```sh
 . .venv/bin/activate
-./scripts/ccdcctl init all --save-bootstrap-password
+./ccdcctl init all --save-bootstrap-password
 ```
 
 At this prompt, type the known competition **default root password** and press
@@ -162,22 +193,20 @@ Keep VM/physical console access available. Run these commands in your tmux pane,
 one at a time, checking each summary before proceeding:
 
 ```sh
-./scripts/ccdcctl ping all
-./scripts/ccdcctl ssh configure all
-./scripts/ccdcctl listeners all
+./ccdcctl ping all
+./ccdcctl listeners all
 ```
 
-For key-only SSH, choose `a` on the first host to disable password authentication
-on the remaining hosts too; press Enter to reuse that choice on later hosts and
-confirm each apply. If scoring/users require password SSH, choose `y` for one
-host or `b` for the remaining hosts instead. **Root SSH login is always disabled
-by SSH hardening**, regardless of that choice.
+SSH policy is **declared in `inventory.yml`** (the `ssh:` mapping) and enforced by
+the scanner and autofix, not by a separate command; see [SSH policy](#ssh-policy).
+A host that must accept passwords for scoring declares `passwordauthentication: "yes"`
+for itself. Root SSH login is disabled only if the inventory says `permitrootlogin: "no"`.
 
-Read `reports/listeners.txt` and hand it to teammates to identify scoring-critical
+Read `state/reports/listeners.txt` and hand it to teammates to identify scoring-critical
 services. Then review firewall decisions:
 
 ```sh
-./scripts/ccdcctl firewall configure all
+./ccdcctl firewall configure all
 ```
 
 TCP/22 is preapproved. Other listening ports default to **blocked**: explicitly
@@ -192,118 +221,47 @@ skip hosts whose requirements this port-only policy cannot safely represent.
 Check the results, then explicitly accept the trusted state:
 
 ```sh
-./scripts/ccdcctl ssh status all
-./scripts/ccdcctl firewall status all
-./scripts/ccdcctl ssh baseline all
-./scripts/ccdcctl firewall baseline all
+./ccdcctl scan all --fix            # SSH policy deviations (asks before each fix)
+./ccdcctl firewall status all
+./ccdcctl firewall baseline all
 ```
 
 Do not baseline an unexplained or failed configuration. Firewall enforcement is
-**runtime-only**: it must be reapplied after reboot. Monitoring does not fix drift.
+**runtime-only**: it must be reapplied after reboot. Status checks do not fix drift.
 Root recovery passwords are for console/login or `su` where permitted, **not a
 root SSH backdoor after hardening**.
 
-### 5. Triage current vulnerabilities and start the combined monitor
+### 5. Triage current vulnerabilities
 
-Beginning-of-competition workflow (review and baseline **only** SSH/firewall as
-explained above):
+Beginning-of-competition workflow (review and baseline **only** the firewall as
+explained above; SSH policy comes from the inventory):
 
 ```sh
-./scripts/ccdcctl init
-./scripts/ccdcctl ssh configure
-./scripts/ccdcctl firewall configure
-./scripts/ccdcctl ssh baseline       # only after reviewing effective policy
-./scripts/ccdcctl firewall baseline  # only after reviewing effective policy
+./ccdcctl init
+./ccdcctl firewall configure
+./ccdcctl firewall baseline  # only after reviewing effective policy
 
 # Find non-stock/tampered system state:
-./scripts/ccdcctl integrity
+./ccdcctl integrity
 # Find high-confidence dangerous Linux configuration:
-./scripts/ccdcctl lse
+./ccdcctl lse
 
-# Teammates investigate and remediate findings, then run continuously:
-./scripts/ccdcctl monitor
+# Run every registered scanner (and apply matching autofixes on request):
+./ccdcctl scan
+./ccdcctl scan --fix --wait 45   # fix, wait, rescan for re-planted artifacts
 ```
 
 Integrity and LSE are **not baseline-driven**. An initially compromised binary
 or dangerous sudo/persistence condition remains a finding until fixed. Each
 new scan evaluates current state; it never accepts the initial vulnerability as
 trusted. Detection does not perform repairs. Detailed evidence is saved under
-`reports/<host>/`; terminal output is severity-ranked and capped at 40 findings
+`state/reports/<host>/`; terminal output is severity-ranked and capped at 40 findings
 per host, with remaining findings available in JSON.
 
-The combined monitor uses independent workers: SSH/firewall default to 10s,
-integrity to 60s, and LSE to 180s. A slow LSE run does not hold up SSH/firewall.
-Startup lists intervals; afterwards it prints only new/changed/resolved findings
-or scanner/connectivity failures, not periodic `OK` lines.
+### 6. tmux survival guide
 
-### 6. Optional separate tmux views
-
-Use the combined monitor above for all four modules. The following optional
-three-pane arrangement focuses on the existing network views; it does **not**
-include integrity/LSE unless you run the combined monitor in another window.
-The three views use existing commands, not a separate dashboard application:
-
-```text
-+--------------------------+--------------------------+
-| SSH drift alerts         | Firewall drift alerts    |
-+--------------------------+--------------------------+
-| Refreshing listener / service inventory             |
-+-----------------------------------------------------+
-```
-
-**How tmux keys work:** press `Ctrl+b`, release both keys, then press the indicated
-key. The prefix is not held down while typing the second key.
-
-Starting from your single setup pane:
-
-1. `Ctrl+b`, then `"` (double quote): split into top and bottom. You land below.
-2. `Ctrl+b`, then Up Arrow: return to the top pane.
-3. `Ctrl+b`, then `%`: split the top into left and right. You land on the right.
-4. `Ctrl+b`, then Left Arrow: select the top-left pane.
-
-In **each pane**, ensure you are in the repository and activate `.venv`. Replace
-the checkout path in these examples with yours.
-
-**Top-left — SSH baseline drift:**
-
-```sh
-cd /path/to/berke1337-ccdc
-. .venv/bin/activate
-./monitor/ssh-monitor --interval 30
-```
-
-Select the top-right pane with `Ctrl+b`, then Right Arrow.
-
-**Top-right — firewall baseline drift:**
-
-```sh
-cd /path/to/berke1337-ccdc
-. .venv/bin/activate
-./monitor/firewall-monitor --interval 30
-```
-
-Select the bottom pane with `Ctrl+b`, then Down Arrow.
-
-**Bottom — current listener inventory, refreshed every minute:**
-
-```sh
-cd /path/to/berke1337-ccdc
-. .venv/bin/activate
-while :; do
-    clear
-    date
-    ./scripts/ccdcctl listeners all
-    sleep 60
-done
-```
-
-The first two panes print `Monitoring ...` and then stay **quiet when healthy**.
-They alert on drift, failed discovery/unreachability, and missing baselines;
-recoveries are announced. The third pane is a **live snapshot**, not a third
-drift detector: it refreshes `reports/listeners.txt` and `.json`, with no listener
-baseline or change alerts. It runs read-only discovery, not firewall changes.
-
-#### tmux survival guide
+Run long commands inside a persistent tmux session (`tmux new-session -s ccdc`).
+Press `Ctrl+b`, release both keys, then press the indicated key.
 
 | Keys / command | What it does |
 | --- | --- |
@@ -311,17 +269,146 @@ baseline or change alerts. It runs read-only discovery, not firewall changes.
 | `Ctrl+b`, `o` | Cycle through panes |
 | `Ctrl+b`, `z` | Zoom/unzoom the current pane |
 | `Ctrl+b`, `[` | Enter scrollback; use arrows/Page Up, then `q` to leave |
-| `Ctrl+b`, `c` | Open another shell window without stopping monitors |
+| `Ctrl+b`, `c` | Open another shell window without stopping running commands |
 | `Ctrl+b`, `w` | List/select windows |
 | `Ctrl+b`, `d` | Detach; processes keep running |
 | `tmux attach-session -t ccdc` | Reattach from an outside terminal |
 | `tmux list-sessions` | Find running sessions |
-| `Ctrl+c` (no tmux prefix) | Stop the foreground monitor/loop in this pane |
+| `Ctrl+c` (no tmux prefix) | Stop the foreground command in this pane |
 
 For a long listener report, zoom the bottom pane or open another window and run
-`less reports/listeners.txt` from the repository (`q` exits less). Detaching does
-not stop monitoring, but shutting down the controller does. Do not use `exit` or
+`less state/reports/listeners.txt` from the repository (`q` exits less). Detaching does
+not stop running commands, but shutting down the controller does. Do not use `exit` or
 kill panes to detach. These keys assume tmux's default bindings.
+
+## Architecture
+
+```
+ccdcctl, ccdcctl-completion.bash, inventory.yml, setup, Makefile   controller entry points
+src/ccdc/       framework: Script, Target, scanners/ and fixes/ (one package per check), scan
+src/ccdc/ansible/  AnsibleScript, BundleScript, archive driver; ansible.cfg, playbooks/, roles/, callback_plugins/
+src/ccdc/remote_lib/  Python helpers shipped to targets with the scripts that list them
+src/scripts/    phase scripts: init/ firewall/
+src/controller/ update workflow driver (`ccdcctl update`)
+src/vendor/     pinned upstream LSE
+lab/            disposable test hosts (lab/check is the live smoke suite)
+secrets/        oski.pub, bootstrap and recovery credentials (gitignored)
+state/          reports/ and baselines/ (gitignored)
+```
+
+Everything the controller does is a **Script** (`src/ccdc/script.py`): an object with a
+`run()` that may return anything. Scripts are declarative and stateless: they never
+assume an earlier run, so a script that needs `nftables` installs it first (a no-op
+when present) instead of recording that it did.
+
+- `HostScript` is a script that runs **locally** on the controller (guards, prompts,
+  inventory edits, turning output into findings).
+- `AnsibleScript` (`src/ccdc/ansible/`) runs on a **remote** `Target`
+  (`src/ccdc/target.py`: a host or an Ansible `--limit` pattern such as `all`, plus an
+  `Auth`: `AgentAuth`, `SudoAuth`, `PasswordAuth`, which is never shown in `repr`). It
+  owns its remote code: `source` is a file beside the class (bash, Python, anything with
+  a shebang), `support` lists helper files shipped with it (Python helpers live in
+  `src/ccdc/remote_lib/` and are imported on the target as plain modules). `arguments()`
+  builds its argv and `parse()` turns `{rc, stdout, stderr}` into the result (default: the
+  JSON on stdout). `PlaybookScript` is an `AnsibleScript` whose source is a playbook.
+- `ComposedScript(Step(script, **prefilled), other, ...)` runs any series of scripts,
+  local and remote mixed, in order and returns their results. Arguments given to
+  `run(**kw)` reach the steps that accept them and override prefilled values.
+  `script.bind(**kw)` is a one-step composition with arguments filled in.
+- `BundleScript` is a `ComposedScript` of `AnsibleScript`s that is **packed into one
+  archive** (only its steps' files), uploaded once and run in order on the host,
+  returning one result per step. A failed step is a `RemoteError` value in its slot
+  (`keep_going=False` stops at the first failure and raises); identical steps run once.
+  A lone `AnsibleScript.run` is a one-step bundle. Only `src/ccdc/runner.py` spawns Ansible.
+  There is no global bundle of host code: every script ships its own files.
+- **Phase scripts** (`src/scripts/`) are what `ccdcctl` runs for the interactive
+  workflows, grouped by phase: `init/` (`Init`, `HostKeys`, `PamGate`) and `firewall/`
+  (`PrepareNetworkTools`, `ApplyFirewall`, `RestoreFirewall`). SSH has no phase script:
+  it is a scanner plus an autofix driven by the inventory (see [SSH policy](#ssh-policy)).
+- **OS and package layers** keep distro knowledge in exactly one place. `DetectOS`
+  (`src/ccdc/osinfo/`) only reports which OS the target is: `id`, `id_like`, version and a
+  display name, plus its `lineage` (itself, then its declared parents). The package layer
+  (`src/ccdc/packages/`) is the only code that turns a lineage into a package manager;
+  `InstallPackage` recipes such as `InstallNftables`, `InstallAuditd` and `InstallPam`
+  hold what each manager calls the package, detect the OS on every run and delegate.
+  `InstallPam(reinstall=True)` restores tampered files. Nothing else says `apt` or `dnf`.
+- **Scanners** (`src/ccdc/findings.py`) are scripts that intend no lasting effect on the
+  host, so they are safe to run repeatedly. They judge the configuration **as it is
+  active on the machine** (`sshd -T -C`, `sudo -l -U`, loaded PAM stacks, `systemctl
+  show`, `auditctl -l`, `/proc`), not by parsing a file for what it says.
+  `scanner.run(target)` returns a `ScanResult` (a list of `Finding`s plus `.errors`;
+  empty with errors is not clean). A `Finding` is a frozen dataclass starting with
+  `host` (a `Target`), with a class `code` and `severity`. LSE is split into per-test
+  scanners that share one LSE run per host per scan.
+- **AutoFix** (`src/ccdc/fixes/`) has `can_fix(finding)` and `get_fix(finding)`; the
+  latter returns a script with the finding's data already filled in, so `.run()` takes
+  no arguments. The script a fix runs lives in the same module as the fix.
+  `GlobalAutofix.register(autofix, priority)` picks the highest-priority match.
+- **Hardening is a scan plus a fix**, not a command: unneeded daemons, missing audit
+  watches and so on are findings with autofixes. SSH settings are **declarative**:
+  `ssh:` in `inventory.yml` says what each host's sshd should do, the scanner compares
+  it with the effective `sshd -T -C` values (Match blocks included) and reports each
+  `SSHPolicyDeviation`; its autofix writes only the declared value for that option
+  (`maxauthtries`, `logingracetime`, `clientalivecountmax` are maximums;
+  `clientaliveinterval` deviates only at 0). Inventory vars reach scanners as
+  `Target.vars`.
+- **Auto-discovery** (`src/ccdc/registry.py`): every `Scanner` in a module under
+  `src/ccdc/scanners/` and every `AutoFix` in `src/ccdc/fixes/` is registered; a module
+  may set `PRIORITY = {FixClass: n}`. No central list exists to edit. Mark a shared
+  base class with `abstract = True` in its own body to keep it out of the registry.
+
+**Adding a scanner:** make a package `src/ccdc/scanners/<thing>/`: `__init__.py` holds
+the `Finding` dataclasses, an `AnsibleScript` (`source = "remote.sh"`, or `remote.py` with
+`support = (...)`) and a `Scanner` whose `remote_step(target)` returns that script and whose
+`findings(target, row)` builds findings; `remote.*` beside it prints
+`{"findings": [...], "errors": [...]}`. `ccdcctl scan` bundles every scanner's step into one
+run per host. **Adding a fix:** `src/ccdc/fixes/<thing>/` with an `AutoFix` that returns
+`script.bind(...)` and the `AnsibleScript` (with its `remote.*`) it runs, in the same package.
+
+### `services [host|all]`: approve what each host exposes
+
+`./ccdcctl services` runs `ss -tulpn` as root on each host (the listeners discovery),
+lists the non-loopback services not yet approved, and asks per service: `y` approve,
+`N` skip (default), `a` approve all remaining, `q` stop. Approved services that no
+longer listen are offered for removal. Answers are written to `inventory.yml` under the
+host as `services: [{port, proto, name}]` (comments and ordering preserved, the file is
+replaced atomically, the previous copy kept in `state/backups/`; the edit is refused
+if it would change anything but that list).
+
+Approved services then drive scanning, like the `ssh:` policy:
+
+- `UnapprovedService`: a non-loopback listener that is not in the inventory.
+- `ApprovedServiceDown`: an approved service that is not listening (critical).
+- `FirewallBlocksService` (critical), `FirewallOpensUnapproved`, `FirewallNotRestricting`:
+  the **effective** inbound firewall compared with the approved list. A firewall the tool
+  cannot summarize (managers such as ufw/firewalld, custom rules) is reported as not
+  compared, never guessed.
+- A host with no `services` declared reports `no services declared in inventory; run
+  ccdcctl services`.
+
+The firewall findings have an autofix that applies exactly the approved ports (tcp/22
+is always kept) with the same guards as `firewall configure`: it refuses unless every
+active sshd port is approved, checks a fresh key login before and after, saves a rollback
+snapshot to `state/reports/rollback/<host>/firewall.json`, lets the host verify the exact
+policy (restoring on failure) and restores the snapshot if the login is lost.
+
+### `scan [host|all] [--fix [ask|all]] [--wait SECONDS] [--recheck SECONDS]`
+
+```sh
+./ccdcctl scan                       # every registered scanner, report only
+./ccdcctl scan hatchery --fix        # ask before each matching autofix
+./ccdcctl scan --fix all --wait 45   # apply all, wait, rescan for re-planted artifacts
+./ccdcctl scan --recheck 60          # scan, wait 60s, scan again; report what changed
+```
+
+Runs each scanner on each host (hosts in parallel), de-duplicates identical
+findings reported by overlapping scanners, and lists which findings have an
+autofix. Without `--fix` nothing on a host changes. With `--fix`, matching
+autofixes run (per-fix confirmation by default), then everything is rescanned after
+a settle delay (at least `--wait`, raised to a unit's `RestartSec` plus 10s where a
+finding reports one) and findings that **returned** are reported separately from new
+ones. Nothing fixed means no rescan. Exit status is nonzero for findings or
+incomplete scans. See [Architecture](#architecture).
 
 ## Command reference and internals
 
@@ -332,19 +419,19 @@ Run commands from the repository with the uv environment active:
 ```sh
 uv sync
 source ./setup                  # Bash: activate .venv and all CLI completions
-./scripts/ccdcctl ssh status
+./ccdcctl ping
 ```
 
-Alternatively, `uv run ./scripts/ccdcctl ssh status` supplies the environment
+Alternatively, `uv run ./ccdcctl ping` supplies the environment
 without shell activation; it also makes Ansible available to child processes.
-The same works for wrappers: `uv run ./monitor/ssh-monitor --interval 30`.
+
 
 `source ./setup` activates `.venv` and enables all Bash completions. Source it
 rather than executing `./setup`, so it updates your current shell. Run `uv sync`
 first if `.venv` is missing. For completion only, without activating `.venv`:
 
 ```sh
-source scripts/ccdcctl-completion.bash
+source ccdcctl-completion.bash
 ```
 
 Bash's `complete -C` runs `ccdcctl complete` and reads one candidate per line;
@@ -352,8 +439,7 @@ Bash's `complete -C` runs `ccdcctl complete` and reads one candidate per line;
 It completes commands, actions, flags (including init-only `--replace-host-keys`),
 password-file paths, and hosts from the selected `ANSIBLE_INVENTORY`.
 The sourced setup also completes `lab/manage` (`up`, `down`, `--password-file`),
-`scripts/check-lab` (`--inventory`, `--password-file`), and both monitor wrappers
-(flags and `--host` values). Lab completion never starts Docker or runs checks.
+and `lab/check` (`--inventory`, `--password-file`). Lab completion never starts Docker or runs checks.
 Host completion requires Ansible on `PATH` (activate `.venv` first); it never connects
 to hosts. To enable it in future shells, add a `source` line using the script's
 absolute path to `~/.bashrc`.
@@ -361,18 +447,17 @@ absolute path to `~/.bashrc`.
 `all` is the default for commands accepting a target. An exact **inventory alias**
 can be used instead, such as `hatchery`; IP addresses, arbitrary Ansible patterns,
 and groups other than `all` are not CLI targets. Hosts are re-enumerated using
-`ansible-inventory`; there is no second host list. Monitors use `--host`, not a
-positional host argument.
+`ansible-inventory`; there is no second host list.
 
 | Operation | SSH authentication | Privilege |
 | --- | --- | --- |
 | First saved-password init | Root password from the private bootstrap file, with one manual retry on authentication failure | Already root; sudo bypassed |
 | Saved-host init rerun | Fresh `oski` key/sudo check first; if that fails, the saved per-host root password, then at most one manual retry | Sudo as `oski`, or already root |
 | Manual init | Your supplied Ansible bootstrap user/key/password options | Root directly or your administrator's escalation |
-| Ping, status, listeners, baselines, monitors, firewall rollback | Configured SSH user, normally `oski`, using the team key from the controller agent or inventory key path | Sudo, passwordless after init |
-| SSH/firewall configuration safety checks | Explicit fresh, key-only `oski` login, bypassing multiplexing and password authentication | Passwordless sudo to root |
+| Ping, status, listeners, baselines, scans, firewall rollback | Configured SSH user, normally `oski`, using the team key from the controller agent or inventory key path | Sudo, passwordless after init |
+| SSH autofix and firewall configuration safety checks | Explicit fresh, key-only `oski` login, bypassing multiplexing and password authentication | Passwordless sudo to root |
 
-Ansible owns SSH transport. `ansible.cfg` defaults to `oski` with sudo escalation;
+Ansible owns SSH transport. `src/ccdc/ansible/ansible.cfg` defaults to `oski` with sudo escalation;
 normal sessions may multiplex connections. Private keys are used **locally** by
 the SSH agent, never copied to targets. Agent forwarding is disabled. Host keys are
 checked against the controller's trusted known-hosts database. An inventory
@@ -395,10 +480,9 @@ prevent keylogging on an already-compromised host.
 
 ### Output and progress
 
-SSH/firewall status and configure show readable settings instead of raw rulesets,
+Firewall status and configure show readable settings instead of raw rulesets,
 config hashes, and JSON. Unknown firewall reachability stays **unknown**; literal
-ACCEPT candidates are not proof that a port is open. SSH summaries retain Match
-scope, active socket bindings, and discovery caveats.
+ACCEPT candidates are not proof that a port is open.
 
 Ansible applies and ping use a compact task display: one updating line in a
 terminal, one summary per task when redirected, followed by host results.
@@ -406,9 +490,9 @@ Failures remain visible, including ignored failures; secret `no_log` results sta
 hidden. Task counts are not a percentage of the entire playbook.
 
 ```sh
-./scripts/ccdcctl ssh status hatchery --json       # full discovery for tooling
-./scripts/ccdcctl firewall status all --json
-./scripts/ccdcctl ssh configure all --verbose     # full Ansible logs + discovery
+./ccdcctl firewall status hatchery --json  # full discovery for tooling
+./ccdcctl firewall status all --json
+./ccdcctl scan all --fix --verbose      # full Ansible logs
 ```
 
 `--json` is status-only and always emits `{"hosts": {...}, "errors": {...}}`, even
@@ -419,9 +503,9 @@ dependency is required; configuration confirmations and safety checks are unchan
 ### `init [host|all]`: access bootstrap and root rotation
 
 ```sh
-./scripts/ccdcctl init all --save-bootstrap-password
-./scripts/ccdcctl init hatchery
-./scripts/ccdcctl init all --bootstrap-password-file ~/.config/ccdc/bootstrap.password
+./ccdcctl init all --save-bootstrap-password
+./ccdcctl init hatchery
+./ccdcctl init all --bootstrap-password-file ~/.config/ccdc/bootstrap.password
 ```
 
 - `--save-bootstrap-password` requires a terminal, asks once through a hidden
@@ -488,9 +572,9 @@ file does **not** encrypt the separately generated root recovery files.
 Ignore saved root credentials and use normal Ansible options:
 
 ```sh
-ANSIBLE_ARGS='-u root --ask-pass -e ansible_become=false' ./scripts/ccdcctl init all --no-bootstrap-password
-ANSIBLE_ARGS='-u admin --ask-pass --ask-become-pass' ./scripts/ccdcctl init all --no-bootstrap-password
-ANSIBLE_ARGS='-u root --private-key /path/to/bootstrap_key -e ansible_become=false' ./scripts/ccdcctl init all --no-bootstrap-password
+ANSIBLE_ARGS='-u root --ask-pass -e ansible_become=false' ./ccdcctl init all --no-bootstrap-password
+ANSIBLE_ARGS='-u admin --ask-pass --ask-become-pass' ./ccdcctl init all --no-bootstrap-password
+ANSIBLE_ARGS='-u root --private-key /path/to/bootstrap_key -e ansible_become=false' ./ccdcctl init all --no-bootstrap-password
 ```
 
 The **team** private key must separately be available through the agent or
@@ -501,18 +585,18 @@ Do not combine saved-root mode with Ansible password-prompt flags.
 An equivalent manual playbook is:
 
 ```sh
-ansible-playbook playbooks/init.yml -u root --ask-pass -e ansible_become=false
+ansible-playbook src/ccdc/ansible/playbooks/init.yml -u root --ask-pass -e ansible_become=false
 ```
 
 It also performs the `oski` proof and root rotation. Init does not change SSH
-policy; `ssh configure` later disables root SSH. Recovery needs console/login
+policy; `scan --fix` later enforces the inventory's `permitrootlogin`. Recovery needs console/login
 or `su` access where permitted, not simply `ssh root@host` after hardening.
 
 ### `ping [host|all]`: verify administrative transport
 
 ```sh
-./scripts/ccdcctl ping
-./scripts/ccdcctl ping hatchery
+./ccdcctl ping
+./ccdcctl ping hatchery
 ```
 
 Runs Ansible's `ping` module through SSH with configured escalation. This checks
@@ -520,72 +604,60 @@ SSH authentication, target Python/module execution, and sudo; **it is not ICMP
 ping**, a port scan, or a scoring-service health check. It is not the explicit
 fresh-login safety preflight, so it may use a multiplexed connection.
 
-### `ssh status|configure|baseline [host|all]`
+### SSH policy
 
-```sh
-./scripts/ccdcctl ssh status                 # inventory summary
-./scripts/ccdcctl ssh status hatchery        # full normalized JSON
-./scripts/ccdcctl ssh configure all
-./scripts/ccdcctl ssh baseline all
+There is no `ssh` command. SSH is a scanner plus an autofix that read the inventory.
+Declare the policy in `inventory.yml` (group `all`, overridable per group or host):
+
+```yaml
+all:
+  vars:
+    ssh:
+      permitrootlogin: "no"
+      passwordauthentication: "no"
+      maxauthtries: 3
+  hosts:
+    daffy:
+      ssh: {passwordauthentication: "yes"}   # scored: must take passwords
 ```
 
-**Status** executes SSH discovery under sudo. Effective settings come from
-`sshd -T`, not config-file greps. Discovery includes configuration sources and
-context details without timestamps; inspect per-host JSON for Match policies and
-active systemd SSH socket bindings separately from `sshd -T`.
+Names are what `sshd -T` prints, in lowercase. Values match exactly, except
+`maxauthtries`, `logingracetime` and `clientalivecountmax` (the declared value is a
+maximum) and `clientaliveinterval` (only 0 deviates). Nothing is built in: an option
+you do not declare is not checked, and a host with no `ssh:` policy gets a scan
+error saying policy checks were skipped. Fixed attack-vector checks (non-standard
+`authorizedkeysfile`, key or CA commands, banner, `permituserenvironment`,
+`permitemptypasswords`, `sshrc`, stale config, `LD_*` in sshd) always run.
 
-**Configure** is interactive and sequential. It always sets root login to `no`
-and public-key authentication to `yes`. Password and keyboard-interactive auth
-are changed together. Choices allow per-host enable/disable/skip and reuse on
-remaining hosts, still with overrides and confirmation.
-
-An owned marked block at the **top** of `/etc/ssh/sshd_config` is the only source
-of truth for these authentication settings, including on older OpenSSH without
-server Include support. Reapplying removes those directives (case-insensitively,
-including quoted keywords and the legacy ChallengeResponseAuthentication alias)
-from the rest of the main file and every parsed Include, including Match blocks. Unrelated settings
-and Include statements are preserved. The entire proposed config graph is staged
-and checked with `sshd -t`, then `sshd -T` globally and in admin/root contexts
-before installation. Validation/reload failures restore changed files. Conditional
-Includes and backslash-escaped Include glob patterns require manual repair;
-unsafe files requiring edits are refused.
-Unchanged symlinked Includes (such as distro crypto policies) remain supported;
-a symlink requiring managed-setting edits is refused rather than replaced.
-
-Reload handles systemd `ssh`/`sshd`, stock Alpine OpenRC defaults, and Void runit,
-without routine restarts. Custom startup config/port/auth overrides are refused.
-Socket-activated SSH supports these authentication-only changes; socket bindings
-are not edited. Fresh key-only `oski`/sudo checks run before and after changes,
-and the effective state is rediscovered. Keep console access available.
-
-**Baseline** saves effective SSH settings, their connection context, normalized
-Match rules with per-Include scope boundaries, and active socket bindings to
-`baselines/<host>/ssh.json`. Source and drop-in hashes, daemon paths, and diagnostic
-caveats remain available in status
-but are not trusted monitoring state. Comments/whitespace changes do not cause
-hash drift; conditional rule changes still alert even when global `sshd -T`
-values stay the same. Older full-discovery baselines are compared using the same
-settings-only projection; preexisting Match rules absent from an old baseline
-require review. Older flattened Include/Match baselines also require review when
-the new scoped representation differs. Baselines never auto-update on configure
-or monitoring. Accepting a malicious policy explicitly would still make it the
-expected policy.
+`./ccdcctl scan` compares the **effective** values (`sshd -T -C user=...,addr=...` for
+root and each login account, so `Match` blocks count) with the declared ones and
+reports `SSHPolicyDeviation` findings. `scan --fix` applies them with one change per
+host: all deviating options are written together, `sshd -t` and `sshd -T` must show
+every declared value **before sshd reloads**, a fresh key-only `oski` login must work
+(checked beforehand for lock-out-prone settings such as `passwordauthentication: "no"`
+and `permitrootlogin: "no"`, and again afterwards), and an on-host watchdog restores the
+previous files after 90 seconds unless the change is confirmed. The setting goes in
+`sshd_config.d/00-hardening.conf` when the main file includes that directory and sets
+none of the options earlier; otherwise, or when another directive still wins, in a
+marked block at the **top** of `sshd_config`. If a `Match` block or other directive
+still overrides it, the fix restores everything and reports why; repair that by hand.
+Keep console access available.
 
 `sshd -T` evaluates the configuration on disk, not the running daemon's in-memory
-configuration; monitoring does not prove that edits have been reloaded.
+configuration; the scanner separately reports config files newer than the daemon.
 
 ### `listeners [host|all]`: service inventory
 
 ```sh
-./scripts/ccdcctl listeners
-./scripts/ccdcctl listeners hatchery
+./ccdcctl listeners
+./ccdcctl listeners hatchery
 ```
 
 Runs listener discovery under sudo, prints the report, and replaces:
 
-- `reports/listeners.txt`: teammate-readable bindings, process/PID, executable,
+- `state/reports/listeners.txt`: teammate-readable bindings, process/PID, executable,
   user, and best-effort service attribution/confidence.
-- `reports/listeners.json`: structured results and explicit per-host errors.
+- `state/reports/listeners.json`: structured results and explicit per-host errors.
 
 These reports contain the selected hosts, not an accumulating historical union.
 A non-loopback binding is an **exposure candidate**, not proof of firewall/routing
@@ -598,11 +670,11 @@ alert on listener changes.
 ### `firewall status|configure|rollback|baseline [host|all]`
 
 ```sh
-./scripts/ccdcctl firewall status
-./scripts/ccdcctl firewall status hatchery
-./scripts/ccdcctl firewall configure all
-./scripts/ccdcctl firewall rollback hatchery
-./scripts/ccdcctl firewall baseline all
+./ccdcctl firewall status
+./ccdcctl firewall status hatchery
+./ccdcctl firewall configure all
+./ccdcctl firewall rollback hatchery
+./ccdcctl firewall baseline all
 ```
 
 **Status** runs privileged discovery for nftables, iptables, firewalld, and ufw.
@@ -645,12 +717,12 @@ with console access, or manage that host separately. Fresh admin access and
 observed firewall state are checked after application.
 
 **Rollback** restores the latest pre-apply snapshot at
-`reports/rollback/<host>/firewall.json`, not a monitoring baseline. Snapshots are
+`state/reports/rollback/<host>/firewall.json`, not a baseline. Snapshots are
 sensitive and gitignored; retain an independent controller copy. Rollback still
 needs working SSH/sudo. If SSH is already blocked, use the console; there is no
 timer-based automatic rollback daemon.
 
-**Baseline** accepts current discovery into `baselines/<host>/firewall.json`.
+**Baseline** accepts current discovery into `state/baselines/<host>/firewall.json`.
 It neither changes rules nor provides rollback. Enforcement is **runtime-only**,
 not a distro-specific boot firewall manager: reapply after reboot.
 
@@ -660,8 +732,8 @@ No package lists, service mappings, or probes need to be configured in inventory
 The workflow discovers updates on **Debian/systemd** and **Alpine/OpenRC** hosts:
 
 ```sh
-./scripts/ccdcctl update plan all    # interactive walkthrough, one host at a time
-./scripts/ccdcctl update apply all   # install the saved selection, then offer restarts
+./ccdcctl update plan all    # interactive walkthrough, one host at a time
+./ccdcctl update apply all   # install the saved selection, then offer restarts
 ```
 
 **Plan** refreshes authenticated native repository indexes (like `apt update`),
@@ -691,8 +763,8 @@ Plans expire after 24 hours, are consumed before installation, and must be redon
 if installed packages, repository settings/candidates, or connection settings
 change. Old configuration-based plans are incompatible: run `update plan` again.
 Updates verify fresh SSH/sudo access before and after installation/restarts. They
-neither require nor read/write SSH/firewall baselines; policy drift belongs to the
-independent monitors. Existing schema-2 package plans remain usable even if they
+neither require nor read/write firewall baselines; policy drift belongs to the
+independent checks. Existing schema-2 package plans remain usable even if they
 contain an obsolete policy snapshot.
 
 After installation, processes using replaced executable/library mappings are
@@ -711,7 +783,7 @@ these are reported rather than silently terminated or declared fully patched.
 
 ```sh
 # Bypass only the package-install confirmation for an already reviewed plan:
-./scripts/ccdcctl update apply web01 --yes
+./ccdcctl update apply web01 --yes
 ```
 
 `--yes` **never approves service restarts**. In a noninteractive apply, restart
@@ -727,10 +799,10 @@ separate reviewed update procedure.
 
 Recovery files are private under `/var/backups/ccdc-updates/<run-id>/` before
 installation; successful apply copies the configuration archive to
-`reports/<host>/updates/backups/<run-id>/configs.tar.gz`. On transaction/transfer
+`state/reports/<host>/updates/backups/<run-id>/configs.tar.gz`. On transaction/transfer
 failure, inspect the remote recovery directory. Archives may contain credentials;
 protect both disks. They are **not full system snapshots** and cannot guarantee
-package/database rollback. `reports/<host>/updates/result.json` records updates,
+package/database rollback. `state/reports/<host>/updates/result.json` records updates,
 restart decisions and outstanding work; `runs/` retains run history and
 `remote-failure.json` retains private native diagnostics. A compromised root
 account or package database can falsify checks; updating is not malware removal.
@@ -738,10 +810,9 @@ account or package database can falsify checks; updating is not malware removal.
 ### `integrity [status] [host|all] [--deep]`
 
 ```sh
-./scripts/ccdcctl integrity
-./scripts/ccdcctl integrity hatchery
-./scripts/ccdcctl integrity status hatchery --deep
-./scripts/ccdcctl monitor integrity
+./ccdcctl integrity
+./ccdcctl integrity hatchery
+./ccdcctl integrity status hatchery --deep
 make integrity HOST=hatchery
 ```
 
@@ -756,12 +827,14 @@ changes without a `y`, and non-interactive runs never change anything.
 `--auto-apply=simple` applies mode-only fixes without asking (ownership changes
 are still prompted, or skipped without a terminal); `--auto-apply=all` also
 applies ownership changes. Fixes are absolute targets (distro-expected values,
-group/other write and secret exposure removed), applied by `host/apply_fixes.py`
+group/other write and secret exposure removed), applied by `ApplyFixes` (`src/ccdc/fixes/permissions/`)
 through the file descriptor, never through symlinks. Package-content changes
 are not fixable and stay as findings; re-run the scan to verify.
 
 `lse` offers the same prompts and `--auto-apply` flag for its basic permission
-tests. For fst030/fst160/fst170/fst180/sys030 it takes the paths named in the
+tests. For fst020 (uncommon setuid binaries) it proposes clearing the setuid and
+setgid bits; this can break a legitimate helper, so it needs `--auto-apply=all`.
+For fst030/fst160/fst170/fst180/sys030 it takes the paths named in the
 evidence, re-reads their metadata on the target and proposes: clear group/other
 write (sys030: other access), and for fst030/fst160/fst170 make a non-root owner
 root (an ownership change, so `--auto-apply=all`). Symlinks, sticky directories
@@ -797,7 +870,7 @@ Investigate rather than blindly restoring scoring configurations.
 `--deep` is a manual expanded audit: Alpine may use `--full` to include added
 files. Normal polling uses neither `--full` nor `--details`. Other package
 managers already verify their installed package set. Raw evidence and normalized
-records replace `reports/<host>/integrity/{raw.txt,report.json}` each scan.
+records replace `state/reports/<host>/integrity/{raw.txt,report.json}` each scan.
 No scan executes reinstall/fix/restore commands or automatically changes modes,
 owners, or package-owned configuration. A compromised package database/verifier
 can lie; corroborate serious findings through a trusted console/vendor source.
@@ -805,22 +878,21 @@ can lie; corroborate serious findings through a trusted console/vendor source.
 ### `lse [status] [host|all] [--deep]`
 
 ```sh
-./scripts/ccdcctl lse
-./scripts/ccdcctl lse hatchery
-./scripts/ccdcctl lse hatchery --deep
-./scripts/ccdcctl monitor lse
+./ccdcctl lse
+./ccdcctl lse hatchery
+./ccdcctl lse hatchery --deep
 make lse HOST=hatchery
 ```
 
 Provides a high-signal security and privilege/persistence triage pass using the
 pinned, vendored Linux Smart Enumeration script: version **4.14nw**, commit
 `fcad39438dc10ac8a8e9c2e2800bf3864c6ab826`, GPL-3.0. See
-[`vendor/LSE-PROVENANCE.md`](vendor/LSE-PROVENANCE.md) for upstream and license.
+[`src/vendor/LSE-PROVENANCE.md`](src/vendor/LSE-PROVENANCE.md) for upstream and license.
 The scanner never downloads executable code. Passive Python supplements add
 selected LinPEAS coverage gaps without running LinPEAS: file/process capabilities,
 SGID and sudo/doas risks, runtime sockets, loader hooks, effective root-service
 and process paths, cross-account credential metadata, and kernel/package CVEs. The comparison and remaining gaps are in
-[`vendor/LINPEAS-GAPS.md`](vendor/LINPEAS-GAPS.md). These are review candidates,
+[`src/vendor/LINPEAS-GAPS.md`](src/vendor/LINPEAS-GAPS.md). These are review candidates,
 not proof of exploitability; no added check executes exploits, loads modules,
 connects to runtime/agent APIs, dumps credentials, or runs discovered application
 binaries. Native delegation checks only list/match policy; read-only `systemctl`
@@ -849,10 +921,9 @@ full coverage is needed. Coverage warnings do not resolve previously detected
 conditions for affected tests, but do not block unrelated resolutions.
 
 Both modes request upstream output level 1 so the promoted checks include their
-evidence. `--deep` selects more checks for manual investigation, not the normal
-monitor loop. Complete human-readable output replaces `reports/<host>/lse.txt`
-and `reports/<host>/lse/raw.txt`; parsed records replace
-`reports/<host>/lse/report.json`. Reports can contain sensitive data and are
+evidence. `--deep` selects more checks for manual investigation, not the normal scan. Complete human-readable output replaces `state/reports/<host>/lse.txt`
+and `state/reports/<host>/lse/raw.txt`; parsed records replace
+`state/reports/<host>/lse/report.json`. Reports can contain sensitive data and are
 private/gitignored. LSE is triage, not a proof that the host is secure.
 
 Kernel triage covers **Copy Fail (CVE-2026-31431)** using upstream and selected
@@ -874,73 +945,27 @@ The workflow for both scanners is **finding → investigate/fix → next scan ve
 it is gone**, not first scan → accept vulnerability → ignore forever.
 Scanner commands return nonzero for findings or incomplete/failed scans.
 
-### `monitor [ssh|firewall|integrity|lse]`: polling and alerts
-
-```sh
-./scripts/ccdcctl monitor                          # all four, independent schedules
-./scripts/ccdcctl monitor ssh --interval 30
-./scripts/ccdcctl monitor firewall --host hatchery
-./scripts/ccdcctl monitor integrity
-./scripts/ccdcctl monitor lse --host hatchery
-./scripts/ccdcctl monitor ssh --host hatchery --once
-./monitor/ssh-monitor --interval 30                # existing wrapper
-./monitor/firewall-monitor --interval 30           # existing wrapper
-make monitor
-```
-
-Omitting the kind monitors all four. `--host` defaults to `all`. Set intervals in
-inventory `all.vars` or individual host variables:
-
-```yaml
-ssh_poll_interval: 10
-firewall_poll_interval: 10
-integrity_poll_interval: 60
-lse_poll_interval: 180
-```
-
-These are also the defaults. `--interval SECONDS` explicitly overrides all
-selected modules; intervals must be 5..86400 seconds. Each module has its own
-worker and schedule; scans never overlap themselves, and a slow scan does not
-block other modules. The inventory is refreshed periodically. `--once` scans
-each selected module once and returns nonzero if active alerts exist.
-
-SSH/firewall alone compare effective policy with reviewed controller baselines.
-Integrity/LSE repeatedly evaluate current known-good/security state. Runtime
-alert deduplication suppresses repeat **terminal messages**, not findings: status
-and latest reports still show persistent conditions. New or materially changed
-findings alert immediately; disappeared findings emit one `RESOLVED` event.
-A failed/incomplete scan does not claim previous findings were fixed. Scanner
-and connectivity failures are deduplicated too. Restarting rediscovers all
-current findings; no persistent integrity/LSE acceptance state is stored.
-
-Healthy hosts are quiet. This is state polling, not login-log auditing,
-service health monitoring, or automatic remediation. New hosts need init and
-explicit reviewed **SSH/firewall only** baselines. Those baselines never
-auto-update; failed baseline commands leave previous trust intact. After a
-legitimate SSH/firewall policy change, inspect status before explicitly accepting
-it; do not hide unexplained drift by rebaselining.
-
 ### Make aliases and controller files
 
-`make ping/init/ssh/listeners/firewall/integrity/lse/baseline/monitor` wrap the corresponding
-commands. `make ssh HOST=hatchery` targets one inventory alias. `make baseline`
-accepts **both** SSH and firewall state; use it only after review. First-run
+`make ping/init/scan/listeners/firewall/integrity/lse/baseline` wrap the corresponding
+commands. `make scan HOST=hatchery` targets one inventory alias. `make baseline`
+accepts the firewall state; use it only after review. First-run
 password storage uses the explicit CLI flag from the quickstart, not `make init`.
-Use an activated environment, or `uv run make ping` / `uv run make test`.
+Use an activated environment, or `uv run make ping`.
 
 | Path | Purpose |
 | --- | --- |
 | `inventory.yml` | The only host inventory |
-| `files/oski.pub` | The team public key installed on targets |
-| `ansible.cfg` | Default transport, user, privilege and host-key policy |
+| `secrets/oski.pub` | The team public key installed on targets |
+| `src/ccdc/ansible/` | `AnsibleScript` plus its `ansible.cfg` (transport, user, privilege, host-key policy), `playbooks/`, `roles/`, `callback_plugins/` |
 | `secrets/bootstrap.password` | Shared initial root credential; optionally Vault encrypted |
 | `secrets/root/<host>.password` and backups | Plaintext generated recovery passwords |
-| `reports/listeners.{txt,json}` | Latest selected-host listener inventory |
-| `reports/rollback/<host>/firewall.json` | Latest pre-apply firewall snapshot |
-| `baselines/<host>/{ssh,firewall}.json` | Explicitly accepted SSH/firewall monitoring state only |
-| `reports/<host>/{integrity,lse}/{raw.txt,report.json}` | Latest raw evidence and current normalized findings |
-| `reports/<host>/lse.txt` | Latest human-readable LSE report |
-| `vendor/lse.sh` | Pinned upstream security triage script; never downloaded at runtime |
+| `state/reports/listeners.{txt,json}` | Latest selected-host listener inventory |
+| `state/reports/rollback/<host>/firewall.json` | Latest pre-apply firewall snapshot |
+| `state/baselines/<host>/firewall.json` | Explicitly accepted firewall state only |
+| `state/reports/<host>/{integrity,lse}/{raw.txt,report.json}` | Latest raw evidence and current normalized findings |
+| `state/reports/<host>/lse.txt` | Latest human-readable LSE report |
+| `src/vendor/lse.sh` | Pinned upstream security triage script; never downloaded at runtime |
 
 Private keys belong outside the repository. Secrets, report contents, baselines,
 and `.venv` are gitignored; the placeholder directory markers remain tracked.
@@ -962,17 +987,14 @@ installations; firewall forwarding/NAT and unrelated policy are not targets.
 
 ```sh
 uv sync --locked
-uv run make test
-uv run ansible-playbook playbooks/init.yml --syntax-check
-uv run ansible-playbook playbooks/ssh.yml --syntax-check
-uv run ansible-playbook playbooks/firewall.yml --syntax-check
-uv run ansible-playbook playbooks/lse.yml --syntax-check
+for p in remote init host-keys network-tools; do
+  uv run ansible-playbook src/ccdc/ansible/playbooks/$p.yml --syntax-check
+done
 ```
 
-Tests do not contact sample inventory hosts or change real root passwords.
-Kernel firewall checks mutate rules only inside new user/network namespaces
-when `unshare`, `nft`, and dual-stack iptables tools are available; otherwise they
-are explicitly skipped. Root-rotation integration uses a fake password tool.
+There is no automated test suite in the repository. Check changes against the
+disposable [lab](lab/README.md) (`lab/check` is the opt-in live smoke suite) before
+using them on real hosts.
 Review dependency upgrades before competition; `uv lock --upgrade-package
 ansible-core` refreshes the lockfile within the supported version range, and
 `uv sync` installs it. Do not hand-edit `uv.lock`.

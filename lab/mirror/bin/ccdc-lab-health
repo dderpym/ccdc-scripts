@@ -1,0 +1,17 @@
+#!/bin/sh
+# Distro-neutral readiness check for the compose healthcheck.
+for pair in "ssh sshd" "cron crond"; do
+    set -- $pair
+    systemctl is-active --quiet "$1" || systemctl is-active --quiet "$2" || exit 1
+done
+for name in rsyslog ccdc-relay@ssh ccdc-relay@http ccdc-relay@app; do
+    systemctl is-active --quiet "$name" || exit 1
+done
+systemctl is-active --quiet ccdc-listeners || systemctl is-active --quiet ccdc-birdcage || exit 1
+python3 - <<'PY'
+import os, socket, stat
+assert all(stat.S_ISSOCK(os.stat('/run/lab-sockets/' + n).st_mode) for n in ('ssh', 'http', 'app'))
+ports = dict(l.strip().split('=') for l in open('/etc/ccdc-lab/ports') if '=' in l)
+for p in set(ports.values()):
+    socket.create_connection(('127.0.0.1', int(p)), 2).close()
+PY

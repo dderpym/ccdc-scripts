@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Per-finding lab tests: plant a condition in a lab container, scan, expect the finding, clean up.
+
+  lab/findings [--host tarpit|hatchery] [--fix] [CODE ...]
+
+Scenarios are lab/scenarios/<finding-code>.sh, run INSIDE the container (`sh -s -- plant|clean`).
+The clean lab already reports many findings, so every assertion is a diff against a baseline
+scan taken just before the plant; nothing here asserts on an absolute list. See lab/README.md.
+"""
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+LAB = Path(__file__).resolve().parent
+ROOT = LAB.parent
+# The only place that knows which container serves which lab host; a replacement lab edits this mapping.
+CONTAINERS = {"hatchery": "ccdc-lab-hatchery", "tarpit": "ccdc-lab-tarpit"}
+HOSTS = tuple(CONTAINERS)
+os.environ.setdefault("ANSIBLE_INVENTORY", str(LAB / "inventory.yml"))
+
+
+def header(path):
+    """Scenario metadata from `# key: value` comment lines at the top of the script."""
+    meta = {}
+    for line in path.read_text().splitlines()[:30]:
+        match = re.match(r"#\s*(hosts|match|fix|skip):\s*(.*)$", line)
+        if match:
+            meta[match[1]] = match[2].strip()
+    return meta
+
+
+def in_container(host, script, action, timeout=120):
+    result = subprocess.run(["docker", "exec", "-i", CONTAINERS[host], "sh", "-s", "--", action],
+                            input=script.read_text(), capture_output=True, text=True, timeout=timeout)
+    return result.returncode, result.stdout, result.stderr
+
+
+def scan(host, *extra):
+    """The parsed `scan --json` document for one host (exit status 1 just means findings exist)."""
+    result = subprocess.run([sys.executable, str(ROOT / "ccdcctl"), "scan", host, "--json", *extra],
+                            capture_output=True, text=True, cwd=ROOT, timeout=900)
+    scan.stderr = result.stderr
+    try:
+        return json.loads(result.stdout)[host]
+    except (ValueError, KeyError):
+        raise RuntimeError("scan --json failed: " + (result.stderr.strip() or result.stdout.strip())[-400:])
+
+
+def key(finding):
+    """Identity of a finding across scans: process ids and similar churn are normalised away."""
+    summary = re.sub(r"\[\d+(?:, ?\d+)*\]|\bpid \d+\b", "[#]", finding["summary"])
+    return finding["code"], summary
+
+
+def keys(document):
+    return {key(f) for f in document["findings"]}
+
+
+def run_scenario(host, script, code, meta, fix, baselines):
+    """(status, detail). Always cleans up and verifies the baseline came back."""
+    status, detail, planted = "FAIL", "", None
+    try:
+        if host not in baselines:
+            baselines[host] = scan(host)
+        before = keys(baselines[host])
+        rc, out, err = in_container(host, script, "plant")
+        marker = out.splitlines()[0].strip() if out.strip() else ""
+        if rc or not marker:
+            return "FAIL", f"plant failed (rc={rc}, marker={marker!r}): {(err or out).strip()[:200]}"
+        document = scan(host)
+        new = [f for f in document["findings"] if f["code"] == code and key(f) not in before
+               and (marker in f["summary"] or marker in json.dumps(f, sort_keys=True))]
+        if not new:
+            others = sorted({c for c, _ in keys(document) - before})
+            return "FAIL", f"no new {code} finding mentioning {marker!r}; new codes: {others or 'none'}; scan errors: {len(document['errors'])}"
+        planted = new[0]
+        status, detail = "PASS", f"detected: {planted['summary'][:110]}"
+        if fix and meta.get("fix") == "yes":
+            fixed = scan(host, "--fix", "all", "--only", f"{code}={planted['summary']}")
+            if not fixed["fixed"]:
+                lines = [l.strip() for l in scan.stderr.splitlines() if l.strip()]
+                failed = [l for l in lines if l.startswith("FAILED")] or lines[:1]
+                status, detail = "FAIL", "autofix did not succeed: " + " / ".join(failed)[:260]
+            elif key(planted) in keys(fixed):
+                status, detail = "FAIL", "autofix ran but the finding is still reported: " + "; ".join(fixed["fixed"])[:150]
+            else:
+                detail += " | fixed and gone"
+        elif fix and meta.get("fix") != "yes":
+            detail += " | no autofix expected"
+        return status, detail
+    except Exception as exc:  # report, then still clean up
+        return "FAIL", f"{type(exc).__name__}: {exc}"[:300]
+    finally:
+        try:
+            in_container(host, script, "clean")
+            after = scan(host)
+            gone, extra = keys(baselines[host]) - keys(after), keys(after) - keys(baselines[host])
+            if gone or extra:
+                status = "LEAK"
+                detail = (detail + " | " if detail else "") + f"clean did not restore the baseline: {len(gone)} missing, {len(extra)} extra" \
+                    + ("; extra e.g. " + "; ".join(c + ": " + s[:60] for c, s in sorted(extra)[:2]) if extra else "")
+            else:
+                baselines[host] = after
+        except Exception as exc:
+            status, detail = "LEAK", (detail + " | " if detail else "") + f"clean/verify failed: {exc}"[:200]
+            baselines.pop(host, None)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("codes", nargs="*", help="finding codes to test (default: every scenario)")
+    parser.add_argument("--host", choices=HOSTS, help="only this lab host")
+    parser.add_argument("--fix", action="store_true", help="also run the autofix and expect the finding to be gone")
+    args = parser.parse_args()
+    scenarios = sorted((LAB / "scenarios").glob("*.sh"))
+    wanted = {c for c in args.codes}
+    unknown = wanted - {s.stem for s in scenarios}
+    if unknown:
+        parser.error("no scenario for: " + ", ".join(sorted(unknown)))
+    running = subprocess.run(["docker", "ps", "--format", "{{.Names}}"], capture_output=True, text=True).stdout.split()
+    failed, baselines = False, {}
+    with open(LAB / ".findings.lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)  # one plant at a time, even across agents
+        for script in scenarios:
+            code, meta = script.stem, header(script)
+            if wanted and code not in wanted:
+                continue
+            for host in meta.get("hosts", " ".join(HOSTS)).split():
+                if args.host and host != args.host:
+                    continue
+                if "skip" in meta:
+                    print(f"SKIP  {code:28} {host:9} {meta['skip']}")
+                elif CONTAINERS[host] not in running:
+                    print(f"SKIP  {code:28} {host:9} container is not running")
+                else:
+                    status, detail = run_scenario(host, script, code, meta, args.fix, baselines)
+                    failed = failed or status in ("FAIL", "LEAK")
+                    print(f"{status:5} {code:28} {host:9} {detail}", flush=True)
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,10 @@
+[Unit]
+Description=Private CCDC host relay (%i)
+After=local-fs.target
+
+[Service]
+ExecStart=/usr/local/bin/ccdc-lab-relay %i
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

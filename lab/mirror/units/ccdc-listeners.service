@@ -1,0 +1,11 @@
+[Unit]
+Description=Stand-in service ports for this host (lab fixture)
+After=network.target
+ConditionHost=!sylvester
+
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/ccdc-lab-listeners /etc/ccdc-lab/listeners
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

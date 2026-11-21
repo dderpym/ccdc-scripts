@@ -1,0 +1,430 @@
+#!/usr/bin/env python3
+"""Run the vendored LSE on this host; stdout is one JSON object, even on failure.
+
+The pinned lse.sh ships beside this script in the archive; --script overrides it with a local file, never a URL. --deep expands the allowlist.
+Passive supplemental permission/kernel checks share the same finding contract.
+Findings are review candidates relative to the invoking user's permissions.
+The repository's expected oski passwordless sudo stays in raw evidence only.
+raw retains complete scanner output; only normalized findings reach the terminal.
+"""
+import argparse
+import contextlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import shlex
+import signal
+import stat
+import shutil
+import subprocess
+import tempfile
+
+import kernel_risks
+import lse_extras
+import lse_host_risks
+
+# Only these tests become findings. Dependencies run but are never inventory.
+# Values: minimum scan profile (0=normal, 1=deep), severity, stable summary.
+# Upstream output level 1 is needed for promoted sys040/ret050 evidence.
+TESTS = {
+    "usr080": (0, "critical", "Current directory in a system PATH"),
+    "sud000": (0, "critical", "Passwordless sudo execution"),
+    "fst020": (0, "warning", "Uncommon setuid binaries"),
+    "fst030": (0, "critical", "Writable setuid binaries"),
+    "fst120": (0, "warning", "Possible credentials in filesystem mounts"),
+    "fst160": (0, "critical", "Writable critical files"),
+    "fst170": (0, "critical", "Writable critical directories"),
+    "fst180": (0, "critical", "Writable system PATH directories"),
+    "fst200": (0, "warning", "Possible credentials in shell history"),
+    "fst210": (0, "critical", "NFS exports with no_root_squash"),
+    "sys020": (0, "critical", "Password hashes or empty passwords in passwd"),
+    "sys022": (0, "critical", "Password hashes or empty passwords in group"),
+    "sys030": (0, "critical", "Readable shadow password files"),
+    "sys040": (0, "critical", "Additional UID-zero accounts"),
+    "sec020": (0, "critical", "Writable binaries with capabilities"),
+    "sec030": (0, "critical", "Binaries with all capabilities"),
+    "ret010": (0, "critical", "Writable cron tasks"),
+    "ret050": (0, "warning", "Writable paths referenced by cron"),
+    "ret060": (0, "critical", "Writable executables referenced by cron"),
+    "ret510": (0, "critical", "Writable systemd timers"),
+    "srv000": (0, "critical", "Writable service configuration"),
+    "srv020": (1, "warning", "Non-root-owned init.d files"),
+    "srv030": (1, "warning", "Non-root-owned rc.d/init.d files"),
+    "srv040": (1, "warning", "Non-root-owned Upstart files"),
+    "srv050": (1, "warning", "Non-root-owned local rc.d files"),
+    "srv500": (0, "critical", "Writable systemd service files"),
+    "srv520": (1, "warning", "Non-root-owned systemd files"),
+    "sof000": (0, "critical", "MySQL accepts root/root credentials"),
+    "sof010": (0, "warning", "MySQL root connection without a supplied password"),
+    "sof015": (0, "warning", "Possible credentials in MySQL history"),
+    "sof020": (0, "warning", "PostgreSQL connection without a supplied password"),
+    "sof130": (0, "critical", "Writable tmux sockets belonging to other users"),
+    "sof160": (0, "critical", "Writable screen sockets belonging to other users"),
+    "sof170": (1, "warning", "MongoDB databases accessible without credentials"),
+    "ctn020": (0, "critical", "Membership in the docker group"),
+    "ctn210": (0, "critical", "Membership in an lxc/lxd group"),
+}
+DEPENDENCIES = ("usr070", "fst000", "fst010", "sec010")
+
+
+def selection(deep=False, only=None):
+    wanted = {test_id for test_id, (level, _, _) in TESTS.items() if level <= int(deep) and (only is None or test_id in only)}
+    return ",".join(sorted(wanted | set(DEPENDENCIES)))
+
+
+SELECTION = selection()
+ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
+HEADER = re.compile(r"^\[([!*i])\]\s+([a-z]{3}\d{3})\s+(.*?)\s+(yes!|nope|skip)\s*$")
+LISTING = re.compile(r"^([bcdlps-][rwxStTs-]{9}[.+@]?)\s+\d+\s+(\S+)\s+(\S+)\s+\S+\s+\S+\s+\S+\s+\S+\s+(.+)$")
+# Running as root makes permission checks tautologies, not vulnerabilities.
+ROOT_PERMISSION_TESTS = {
+    "sud000", "fst030", "fst160", "fst170", "fst180", "sys030", "sec020",
+    "ret010", "ret050", "ret060", "ret510", "srv000", "srv500",
+    "sof000", "sof010", "sof130", "sof160", "ctn020", "ctn210",
+}
+
+
+# Permission tests whose affirmative path evidence has a mechanical fix:
+# bits to clear, and whether a non-root owner of a system path becomes root.
+# Removing setuid can break a working program, so it is never a 'simple' fix.
+ALWAYS_PROMPT = {"fst020"}
+PERMISSION_FIXES = {
+    "fst020": (0o6000, False),  # strips setuid/setgid; may break a legitimate helper
+    "fst030": (0o022, True), "fst160": (0o022, True), "fst170": (0o022, True),
+    "fst180": (0o022, False),  # PATH entries may legitimately be the user's own
+    "sys030": (0o007, False),
+}
+EVIDENCE_PATH = re.compile(r"^[bcdlps-][rwxStTs-]{9}[.+@]?\s+\S+\s+\S+\s+(/.+)$")
+MAX_FIXES = 50
+
+
+def permission_fixes(test_id, contexts, lstat=os.lstat):
+    """Absolute-target fixes for regular files/directories named in the evidence."""
+    clear, chown_root = PERMISSION_FIXES[test_id]
+    fixes, seen = [], set()
+    for context in contexts:
+        for line in context["evidence"]:
+            match = EVIDENCE_PATH.match(line)
+            path = match[1] if match else line if line.startswith("/") else None
+            if path is None or path in seen or len(fixes) >= MAX_FIXES:
+                continue
+            seen.add(path)
+            try:
+                info = lstat(path)
+            except OSError:
+                continue
+            kind = stat.S_IFMT(info.st_mode)
+            if kind not in (stat.S_IFREG, stat.S_IFDIR) or (kind == stat.S_IFDIR and info.st_mode & stat.S_ISVTX):
+                continue
+            was = {"mode": stat.S_IMODE(info.st_mode), "uid": info.st_uid, "gid": info.st_gid}
+            target = dict(was, mode=was["mode"] & ~clear, uid=0 if chown_root else was["uid"])
+            if target != was:
+                fixes.append(dict(path=path, **target, was=was,
+                                  tier="simple" if target["uid"] == was["uid"] and test_id not in ALWAYS_PROMPT else "all"))
+    return fixes
+
+
+def clean(text):
+    text = ANSI.sub("", text)
+    text = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", "", text)
+    text = re.sub(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b", "<timestamp>", text)
+    text = re.sub(r"\b(?:pid|PID)(\s*[=:]?\s*)\d+\b", "PID=<pid>", text)
+    return text
+
+
+def evidence(test_id, lines):
+    result = []
+    for line in lines:
+        line = line.strip()
+        if not line or line == "---" or line.startswith("#"):
+            continue
+        if re.match(r"(?i)^(warning|error|uptime|threads|questions|slow queries|opens|flush tables|open tables|queries per second|runtime|elapsed|total\s+\d+)", line):
+            continue
+        if test_id == "sys030":
+            # Keep the proof of readability, not the entire password database.
+            if not re.fullmatch(r"/etc/(?:shadow[-~]?|gshadow-?|master\.passwd)", line):
+                continue
+        if test_id in ("sys020", "sys022"):
+            fields = line.split(":")
+            if len(fields) < 2 or fields[1].startswith(("!", "*")) or fields[1] == "x":
+                continue  # Upstream also emits ordinary locked accounts.
+        if test_id == "fst210" and "no_root_squash" not in line:
+            continue
+        listing = LISTING.match(line)
+        if listing:
+            # Retain permissions, owner, group and path; drop size/mtime/link count.
+            line = " ".join(listing.groups())
+        if test_id == "sof160":
+            line = re.sub(r"(/run/screen/S-[^/]+/)\d+\.", r"\1<pid>.", line)
+        if test_id == "sof170":
+            line = re.sub(r"\s+\d+(?:\.\d+)?\s*(?:[KMGT]i?B|[KMGT]B)\s*$", "", line)
+        result.append(line)
+    return sorted(set(result))
+
+
+def parse(text, deep=False):
+    """Keep every independent affirmative occurrence, including repeated sof020."""
+    raw = text
+    text = clean(text)
+    root = bool(re.search(r"^\s*User ID:\s*0\s*$", text, re.M))
+    records = []
+    current = None
+    in_body = False
+    for line in text.splitlines():
+        header = HEADER.match(line)
+        if header:
+            marker, test_id, summary, status = header.groups()
+            current = None
+            in_body = False
+            if (status == "yes!" and marker != "i" and test_id in TESTS
+                    and TESTS[test_id][0] <= int(deep)
+                    and not (root and test_id in ROOT_PERMISSION_TESTS)):
+                current = {"id": test_id, "summary": summary.rstrip('.').strip(), "lines": []}
+                records.append(current)
+        elif line.strip() == "---":
+            # A body can contain '---' itself (notably sys030). Consume until
+            # the next test/section; delimiters aren't evidence.
+            in_body = True
+        elif line.startswith("==="):
+            current = None
+            in_body = False
+        elif current is not None and in_body:
+            current["lines"].append(line)
+
+    grouped = {}
+    for record in records:
+        test_id = record["id"]
+        values = evidence(test_id, record["lines"])
+        if not values:
+            continue  # Empty/locked/comment-only output is not affirmative proof.
+        # The pinned PostgreSQL title says 'psql', but its command uses pgsql.
+        summary = record["summary"]
+        if test_id == "sof020":
+            summary = summary.replace("as psql", "as pgsql")
+        context = {"summary": summary, "evidence": values}
+        grouped.setdefault(test_id, [])
+        if context not in grouped[test_id]:
+            grouped[test_id].append(context)
+    findings = []
+    for test_id, contexts in sorted(grouped.items()):
+        _, severity, summary = TESTS[test_id]
+        contexts.sort(key=lambda item: json.dumps(item, sort_keys=True))
+        row = {"id": test_id, "severity": severity, "summary": summary, "context": contexts}
+        fixes = permission_fixes(test_id, contexts) if test_id in PERMISSION_FIXES else []
+        if fixes:
+            row["fixes"] = fixes
+        findings.append(row)
+    errors = ["LSE ran as root; permission checks cannot assess an unprivileged account"] if root else []
+    return {"findings": findings, "raw": raw, "errors": errors}
+
+
+def coverage(directory, env=None):
+    """Upstream hides optional-command errors; expose important coverage gaps."""
+    env = os.environ if env is None else env
+    gaps = []
+    affected = {
+        "find": ("fst020", "fst030", "fst160", "fst170", "ret010", "ret510", "srv000", "srv020", "srv030", "srv040", "srv050", "srv500", "srv520"),
+        "getcap": ("sec020", "sec030"), "sudo": ("sud000",),
+    }
+    for tool in affected:
+        if not shutil.which(tool, path=env.get('PATH')):
+            gaps.append((tool, "Optional utility %s missing; related LSE checks are incomplete" % tool, affected[tool]))
+    if shutil.which("find", path=env.get('PATH')):
+        try:
+            probe = subprocess.run(["find", directory, "-maxdepth", "0", "-writable", "-print"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5, env=env)
+            if probe.returncode:
+                gaps.append(("find-writable", "Installed find lacks -writable (common with BusyBox); writable-file LSE coverage is incomplete",
+                             ("fst160", "fst170", "ret010", "ret510", "srv000", "srv500")))
+        except (OSError, subprocess.TimeoutExpired):
+            gaps.append(("find", "Cannot probe find support; writable-file LSE coverage is incomplete", affected["find"]))
+    return gaps
+
+
+def drop_privileges(name=None):
+    """Under sudo, become the login account but keep root as the saved uid.
+
+    Permission checks must reflect what the account can do. Helpers re-elevate only
+    for read-only visibility, and exec'd children (LSE, getcap, ...) lose root.
+    """
+    if os.geteuid() != 0:
+        return
+    name = name or os.environ.get("SUDO_USER")
+    try:
+        account = pwd.getpwnam(name) if name else None
+    except KeyError:
+        account = None
+    if account is None or account.pw_uid == 0:
+        raise SystemExit("Running as root requires an unprivileged target account (--user or SUDO_USER)")
+    # The driver runs us inside a root-only work directory. Leave it first: as the dropped account
+    # find(1) cannot restore an unreadable cwd and exits 1, which looked like "no -writable".
+    os.chdir("/")
+    os.setgroups(os.getgrouplist(account.pw_name, account.pw_gid))
+    os.setresgid(account.pw_gid, account.pw_gid, 0)
+    os.setresuid(account.pw_uid, account.pw_uid, 0)
+    os.environ.update(HOME=account.pw_dir, USER=account.pw_name, LOGNAME=account.pw_name)
+
+
+def exec_scratch():
+    """Private scratch directory on a filesystem that allows execution (/tmp is often noexec)."""
+    for base in (None, "/var/tmp", "/dev/shm", str(Path.home())):
+        try:
+            if os.statvfs(base or tempfile.gettempdir()).f_flag & os.ST_NOEXEC:
+                continue
+            return tempfile.TemporaryDirectory(prefix="ccdc-lse-bin-", dir=base)
+        except (OSError, RuntimeError):
+            continue
+    return None
+
+
+def scan_lse(script, deep=False, only=None):
+    command = ["/bin/sh", str(Path(script).resolve()), "-c", "-i", "-l", "1",
+               "-p", "0", "-s", selection(deep, only)]
+    # LSE creates scratch files even with monitoring disabled. Keep these private
+    # and remove them on success, warnings, missing commands, or timeout.
+    with tempfile.TemporaryDirectory(prefix="ccdc-lse-") as directory:
+        env = dict(os.environ, LC_ALL="C", LANG="C", TMPDIR=directory,
+                   PGCONNECT_TIMEOUT="5", PAGER="cat", TERM="dumb")
+        env.pop("lse_NO_EXEC", None)
+        # Debian unprivileged SSH logins often omit sbin although getcap exists.
+        standard = ('/usr/local/sbin', '/usr/local/bin', '/usr/sbin', '/usr/bin', '/sbin', '/bin')
+        env['PATH'] = os.pathsep.join(dict.fromkeys((*standard, *env.get('PATH', '').split(os.pathsep))))
+        gaps = coverage(directory, env)
+        # LSE maps both a successful empty inventory and command failure to 'nope'.
+        # Record the native exit status without a second filesystem traversal or
+        # modifying the pinned script. The private shim forwards stdout unchanged.
+        cap_status = Path(directory) / 'getcap.status'
+        getcap = shutil.which('getcap', path=env['PATH'])
+        shims = exec_scratch() if getcap else None
+        if shims:
+            recorder = Path(shims.name) / 'getcap'
+            recorder.write_text('#!/bin/sh\n' + shlex.quote(getcap) + ' "$@"\n'
+                                'status=$?\nprintf "%s" "$status" > ' + shlex.quote(str(cap_status))
+                                + '\nexit "$status"\n')
+            recorder.chmod(0o700)
+            env['PATH'] = shims.name + os.pathsep + env['PATH']
+        try:
+            with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, universal_newlines=True, errors="replace",
+                                  env=env, start_new_session=True) as process:
+                timed_out = False
+                try:
+                    stdout, stderr = process.communicate(timeout=180)
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass  # The group may have exited just as the deadline fired.
+                    stdout, stderr = process.communicate()
+                result = parse(stdout, deep)
+                if cap_status.exists():
+                    receipt = cap_status.read_text()
+                    if receipt.isdigit() and len(receipt) <= 3:
+                        result['_capability_status'] = int(receipt)
+                # Bootstrap intentionally grants this account NOPASSWD sudo.
+                # Use the real effective account, not USER or the LSE banner.
+                try:
+                    account = pwd.getpwuid(os.geteuid()).pw_name
+                except KeyError:
+                    account = None
+                if account == "oski":
+                    result["findings"] = [f for f in result["findings"] if f["id"] != "sud000"]
+                result["raw"] = stdout + ("\n--- stderr ---\n" + stderr if stderr else "")
+                if timed_out:
+                    result["errors"].append("LSE timed out after 180 seconds; findings may be incomplete")
+                elif process.returncode:
+                    result["errors"].append("LSE exited with status %s; findings may be incomplete" % process.returncode)
+                if gaps:
+                    result["incomplete_ids"] = sorted({test_id for _, _, ids in gaps for test_id in ids})
+                    result["findings"].extend({"id": "scanner-" + tool, "severity": "warning", "summary": message}
+                                              for tool, message, _ in gaps)
+                result["errors"].extend(line.strip() for line in clean(stderr).splitlines() if line.strip())
+                result["errors"] = sorted(set(result["errors"]))
+                return result
+        except OSError as exc:
+            return {"findings": [], "raw": "", "errors": ["Cannot execute local LSE: " + str(exc)]}
+        finally:
+            if shims:
+                shims.cleanup()
+
+
+def supplemental_scan(raw, deep=False, capability_status=None):
+    """Helpers ship in the same archive; never import scanner code from the target PATH."""
+    states = []
+    for name, helper, args in (
+            ('lse_extras', lse_extras.scan, (raw, capability_status)),
+            ('kernel_risks', kernel_risks.inspect_kernel, (deep,)),
+            ('lse_host_risks', lse_host_risks.scan, (deep,))):
+        try:
+            states.append(helper(*args))
+        except (OSError, ValueError, KeyError, RuntimeError) as exc:
+            states.append({'findings': [], 'raw': '', 'errors': [name + ': ' + str(exc)]})
+    return states
+
+
+def scan(script, deep=False, only=None):
+    """`only` limits the run to those finding ids (LSE tests and/or supplemental checks)."""
+    if only is not None and not only & set(TESTS):
+        result = {"findings": [], "raw": "", "errors": []}
+    else:
+        result = scan_lse(script, deep, only)
+    incomplete = set(result.get('incomplete_ids', []))
+    capability_status = result.pop('_capability_status', None)
+    for extra in supplemental_scan(result['raw'], deep, capability_status):
+        result['findings'].extend(extra['findings'])
+        result['errors'].extend(extra.get('errors', []))
+        incomplete.update(extra.get('incomplete_ids', []))
+        if extra.get('raw'):
+            result['raw'] += '\n--- passive supplemental checks ---\n' + extra['raw']
+    if only is not None:
+        result['findings'] = [f for f in result['findings'] if f['id'] in only]
+    result['findings'].sort(key=lambda finding: finding['id'])
+    result['errors'] = sorted(set(result['errors']))
+    if incomplete:
+        result['incomplete_ids'] = sorted(incomplete)
+    return result
+
+
+@contextlib.contextmanager
+def bundled_script():
+    """The pinned lse.sh as a file the dropped account can read; /bin/sh runs it, so no exec bit is needed.
+
+    Staged BEFORE privileges are dropped: the archive directory is private to root, and the
+    assessed account (the whole point of dropping) must not be given access to it. The copy
+    lives in its own world-readable directory and is removed afterwards with the saved root uid.
+    """
+    source = Path(kernel_risks.__file__).resolve().with_name("lse.sh")
+    directory = tempfile.mkdtemp(prefix="ccdc-lse-pin-")
+    try:
+        os.chmod(directory, 0o755)
+        path = Path(directory) / "lse.sh"
+        path.write_bytes(source.read_bytes())
+        path.chmod(0o644)
+        yield path
+    finally:
+        if os.geteuid() != 0 and os.getresuid()[2] == 0:
+            os.seteuid(0)  # drop_privileges kept root as the saved uid for exactly this
+        shutil.rmtree(directory, ignore_errors=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--script", help="path to a local lse.sh (default: the pinned copy shipped with this script)")
+    parser.add_argument("--deep", action="store_true", help="include actionable level-1 checks")
+    parser.add_argument("--only", help="comma-separated finding ids; run just those checks")
+    parser.add_argument("--user", help="unprivileged account to assess when started as root (default SUDO_USER)")
+    args = parser.parse_args()
+    try:
+        with (contextlib.nullcontext(args.script) if args.script else bundled_script()) as script:
+            drop_privileges(args.user)  # after the pinned copy is staged, before anything is assessed
+            result = scan(script, args.deep, set(args.only.split(",")) if args.only else None)
+    except OSError as exc:
+        result = {"findings": [], "raw": "", "errors": [str(exc)]}
+    print(json.dumps(result, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()
